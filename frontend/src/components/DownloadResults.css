@@ -1,0 +1,25 @@
+.download-button {
+  position: absolute;
+  bottom: -10px; /* Sposta il pulsante 20px dal bordo inferiore */
+  left: 0px; /* Sposta il pulsante 20px dal bordo sinistro */
+  background-color: #1976d2 !important; /* Forza il colore di base */
+  color: white !important;
+  border: 2px solid #1976d2 !important; /* Forza il bordo blu */
+  padding: 10px 20px;
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: bold;
+  text-transform: uppercase;
+  transition: background-color 0.3s ease !important;
+}
+
+.download-button:hover {
+  background-color: #119327 !important; /* Verde personalizzato al passaggio del mouse */
+  color: white !important;
+}
+
+.download-button:disabled {
+  background-color: #cccccc !important; /* Colore del pulsante disabilitato */
+  color: #666666 !important; /* Colore del testo disabilitato */
+  cursor: not-allowed !important; /* Cambia il cursore */
+}

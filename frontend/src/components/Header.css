@@ -1,0 +1,40 @@
+/* Header.css */
+.app-header {
+    padding: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: white;
+    position: relative;
+    min-height: 120px;
+  }
+  
+  .app-header h1 {
+    font-size: calc(12px + 2vmin);
+    margin: 0;
+    z-index: 1; /* Assicura che il testo sia visibile sopra l'immagine */
+    position: relative;
+    top: 10px; /* Sposta verso il basso */
+    left: -400px; /* Sposta verso destra */
+  }
+
+  .logo {
+    position: absolute;
+    left: 0px;
+    height: 159px;
+    width: auto;
+    z-index: 1; /* Assicura che il logo sia visibile sopra l'immagine */
+  }
+  
+  /* Overlay per migliorare il contrasto */
+  .app-header::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: rgba(0, 0, 0, 0.4); /* Sfondo semitrasparente */
+    z-index: 0; /* Posiziona l'overlay sotto il testo e il logo */
+  }
+  

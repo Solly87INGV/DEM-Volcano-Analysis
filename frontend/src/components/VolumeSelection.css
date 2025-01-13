@@ -1,0 +1,144 @@
+.volume-selection-container {
+  background-color: #bac6f7;
+  padding: 30px;
+  border-radius: 12px;
+  border: 1px solid #55659e;
+  max-width: 1100px;
+  margin: 40px auto;
+  box-shadow: 0px 8px 20px rgba(0, 0, 0, 0.05);
+  display: flex;
+  flex-direction: column;
+}
+
+.success-message {
+  font-weight: bold;
+  color: #556cd6;
+  margin-bottom: 15px;
+  font-size: 1.2rem;
+}
+
+.instruction-message {
+  margin-bottom: 20px;
+  color: #333333;
+  font-size: 1.1rem;
+}
+
+.main-layout {
+  display: flex;
+  gap: 20px; /* Spazio tra le card e l'immagine */
+  align-items: flex-start; /* Allinea gli elementi in alto */
+}
+
+.card-container {
+  display: flex;
+  flex-direction: row; /* Disposizione orizzontale */
+  gap: 20px;
+  justify-content: center;
+  flex: 2; /* Più spazio per le card */
+}
+
+.card-selection {
+  background-color: #ffffff;
+  padding: 20px;
+  border-radius: 8px;
+  border: 1px solid #dcdde1;
+  box-shadow: 0px 4px 10px rgba(0, 0, 0, 0.1);
+  cursor: pointer;
+  text-align: center;
+  transition: transform 0.2s;
+}
+
+.card-selection:hover {
+  transform: scale(1.05);
+}
+
+.card-title {
+  font-weight: bold;
+  color: #333333;
+}
+
+.back-arrow {
+  position: absolute;
+  left: -10px; /* Posizione a sinistra */
+  top: -10px; /* Posizione verticale */
+  width: 40px; /* Larghezza fissa del pulsante */
+  height: 40px; /* Altezza fissa del pulsante */
+  background-color: #ff5733; /* Colore di sfondo */
+  border: none; /* Nessun bordo */
+  border-radius: 50%; /* Arrotonda il pulsante */
+  display: flex; /* Centra il contenuto */
+  align-items: center; /* Centra verticalmente */
+  justify-content: center; /* Centra orizzontalmente */
+  cursor: pointer; /* Mostra il cursore cliccabile */
+  transition: color 0.3s ease; /* Cambia solo il colore */
+}
+
+.back-arrow:hover {
+  background-color: #c70039; /* Cambia il colore al passaggio del mouse */
+  transform: none; /* Nessun ingrandimento */
+}
+
+.back-arrow svg {
+  font-size: 40px; /* Dimensione della freccia */
+  color: rgb(75, 65, 65); /* Colore della freccia */
+}
+
+
+.info-image-container {
+  flex: 1;
+  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 20px;
+  max-width: 100%; /* Permette alla box di adattarsi */
+}
+
+.info-image-container img {
+  width: 600px; /* Larghezza fissa maggiore */
+  height: auto; /* Mantiene le proporzioni */
+  max-height: 500px; /* Altezza massima ancora più grande */
+  border-radius: 8px; /* Arrotondamento degli angoli */
+  box-shadow: 0px 4px 10px rgba(0, 0, 0, 0.1); /* Ombreggiatura */
+}
+
+
+.button-group {
+  display: flex;
+  justify-content: center; /* Pulsanti centrati e vicini */
+  gap: 10px; /* Spazio tra i pulsanti */
+  margin-top: 30px;
+}
+
+.modal-style {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 300px;
+  background-color: #ffffff;
+  border: 1px solid #dcdde1;
+  box-shadow: 0px 4px 10px rgba(0, 0, 0, 0.1);
+  padding: 20px;
+  border-radius: 8px;
+  outline: none;
+}
+
+/* Pulsante di chiusura */
+.close-button {
+  background-color: #e53935; /* Rosso per il pulsante di chiusura */
+  color: white;
+  position: absolute; /* Posizionamento indipendente */
+  bottom: -10px; /* Distanza dal fondo del modale */
+  right: -220px; /* Distanza dal lato destro */
+  padding: 10px 20px;
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: bold;
+  text-transform: uppercase;
+  transition: background-color 0.3s ease;
+}
+
+.close-button:hover {
+  background-color: #b71c1c; /* Rosso più scuro al passaggio del mouse */
+}

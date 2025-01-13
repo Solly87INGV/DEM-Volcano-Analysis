@@ -1,0 +1,29 @@
+/* Description.css */
+.description-container {
+  max-width: 800px;
+  margin: 40px auto; /* Centra la descrizione nella pagina */
+  padding: 20px; /* Aggiungi spazio interno */
+  font-size: 1rem;
+  line-height: 1.8; /* Spazio tra le righe migliorato */
+  color: #333;
+  background-color: #ccf8fd; /* Sfondo leggero */
+  border: 1px solid #e0e0e0; /* Bordo sottile e neutro */
+  border-radius: 12px; /* Arrotonda gli angoli */
+  box-shadow: 0px 4px 10px rgba(0, 0, 0, 0.1); /* Ombreggiatura per profondità */
+}
+
+.description-container h2 {
+  font-size: 1.8rem; /* Titolo più grande e evidente */
+  margin-bottom: 20px; /* Più spazio sotto il titolo */
+  color: #556cd6; /* Colore distintivo */
+  text-align: center; /* Centra il titolo */
+}
+
+.description-container p {
+  margin-bottom: 15px; /* Spazio tra i paragrafi */
+  text-align: justify; /* Giustifica il testo per uniformità */
+}
+
+.description-container p:last-child {
+  margin-bottom: 0; /* Rimuove spazio sotto l'ultimo paragrafo */
+}

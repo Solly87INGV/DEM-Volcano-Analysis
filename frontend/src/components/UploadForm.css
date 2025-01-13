@@ -1,0 +1,93 @@
+/* UploadForm.css */
+.upload-form-container {
+  background-color: #dee5f7;
+  padding: 40px;
+  border-radius: 12px;
+  border: 1px solid #dcdde1;
+  max-width: 600px;
+  margin: 40px auto;
+  box-shadow: 0px 8px 20px rgba(0, 0, 0, 0.1);
+  text-align: center;
+}
+
+.form-title {
+  font-size: 2rem;
+  margin-bottom: 20px;
+  font-weight: bold;
+  color: #333;
+}
+
+.drag-drop-area {
+  border: 2px dashed #a0a0a0;
+  padding: 40px;
+  border-radius: 12px;
+  background-color: #ffffff;
+  cursor: pointer;
+  transition: background-color 0.3s ease;
+  margin-top: 30px;
+}
+
+.drag-drop-area:hover,
+.drag-drop-area.drag-over {
+  background-color: #e0e6ff;
+  border-color: #556cd6; /* Cambia colore bordo durante il drag */
+}
+
+.drag-drop-label {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  font-size: 1rem;
+  color: #556cd6;
+  cursor: pointer;
+}
+
+.upload-icon {
+  font-size: 3rem;
+  margin-bottom: 10px;
+}
+
+.selected-file {
+  margin-top: 30px;
+  font-size: 1.2rem; /* Ancora più grande */
+  font-weight: bold;
+  color: #ffffff;
+  background: linear-gradient(135deg, #ff416c, #ff4b2b); /* Gradiente vivace */
+  padding: 12px 20px;
+  border-radius: 10px;
+  text-align: center;
+  box-shadow: 0px 6px 15px rgba(255, 65, 108, 0.4); /* Ombreggiatura colorata */
+  display: inline-block;
+}
+
+.selected-file-container {
+  margin-top: 20px; /* Sposta il blocco più in basso */
+  text-align: center; /* Centra il contenitore */
+}
+
+.upload-message {
+  margin-top: 20px;
+  font-size: 1rem;
+  color: rgb(255, 13, 13); /* Cambia colore a rosso per errori */
+}
+
+.process-button-container {
+  margin-top: 30px;
+}
+
+.process-button {
+  background-color: #4e5fac;
+  color: white;
+  padding: 10px 20px;
+  border-radius: 8px;
+  border: none;
+  font-size: 1rem;
+  cursor: pointer;
+  transition: background-color 0.3s ease, box-shadow 0.3s ease;
+}
+
+.process-button:hover {
+  background-color: #3d4db7;
+  box-shadow: 0px 4px 10px rgba(0, 0, 0, 0.2);
+  color: #ffffff; /* Colore della scritta */
+}
