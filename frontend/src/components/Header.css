@@ -21,7 +21,7 @@
   .logo {
     position: absolute;
     left: 0px;
-    height: 159px;
+    height: 160px;
     width: auto;
     z-index: 1; /* Assicura che il logo sia visibile sopra l'immagine */
   }
