@@ -1,261 +1,243 @@
+// server.js (aggiornato)
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const { spawn } = require('child_process');
 const path = require('path');
-const { v4: uuidv4 } = require('uuid'); // Importa uuidv4
+const fs = require('fs'); // <-- aggiunto
+const { v4: uuidv4 } = require('uuid');
+const { performance } = require('perf_hooks'); // <-- per timing lato server
 
 const app = express();
 app.use(cors());
 
 // Configurazione di multer per gestire l'upload
 const storage = multer.diskStorage({
-    destination: 'uploads/',
-    filename: function (req, file, cb) {
-        cb(null, file.originalname); // Preserva il nome originale del file
-    }
+  destination: 'uploads/',
+  filename: function (req, file, cb) {
+    cb(null, file.originalname); // preserva il nome originale
+  }
 });
+const upload = multer({ storage });
 
-const upload = multer({ storage: storage });
-
-// Percorso Python (modificalo se necessario)
+// Percorso Python (adatta se necessario)
 const pythonPath = 'C:\\Users\\solly\\AppData\\Local\\Programs\\Python\\Python312\\python.exe';
 
-// Oggetto per tenere traccia dello stato delle elaborazioni
+// Stato elaborazioni
 const processingStatus = {};
 
-// Primo processamento del DEM usando lo script completo
+// ========== Primo processamento del DEM ==========
 app.post('/process', upload.single('demFile'), (req, res) => {
-    const file = req.file;
-    if (!file) {
-        console.error("[ERROR] Nessun file caricato.");
-        return res.status(400).json({ error: "Nessun file caricato." });
+  const t0 = performance.now();
+  const file = req.file;
+  if (!file) {
+    console.error("[ERROR] Nessun file caricato.");
+    return res.status(400).json({ error: "Nessun file caricato." });
+  }
+
+  const scriptPath = path.join(__dirname, 'scripts', 'complete_dem_analysis.py');
+  const originalFileName = req.body.originalFileName
+    ? req.body.originalFileName.split('.')[0]
+    : "Unknown";
+
+  // id run
+  const processId = uuidv4();
+  processingStatus[processId] = { status: 'processing' };
+
+  // AVVIO PYTHON **NON** DETACHED + piping degli stream
+  const child = spawn(
+    pythonPath,
+    [scriptPath, file.path, originalFileName, processId],
+    {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, PYTHONUNBUFFERED: '1' } // log immediati
     }
+  );
 
-    const scriptPath = path.join(__dirname, 'scripts', 'complete_dem_analysis.py');
-    const originalFileName = req.body.originalFileName
-        ? req.body.originalFileName.split('.')[0]
-        : "Unknown";
+  // Log stdout/stderr Python nella console di Node
+  child.stdout.on('data', d => {
+    const line = d.toString().trim();
+    if (line) console.log(`[PY ${processId}] ${line}`);
+  });
 
-    // Genera un identificatore univoco per questa elaborazione
-    const processId = uuidv4(); // Usa uuidv4() per generare un UUID
-    // Salva lo stato iniziale dell'elaborazione
-    processingStatus[processId] = { status: 'processing' };
+  child.stderr.on('data', d => {
+    const line = d.toString().trim();
+    if (line) console.error(`[PY ${processId} ERR] ${line}`);
+  });
 
-    // Avvia il processo Python, passando processId come argomento
-    const pythonProcess = spawn(pythonPath, [scriptPath, file.path, originalFileName, processId], {
-        detached: true,
-        stdio: 'ignore' // Ignora gli output per evitare che il processo rimanga collegato
-    });
+  child.on('close', code => {
+    const dt = (performance.now() - t0).toFixed(1);
+    console.log(`[PY ${processId}] exited with code ${code} (server elapsed ${dt} ms)`);
+    // NB: lo stato "completed" lo aggiorna comunque lo script via POST /processComplete/:id
+    // Qui NON lo forziamo, così resti fedele al tuo flusso attuale.
+  });
 
-    // Disconnette il processo figlio
-    pythonProcess.unref();
-
-    // Rispondi immediatamente al client con il processId
-    res.json({ message: 'Processing started', processId });
-
-    // Non aspettiamo più l'evento 'close' del processo Python per aggiornare lo stato
+  // Rispondi subito con l'id
+  res.json({ message: 'Processing started', processId });
 });
 
-// Endpoint per controllare lo stato dell'elaborazione
+// Stato
 app.get('/processStatus/:processId', (req, res) => {
-    const { processId } = req.params;
-    const statusInfo = processingStatus[processId];
-
-    if (statusInfo) {
-        res.json({ status: statusInfo.status });
-    } else {
-        res.status(404).json({ error: 'Process ID not found' });
-    }
+  const { processId } = req.params;
+  const statusInfo = processingStatus[processId];
+  if (statusInfo) {
+    res.json({ status: statusInfo.status });
+  } else {
+    res.status(404).json({ error: 'Process ID not found' });
+  }
 });
 
-// Endpoint per ricevere la notifica di completamento dal processo Python
+// Notifica di completamento inviata dallo script Python
 app.post('/processComplete/:processId', (req, res) => {
-    const { processId } = req.params;
-    if (processingStatus[processId]) {
-        processingStatus[processId].status = 'completed';
-        res.json({ message: 'Process status updated to completed' });
-    } else {
-        res.status(404).json({ error: 'Process ID not found' });
-    }
+  const { processId } = req.params;
+  if (processingStatus[processId]) {
+    processingStatus[processId].status = 'completed';
+    console.log(`[INFO] process ${processId} marked as completed by Python callback`);
+    res.json({ message: 'Process status updated to completed' });
+  } else {
+    res.status(404).json({ error: 'Process ID not found' });
+  }
 });
 
-// Nuovo endpoint per il calcolo del volume
+// ========== Calcolo volume ==========
 app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
-    const file = req.file;
-    const volumeType = req.body.volumeType;
-    const approximationType = req.body.approximationType;
-    const originalFileName = req.body.originalFileName
-        ? req.body.originalFileName.split('.')[0]
-        : "Unknown";
+  const t0 = performance.now();
 
-    // Messaggi di debug
+  const file = req.file;
+  const volumeType = req.body.volumeType;
+  const approximationType = req.body.approximationType;
+  const originalFileName = req.body.originalFileName
+    ? req.body.originalFileName.split('.')[0]
+    : "Unknown";
 
-    if (!file || !volumeType || !approximationType || !originalFileName) {
-        console.error("[ERROR] Missing required fields.");
-        return res.status(400).json({ error: "Missing required fields." });
+  if (!file || !volumeType || !approximationType || !originalFileName) {
+    console.error("[ERROR] Missing required fields.");
+    return res.status(400).json({ error: "Missing required fields." });
+  }
+
+  let scriptPath;
+  if (volumeType === 'circular') {
+    if (approximationType === 'approximation1') {
+      scriptPath = path.join(__dirname, 'scripts', 'CircularVolcano_Approx1.py');
+    } else if (approximationType === 'approximation2') {
+      scriptPath = path.join(__dirname, 'scripts', 'CircularVolcano_Approx2.py');
     }
+  } else if (volumeType === 'elliptical') {
+    if (approximationType === 'approximation1') {
+      scriptPath = path.join(__dirname, 'scripts', 'EllipticalVolcano_Approx1.py');
+    } else if (approximationType === 'approximation2') {
+      scriptPath = path.join(__dirname, 'scripts', 'EllipticalVolcano_Approx2.py');
+    }
+  }
+  if (!scriptPath) return res.status(400).json({ error: 'Invalid volumeType or approximationType' });
 
-    // Decide which script to run based on volumeType and approximationType
-    let scriptPath;
-    if (volumeType === 'circular') {
-        if (approximationType === 'approximation1') {
-            scriptPath = path.join(__dirname, 'scripts', 'CircularVolcano_Approx1.py');
-        } else if (approximationType === 'approximation2') {
-            scriptPath = path.join(__dirname, 'scripts', 'CircularVolcano_Approx2.py');
-        }
-    } else if (volumeType === 'elliptical') {
-        if (approximationType === 'approximation1') {
-            scriptPath = path.join(__dirname, 'scripts', 'EllipticalVolcano_Approx1.py');
-        } else if (approximationType === 'approximation2') {
-            scriptPath = path.join(__dirname, 'scripts', 'EllipticalVolcano_Approx2.py');
-        }
+  const child = spawn(
+    pythonPath,
+    [scriptPath, file.path, originalFileName],
+    {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, PYTHONUNBUFFERED: '1' }
+    }
+  );
+
+  let resultData = '';
+
+  child.stdout.on('data', d => {
+    const s = d.toString();
+    resultData += s;
+    // Mostra comunque i log in console
+    s.split(/\r?\n/).forEach(line => {
+      if (line.trim()) console.log(`[PY VOL] ${line.trim()}`);
+    });
+  });
+
+  child.stderr.on('data', d => {
+    const s = d.toString();
+    s.split(/\r?\n/).forEach(line => {
+      if (line.trim()) console.error(`[PY VOL ERR] ${line.trim()}`);
+    });
+  });
+
+  child.on('close', code => {
+    const dt = (performance.now() - t0).toFixed(1);
+    console.log(`[TIMING][SERVER] /calculateVolume finished in ${dt} ms (code=${code})`);
+    if (code === 0) {
+      res.json({ result: resultData });
     } else {
-        return res.status(400).json({ error: 'Invalid volumeType or approximationType' });
+      res.status(500).json({ error: 'Error calculating volume' });
     }
-
-    // Spawn the Python process
-    const pythonProcess = spawn(pythonPath, [scriptPath, file.path, originalFileName]);
-
-    let resultData = '';
-    pythonProcess.stdout.on('data', (data) => {
-        resultData += data.toString();
-    });
-
-    pythonProcess.stderr.on('data', (data) => {
-        console.error("[ERROR]", data.toString());
-    });
-
-    pythonProcess.on('close', (code) => {
-        if (code === 0) {
-            res.json({ result: resultData });
-        } else {
-            res.status(500).json({ error: 'Error calculating volume' });
-        }
-    });
+  });
 });
 
-// Nuovo endpoint per la visualizzazione dello Shaded Relief
+// ========== Shaded Relief ==========
 app.post('/shadedRelief', upload.single('demFile'), (req, res) => {
-    const file = req.file;
-    if (!file) {
-        return res.status(400).send('Nessun file caricato.');
+  const file = req.file;
+  if (!file) return res.status(400).send('Nessun file caricato.');
+
+  const scriptPath = path.join(__dirname, 'scripts', 'generate_shaded_relief.py');
+  const child = spawn(pythonPath, [scriptPath, file.path], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, PYTHONUNBUFFERED: '1' }
+  });
+
+  let output = '';
+  child.stdout.on('data', d => output += d.toString());
+  child.stderr.on('data', d => fs.appendFile('error_log.txt', d.toString(), () => {}));
+  child.on('close', code => {
+    if (code !== 0) {
+      fs.appendFile('error_log.txt', `Errore Shaded Relief. Exit: ${code}\n`, () => {});
+      return res.status(500).json({ error: "Errore durante la generazione dello Shaded Relief." });
     }
+    res.json({ message: 'Shaded Relief generated successfully' });
+  });
+});
 
-    // Percorso allo script Python per la generazione dello shaded relief
-    const scriptPath = path.join(__dirname, 'scripts', 'generate_shaded_relief.py');  // Presupponendo che lo script sia salvato in questa posizione
+// ========== Slopes ==========
+app.post('/calculateSlopes', upload.single('demFile'), (req, res) => {
+  const file = req.file;
+  if (!file) return res.status(400).send('Nessun file caricato.');
 
-    // Esegui lo script Python con il file caricato
-    const pythonProcess = spawn(pythonPath, [scriptPath, file.path]);
+  const scriptPath = path.join(__dirname, 'scripts', 'generate_slopes.py');
+  const child = spawn(pythonPath, [scriptPath, file.path], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, PYTHONUNBUFFERED: '1' }
+  });
 
-    let output = '';
-    pythonProcess.stdout.on('data', (data) => {
-        output += data.toString();
-    });
+  let output = '';
+  child.stdout.on('data', d => output += d.toString());
+  child.stderr.on('data', d => fs.appendFile('error_log.txt', d.toString(), () => {}));
+  child.on('close', code => {
+    if (code !== 0) {
+      fs.appendFile('error_log.txt', `Errore slopes. Exit: ${code}\n`, () => {});
+      return res.status(500).json({ error: "Errore durante la generazione delle due pendenze." });
+    }
+    res.json({ message: 'Slope calculation successful' });
+  });
+});
 
-    pythonProcess.stderr.on('data', (data) => {
-        fs.appendFile('error_log.txt', data.toString(), (err) => {
-            if (err) {
-                console.error('Errore durante la scrittura del log:', err);
-            }
-        });
-    });
+// ========== Curvatures ==========
+app.post('/calculateCurvatures', upload.single('demFile'), (req, res) => {
+  const file = req.file;
+  if (!file) return res.status(400).send('Nessun file caricato.');
 
-    pythonProcess.on('close', (code) => {
-        if (code !== 0) {
-            fs.appendFile('error_log.txt', `Errore durante la generazione dello Shaded Relief. Codice di uscita: ${code}\n`, (err) => {
-                if (err) {
-                    console.error('Errore durante la scrittura del log:', err);
-                }
-            });
-            return res.status(500).json({ error: "Errore durante la generazione dello Shaded Relief." });
-        }
+  const scriptPath = path.join(__dirname, 'scripts', 'calculate_curvatures.py');
+  const child = spawn(pythonPath, [scriptPath, file.path], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, PYTHONUNBUFFERED: '1' }
+  });
 
-        // Restituisci l'immagine generata o un messaggio di conferma
-        res.json({ message: 'Shaded Relief generated successfully' });
-    });
+  let output = '';
+  child.stdout.on('data', d => output += d.toString());
+  child.stderr.on('data', d => fs.appendFile('error_log.txt', d.toString(), () => {}));
+  child.on('close', code => {
+    if (code !== 0) {
+      fs.appendFile('error_log.txt', `Errore curvature. Exit: ${code}\n`, () => {});
+      return res.status(500).json({ error: "Errore durante la generazione delle curvature." });
+    }
+    res.json({ message: 'Curvature calcolate con successo', output });
+  });
 });
 
 app.listen(5000, () => {
+  console.log('[SERVER] listening on http://localhost:5000');
 });
-
-// Nuovo endpoint per la visualizzazione delle due pendenze (slope1 e slope2)
-app.post('/calculateSlopes', upload.single('demFile'), (req, res) => {
-    const file = req.file;
-    if (!file) {
-        return res.status(400).send('Nessun file caricato.');
-    }
-
-    // Percorso allo script Python per la generazione delle due pendenze
-    const scriptPath = path.join(__dirname, 'scripts', 'generate_slopes.py');  // Presupponendo che lo script sia salvato in questa posizione
-
-    // Esegui lo script Python con il file caricato
-    const pythonProcess = spawn(pythonPath, [scriptPath, file.path]);
-
-    let output = '';
-    pythonProcess.stdout.on('data', (data) => {
-        output += data.toString();
-    });
-
-    pythonProcess.stderr.on('data', (data) => {
-        fs.appendFile('error_log.txt', data.toString(), (err) => {
-            if (err) {
-                console.error('Errore durante la scrittura del log:', err);
-            }
-        });
-    });
-
-    pythonProcess.on('close', (code) => {
-        if (code !== 0) {
-            fs.appendFile('error_log.txt', `Errore durante la generazione delle due pendenze. Codice di uscita: ${code}\n`, (err) => {
-                if (err) {
-                    console.error('Errore durante la scrittura del log:', err);
-                }
-            });
-            return res.status(500).json({ error: "Errore durante la generazione delle due pendenze." });
-        }
-
-        res.json({ message: 'Slope calculation successful' });
-    });
-});
-
-// Endpoint per il calcolo e visualizzazione delle curvature
-app.post('/calculateCurvatures', upload.single('demFile'), (req, res) => {
-    const file = req.file;
-    if (!file) {
-        return res.status(400).send('Nessun file caricato.');
-    }
-
-    // Percorso allo script Python per la generazione delle curvature
-    const scriptPath = path.join(__dirname, 'scripts', 'calculate_curvatures.py');
-
-    // Esegui lo script Python con il file caricato
-    const pythonProcess = spawn(pythonPath, [scriptPath, file.path]);
-
-    let output = '';
-    pythonProcess.stdout.on('data', (data) => {
-        output += data.toString();
-    });
-
-    pythonProcess.stderr.on('data', (data) => {
-        fs.appendFile('error_log.txt', data.toString(), (err) => {
-            if (err) {
-                console.error('Errore durante la scrittura del log:', err);
-            }
-        });
-    });
-
-    pythonProcess.on('close', (code) => {
-        if (code !== 0) {
-            fs.appendFile('error_log.txt', `Errore durante la generazione delle curvature. Codice di uscita: ${code}\n`, (err) => {
-                if (err) {
-                    console.error('Errore durante la scrittura del log:', err);
-                }
-            });
-            return res.status(500).json({ error: "Errore durante la generazione delle curvature." });
-        }
-
-        res.json({ message: 'Curvature calcolate con successo', output });
-    });
-});
-

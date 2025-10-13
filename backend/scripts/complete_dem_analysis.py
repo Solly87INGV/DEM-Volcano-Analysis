@@ -5,6 +5,9 @@ import os
 import json
 import numpy as np
 import rasterio
+import time
+import psutil
+from contextlib import contextmanager
 from scipy.ndimage import gaussian_filter, sobel
 from skimage import measure
 from PyQt5 import QtWidgets
@@ -23,6 +26,33 @@ import requests  # Per inviare richieste HTTP al server Node.js
 import pandas as pd  # Per esportare i dati in CSV
 import matplotlib.cm as cm  # Per accedere ai colormap
 from matplotlib.widgets import RectangleSelector  # Per la selezione di regioni
+
+# ==== Memory & timing helpers ======================================
+_process = psutil.Process(os.getpid())
+_peak_mb = 0.0
+
+def _mem_mb() -> float:
+    return _process.memory_info().rss / (1024 * 1024)
+
+def log_memory(tag: str = ""):
+    """Logga snapshot RAM corrente e aggiorna il picco."""
+    global _peak_mb
+    cur = _mem_mb()
+    if cur > _peak_mb:
+        _peak_mb = cur
+    print(f"[MEMORY] {tag}: {cur:.1f} MB (peak so far: {_peak_mb:.1f} MB)")
+
+@contextmanager
+def phase(name: str):
+    """Context manager per tempi + RAM."""
+    t0 = time.time()
+    log_memory(f"{name}::start")
+    try:
+        yield
+    finally:
+        log_memory(f"{name}::end")
+        dt = time.time() - t0
+        print(f"[TIMING] {name}: {dt:.3f} s")
 
 # ### Definizione della CustomNavigationToolbar ###
 class CustomNavigationToolbar(NavigationToolbar):
@@ -281,9 +311,6 @@ class DEMAnalysisApp(QMainWindow):
         # Connessione degli eventi per i tooltips
         self.canvas.mpl_connect("motion_notify_event", self.on_motion)
 
-        # Aggiungi RectangleSelector per ogni grafico dopo la creazione dei plot
-        # Verrà gestito nell'update_display()
-
         # Display iniziale
         self.update_display()
 
@@ -353,11 +380,12 @@ class DEMAnalysisApp(QMainWindow):
 
                 # Aggiungi RectangleSelector per la selezione di regioni
                 self.rectangle_selectors[i] = RectangleSelector(
-                    ax, self.on_select, drawtype='box',
-                    useblit=True, button=[1],  # Solo il tasto sinistro del mouse
-                    minspanx=5, minspany=5, spancoords='pixels',
-                    interactive=True
+                ax, self.on_select,
+                useblit=True, button=[1],
+                 minspanx=5, minspany=5, spancoords='pixels',
+                interactive=True
                 )
+
                 print(f"[DEBUG] Plotted graph {i} with title '{titles[i]}'")
             except Exception as e:
                 print(f"[ERROR] Error plotting graph {i}: {e}")
@@ -759,121 +787,147 @@ def main():
     print(f"[DEBUG] Original file name: {original_file_name}")
     print(f"[DEBUG] Number of arguments received: {len(sys.argv)}")
 
+    # ==== Benchmark: start ====
+    _t_all_start = time.time()
+    log_memory("program_start")
+
+    # Caricamento DEM (timed)
     try:
-        dem, profile, transform, res = load_dem(dem_path)
-        print(f"[DEBUG] DEM loaded successfully. Dimensions: {dem.shape}, Resolution: {res}")
+        with phase("load_dem"):
+            dem, profile, transform, res = load_dem(dem_path)
+            print(f"[DEBUG] DEM loaded successfully. Dimensions: {dem.shape}, Resolution: {res}")
+            log_memory("after_load_dem")
     except Exception as e:
         print(f"Error loading DEM: {e}")
         sys.exit(1)
 
     # Esegui le varie analisi
     try:
-        print("[DEBUG] Starting Hillshade calculation.")
-        hillshade = calculate_hillshade(dem)
-        print("[DEBUG] Hillshade calculated successfully.")
+        with phase("derivatives"):
+            with phase("calc: hillshade"):
+                print("[DEBUG] Starting Hillshade calculation.")
+                hillshade = calculate_hillshade(dem)
+                print("[DEBUG] Hillshade calculated successfully.")
 
-        print("[DEBUG] Starting Aspect calculation.")
-        aspect = calculate_aspect(dem)
-        print("[DEBUG] Aspect calculated successfully.")
+            with phase("calc: aspect"):
+                print("[DEBUG] Starting Aspect calculation.")
+                aspect = calculate_aspect(dem)
+                print("[DEBUG] Aspect calculated successfully.")
 
-        print("[DEBUG] Starting Convexity calculation.")
-        convexity = calculate_convexity(dem, amplification_factor=200)
-        print("[DEBUG] Convexity calculated successfully.")
+            with phase("calc: convexity"):
+                print("[DEBUG] Starting Convexity calculation.")
+                convexity = calculate_convexity(dem, amplification_factor=200)
+                print("[DEBUG] Convexity calculated successfully.")
 
-        print("[DEBUG] Starting Shaded Relief calculation.")
-        shaded = shaded_relief(dem, scale=10)
-        print("[DEBUG] Shaded Relief calculated successfully.")
+            with phase("calc: shaded_relief"):
+                print("[DEBUG] Starting Shaded Relief calculation.")
+                shaded = shaded_relief(dem, scale=10)
+                print("[DEBUG] Shaded Relief calculated successfully.")
 
-        print("[DEBUG] Starting Roughness calculation.")
-        roughness = calculate_roughness(dem)
-        print("[DEBUG] Roughness calculated successfully.")
+            with phase("calc: roughness"):
+                print("[DEBUG] Starting Roughness calculation.")
+                roughness = calculate_roughness(dem)
+                print("[DEBUG] Roughness calculated successfully.")
 
-        print("[DEBUG] Starting Slope calculation.")
-        slope2 = calculate_slope_2(dem)
-        print("[DEBUG] Slope calculated successfully.")
+            with phase("calc: slope"):
+                print("[DEBUG] Starting Slope calculation.")
+                slope2 = calculate_slope_2(dem)
+                print("[DEBUG] Slope calculated successfully.")
 
-        print("[DEBUG] Starting Curvature calculation.")
-        curvature = calculate_curvature(dem)
-        print("[DEBUG] Curvature calculated successfully.")
+            with phase("calc: curvature"):
+                print("[DEBUG] Starting Curvature calculation.")
+                curvature = calculate_curvature(dem)
+                print("[DEBUG] Curvature calculated successfully.")
 
-        print("[DEBUG] Starting Gaussian Curvature calculation.")
-        normalized_log_gaussian_curvature, log_gaussian_curvature = calculate_gaussian_curvature(dem, res)
-        print("[DEBUG] Gaussian Curvature calculated successfully.")
+            with phase("calc: gaussian_curvature"):
+                print("[DEBUG] Starting Gaussian Curvature calculation.")
+                normalized_log_gaussian_curvature, log_gaussian_curvature = calculate_gaussian_curvature(dem, res)
+                print("[DEBUG] Gaussian Curvature calculated successfully.")
 
-        # Amplificazione e smoothing della curvatura
-        amplification_factor = 5
-        curvature_amplified = curvature * amplification_factor
-        curvature_smoothed = gaussian_filter(curvature_amplified, sigma=1)
-        curvature_smoothed_normalized = (
-            curvature_smoothed - np.min(curvature_smoothed)
-        ) / (np.max(curvature_smoothed) - np.min(curvature_smoothed))
+            with phase("calc: smooth+normalize"):
+                print("[DEBUG] Starting curvature amplify + smooth + normalize.")
+                amplification_factor = 5
+                curvature_amplified = curvature * amplification_factor
+                curvature_smoothed = gaussian_filter(curvature_amplified, sigma=1)
+                curvature_smoothed_normalized = (
+                    curvature_smoothed - np.min(curvature_smoothed)
+                ) / (np.max(curvature_smoothed) - np.min(curvature_smoothed))
+                print("[DEBUG] Curvature smoothing/normalization completed.")
     except Exception as e:
         print(f"Error during analysis calculations: {e}")
         sys.exit(1)
 
-    # Raccogli statistiche in un dizionario
-    total_statistics, gauss_curv_stats = gather_statistics(
-        log_gaussian_curvature, "Logarithmic Amplified Gaussian Curvature"
-    )
-    _, smooth_curv_stats = gather_statistics(
-        curvature_smoothed, "Amplified and Smoothed Curvature"
-    )
+    # Raccogli statistiche in un dizionario (timed)
+    with phase("statistics_json"):
+        total_statistics, gauss_curv_stats = gather_statistics(
+            log_gaussian_curvature, "Logarithmic Amplified Gaussian Curvature"
+        )
+        _, smooth_curv_stats = gather_statistics(
+            curvature_smoothed, "Amplified and Smoothed Curvature"
+        )
+        write_statistics_to_json(total_statistics, filename="output_statistics.json")
+        print("[DEBUG] Statistics written to output_statistics.json")
+        log_memory("after_statistics_json")
 
-    # Scrivi le statistiche in un file JSON
-    write_statistics_to_json(total_statistics, filename="output_statistics.json")
-    print("[DEBUG] Statistics written to output_statistics.json")
+    # Organizza le analisi in triplette (timed)
+    with phase("prepare_triplets"):
+        print("[DEBUG] Preparing analysis triplets.")
+        analysis_triplets = [
+            (dem, shaded, hillshade),  # Prima finestra
+            (dem, aspect, slope2),     # Seconda finestra
+            (dem, roughness, convexity),  # Terza finestra
+            (dem, curvature_smoothed_normalized, normalized_log_gaussian_curvature)
+        ]
+        print("[DEBUG] Analysis triplets prepared.")
+        titles = [
+            "DEM", "Shaded Relief", "Hillshade",
+            "DEM", "Aspect", "Slope",
+            "DEM", "Roughness", "Convexity",
+            "DEM", "Amplified and Smoothed Curvature", "Logarithmic Amplified Gaussian Curvature"
+        ]
+        cmaps = [
+            "terrain", "gray", "gray",
+            "terrain", "twilight", "plasma",
+            "terrain", "seismic", "twilight",
+            "terrain", "plasma", "plasma"
+        ]
+        units = [
+            "m", "Adimensional", "Adimensional",  # Prima finestra
+            "m", "Degrees", "Degrees",            # Seconda finestra
+            "m", "Adimensional", "Adimensional",  # Terza finestra
+            "m", "Adimensional", "Adimensional"   # Quarta finestra
+        ]
+        descriptions = [
+            "Represents terrain elevation in meters above sea level.",
+            "Simulates light and shadow effects on the terrain.",
+            "Represents relative illumination intensity on the terrain.\nSun position Altitude=45° - Azimuth=45°",
+            "Represents terrain elevation in meters above sea level.",
+            "Indicates the direction of the slope in degrees.\nWith 0° representing north, increasing clockwise to 360°",
+            "Measures terrain slope in degrees.",
+            "Represents terrain elevation in meters above sea level.",
+            "Measures local variations in elevation.",
+            "Shows whether terrain areas are convex or concave.",
+            "Represents terrain elevation in meters above sea level.",
+            "Smoothed curvature for improved interpretation.",
+            "Gaussian curvature for detailed terrain analysis."
+        ]
+        log_memory("after_prepare_triplets")
 
-    # Organizza le analisi in triplette
-    print("[DEBUG] Preparing analysis triplets.")
-    analysis_triplets = [
-        (dem, shaded, hillshade),  # Prima finestra
-        (dem, aspect, slope2),     # Seconda finestra
-        (dem, roughness, convexity),  # Terza finestra
-        (dem, curvature_smoothed_normalized, normalized_log_gaussian_curvature)
-    ]
-    print("[DEBUG] Analysis triplets prepared.")
-    titles = [
-        "DEM", "Shaded Relief", "Hillshade",
-        "DEM", "Aspect", "Slope",
-        "DEM", "Roughness", "Convexity",
-        "DEM", "Amplified and Smoothed Curvature", "Logarithmic Amplified Gaussian Curvature"
-    ]
-    cmaps = [
-        "terrain", "gray", "gray",
-        "terrain", "twilight", "plasma",
-        "terrain", "seismic", "twilight",
-        "terrain", "plasma", "plasma"
-    ]
-    units = [
-        "m", "Adimensional", "Adimensional",  # Prima finestra
-        "m", "Degrees", "Degrees",            # Seconda finestra
-        "m", "Adimensional", "Adimensional",  # Terza finestra
-        "m", "Adimensional", "Adimensional"   # Quarta finestra
-    ]
-    descriptions = [
-        "Represents terrain elevation in meters above sea level.",
-        "Simulates light and shadow effects on the terrain.",
-        "Represents relative illumination intensity on the terrain.\nSun position Altitude=45° - Azimuth=45°",
-        "Represents terrain elevation in meters above sea level.",
-        "Indicates the direction of the slope in degrees.\nWith 0° representing north, increasing clockwise to 360°",
-        "Measures terrain slope in degrees.",
-        "Represents terrain elevation in meters above sea level.",
-        "Measures local variations in elevation.",
-        "Shows whether terrain areas are convex or concave.",
-        "Represents terrain elevation in meters above sea level.",
-        "Smoothed curvature for improved interpretation.",
-        "Gaussian curvature for detailed terrain analysis."
-    ]
-
-    # Invia notifica di completamento al server Node.js
+    # Invia notifica di completamento al server Node.js (timed, se presente process_id)
     if process_id:
-        try:
-            print(f"[DEBUG] Sending completion notification to server for process ID: {process_id}")
-            response = requests.post(f'http://localhost:5000/processComplete/{process_id}')
-            print(f"[DEBUG] Server response status code: {response.status_code}")
-            print(f"[DEBUG] Server response content: {response.content}")
-        except Exception as e:
-            print(f"[ERROR] Error sending completion notification: {e}")
+        with phase("notify_server"):
+            try:
+                print(f"[DEBUG] Sending completion notification to server for process ID: {process_id}")
+                response = requests.post(f'http://localhost:5000/processComplete/{process_id}')
+                print(f"[DEBUG] Server response status code: {response.status_code}")
+                print(f"[DEBUG] Server response content: {response.content}")
+            except Exception as e:
+                print(f"[ERROR] Error sending completion notification: {e}")
+
+    # ==== Benchmark: final summary (prima di avviare la GUI) ====
+    print(f"[RESULT] Peak RAM = {_peak_mb:.1f} MB")
+    print(f"[TIMING] total_end_to_end = {time.time() - _t_all_start:.3f} s")
+    log_memory("before_gui_start")
 
     # Avvia l'applicazione PyQt5 con un piccolo ritardo per assicurare che la richiesta sia completata
     try:

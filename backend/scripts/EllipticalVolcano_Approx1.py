@@ -102,8 +102,8 @@ class VolumeAnalysisApp(QMainWindow):
         button_layout = QHBoxLayout()
         main_layout.addLayout(button_layout)
 
-        self.results_button = QPushButton('Results')
-        self.results_button.setFixedSize(150, 50)
+        self.results_button = QPushButton('View Results && Print Report')
+        self.results_button.setFixedSize(180, 50)
         self.results_button.clicked.connect(self.show_results)
         button_layout.addWidget(self.results_button)
 
@@ -323,7 +323,7 @@ class VolumeAnalysisApp(QMainWindow):
         msg_box = QMessageBox()
         msg_box.setWindowTitle("Summary Results")
         msg_box.setText(self.results_text)
-        download_button = msg_box.addButton("Download Full Results", QMessageBox.ActionRole)
+        download_button = msg_box.addButton("Download Full Report", QMessageBox.ActionRole)
         msg_box.addButton(QMessageBox.Ok)
         msg_box.exec_()
 

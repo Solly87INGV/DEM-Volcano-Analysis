@@ -9,17 +9,41 @@ from scipy.ndimage import gaussian_filter, sobel
 from skimage import measure
 from PyQt5 import QtWidgets
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QFileDialog, QMessageBox
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QFileDialog, QMessageBox,
+    QComboBox, QDialog, QLabel, QSizePolicy, QSpacerItem, QDialogButtonBox
 )
-from PyQt5.QtCore import QTimer  # Importa QTimer
+from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtGui import QCursor
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt5 import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 from matplotlib import gridspec  # For advanced subplot layout
 from mpl_toolkits.mplot3d import Axes3D  # Necessary for 3D plots
 import requests  # Per inviare richieste HTTP al server Node.js
 import pandas as pd  # Per esportare i dati in CSV
+import matplotlib.cm as cm  # Per accedere ai colormap
+from matplotlib.widgets import RectangleSelector  # Per la selezione di regioni
 
-# Function to calculate hillshade
+# ### Definizione della CustomNavigationToolbar ###
+class CustomNavigationToolbar(NavigationToolbar):
+    """
+    Classe personalizzata per la NavigationToolbar di Matplotlib.
+    Rimuove il pulsante di salvataggio predefinito.
+    """
+    def __init__(self, canvas, parent):
+        super().__init__(canvas, parent)
+        self.remove_save_button()
+
+    def remove_save_button(self):
+        """
+        Rimuove il pulsante 'Save the figure' dalla toolbar.
+        """
+        for action in self.actions():
+            if action.toolTip() == 'Save the figure':
+                self.removeAction(action)
+                break
+
+# Funzioni di analisi (rimangono invariate)
 def calculate_hillshade(dem, azimuth=45, altitude=45):
     x, y = np.gradient(dem)
     slope = np.pi / 2 - np.arctan(np.sqrt(x ** 2 + y ** 2))
@@ -34,7 +58,6 @@ def calculate_hillshade(dem, azimuth=45, altitude=45):
     hillshade = np.clip(shaded, 0, 1) * 255
     return hillshade
 
-# Function to calculate aspect
 def calculate_aspect(dem):
     x, y = np.gradient(dem)
     aspect = np.arctan2(-x, y)
@@ -42,7 +65,6 @@ def calculate_aspect(dem):
     aspect = np.where(aspect < 0, 360 + aspect, aspect)
     return aspect
 
-# Function to calculate convexity
 def calculate_convexity(dem, amplification_factor=100):
     x, y = np.gradient(dem)
     xx, xy = np.gradient(x)
@@ -51,20 +73,17 @@ def calculate_convexity(dem, amplification_factor=100):
     convexity *= amplification_factor
     return convexity
 
-# Function to create a shaded relief map
 def shaded_relief(dem, scale=10):
     x, y = np.gradient(dem)
     shaded = np.sqrt(x ** 2 + y ** 2)
     shaded *= scale
     return shaded
 
-# Function to calculate slope (slope 2)
 def calculate_slope_2(dem):
     dz_dx, dz_dy = np.gradient(dem)
     slope = np.arctan(np.sqrt(dz_dx ** 2 + dz_dy ** 2)) * (180 / np.pi)
     return slope
 
-# Function to calculate mean curvature
 def calculate_curvature(dem):
     dz_dx = np.gradient(dem, axis=1)
     dz_dy = np.gradient(dem, axis=0)
@@ -73,7 +92,6 @@ def calculate_curvature(dem):
     curvature = dz_dx2 + dz_dy2
     return curvature
 
-# Function to calculate Gaussian curvature
 def calculate_gaussian_curvature(dem, res, amplification_factor=10):
     dem_smoothed = gaussian_filter(dem, sigma=1)
     dzdx, dzdy = np.gradient(dem_smoothed, res)
@@ -89,7 +107,6 @@ def calculate_gaussian_curvature(dem, res, amplification_factor=10):
     ) / (np.max(log_gaussian_curvature) - np.min(log_gaussian_curvature))
     return normalized_log_gaussian_curvature, log_gaussian_curvature
 
-# Function to gather statistics
 def gather_statistics(curvature, description=""):
     stats = {
         'min': float(np.min(curvature)),
@@ -100,18 +117,15 @@ def gather_statistics(curvature, description=""):
     }
     return {description: stats}, stats
 
-# Function to write statistics to a JSON file
 def write_statistics_to_json(stats, filename="output_statistics.json"):
     with open(filename, 'w') as f:
         json.dump(stats, f, indent=4)
 
-# Function to calculate roughness (rugosità)
 def calculate_roughness(dem, window=3):
     from scipy.ndimage import generic_filter
     roughness = generic_filter(dem, np.std, size=window)
     return roughness
 
-# Function to load a DEM from a file
 def load_dem(dem_path):
     with rasterio.open(dem_path) as src:
         dem = src.read(1)  # Read the first channel
@@ -119,6 +133,34 @@ def load_dem(dem_path):
         transform = src.transform  # Affine transformation
         res = src.res[0]
     return dem, profile, transform, res
+
+# Dialog per selezionare il colormap
+class ColormapDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Colormap")
+        self.selected_colormap = "terrain"  # Default colormap
+
+        layout = QVBoxLayout()
+
+        label = QLabel("Choose a colormap:")
+        layout.addWidget(label)
+
+        self.combo_box = QComboBox()
+        # Aggiungi una lista di colormap di matplotlib
+        self.combo_box.addItems(sorted(m for m in cm.datad if not m.endswith("_r")))
+        self.combo_box.setCurrentText(self.selected_colormap)
+        layout.addWidget(self.combo_box)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.setLayout(layout)
+
+    def get_selected_colormap(self):
+        return self.combo_box.currentText()
 
 # Classe PyQt5 Application con le modifiche richieste
 class DEMAnalysisApp(QMainWindow):
@@ -134,6 +176,24 @@ class DEMAnalysisApp(QMainWindow):
         self.descriptions = descriptions
         self.file_name = file_name
         self.current_index = 0
+
+        # Nuove proprietà per colormap e selezione grafico
+        self.selected_colormap = "terrain"  # Default colormap
+        self.selected_graph = 0  # Indice del grafico selezionato (0, 1, 2)
+
+        # Liste per memorizzare immagini, colorbar e assi dei grafici
+        self.images = [None, None, None]
+        self.colorbars = [None, None, None]
+        self.image_axes = [None, None, None]  # Nuova lista per gli assi dei grafici
+        self.rectangle_selectors = [None, None, None]  # Per la selezione di regioni
+
+        # Etichetta per i tooltips
+        self.tooltip_label = QLabel("", self)
+        self.tooltip_label.setStyleSheet("background-color: white; border: 1px solid black;")
+        self.tooltip_label.setVisible(False)
+        self.tooltip_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.tooltip_label.setWindowFlags(Qt.ToolTip)
+
         self.initUI()
 
     def initUI(self):
@@ -149,10 +209,20 @@ class DEMAnalysisApp(QMainWindow):
         self.canvas = FigureCanvas(self.figure)
         main_layout.addWidget(self.canvas)
 
-        # Pulsanti di navigazione
+        # Creazione della Custom Navigation Toolbar (senza pulsante di salvataggio)
+        self.toolbar = CustomNavigationToolbar(self.canvas, self)
+        
+        # Pulsanti di navigazione e nuove funzionalità in un'unica riga
         nav_layout = QHBoxLayout()
         main_layout.addLayout(nav_layout)
 
+        # Allineamento orizzontale: Toolbar + Spacer + Pulsanti
+        nav_layout.addWidget(self.toolbar)
+
+        # Spacer tra la toolbar e i pulsanti
+        nav_layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
+
+        # Pulsanti di navigazione: Previous e Next
         self.prev_button = QPushButton('Previous')
         self.prev_button.setFixedSize(100, 40)
         self.prev_button.clicked.connect(self.previous_triplet)
@@ -163,30 +233,67 @@ class DEMAnalysisApp(QMainWindow):
         self.next_button.clicked.connect(self.next_triplet)
         nav_layout.addWidget(self.next_button)
 
+        # Pulsante per visualizzare il modello 3D
         self.view3d_button = QPushButton('View 3D Model')
         self.view3d_button.setFixedSize(120, 40)
         self.view3d_button.clicked.connect(self.display_volcano_3d)
         nav_layout.addWidget(self.view3d_button)
 
-        # ### Aggiunta del Pulsante di Download in Formato PNG o JPG ###
+        # Spacer tra i pulsanti di navigazione e i controlli di selezione
+        nav_layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
+
+        # Label "Select Graph:"
+        self.graph_selection_label = QLabel("Select Graph:")
+        self.graph_selection_label.setFixedSize(100, 40)
+        self.graph_selection_label.setAlignment(Qt.AlignVCenter | Qt.AlignRight)  # Allineamento verticale
+        nav_layout.addWidget(self.graph_selection_label)
+
+        # ComboBox per selezionare il grafico
+        self.graph_selection_combo = QComboBox()
+        self.graph_selection_combo.setFixedSize(200, 40)
+        self.graph_selection_combo.currentIndexChanged.connect(self.update_selected_graph)
+        nav_layout.addWidget(self.graph_selection_combo)
+
+        # Pulsante "Select Colormap"
+        self.select_colormap_button = QPushButton('Select Colormap')
+        self.select_colormap_button.setFixedSize(150, 40)
+        self.select_colormap_button.clicked.connect(self.select_colormap)
+        nav_layout.addWidget(self.select_colormap_button)
+
+        # Spacer tra i controlli di selezione e gli altri pulsanti
+        nav_layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
+
+        # Pulsante di Download
         self.download_image_button = QPushButton('Download as PNG or JPG')
         self.download_image_button.setFixedSize(200, 40)
         self.download_image_button.clicked.connect(self.download_graph_image)
         nav_layout.addWidget(self.download_image_button)
 
-        # ### Aggiunta del Pulsante di Esportazione dei Dati ###
+        # Pulsante di Esportazione dei Dati
         self.export_data_button = QPushButton('Export Data')
         self.export_data_button.setFixedSize(120, 40)
         self.export_data_button.clicked.connect(self.export_data)
         nav_layout.addWidget(self.export_data_button)
 
-        # Nascondi il pulsante "Previous" all'avvio
-        self.prev_button.setVisible(False)
+        # Spacer per equidistanza a destra
+        nav_layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
+
+        # Connessione degli eventi per i tooltips
+        self.canvas.mpl_connect("motion_notify_event", self.on_motion)
+
+        # Aggiungi RectangleSelector per ogni grafico dopo la creazione dei plot
+        # Verrà gestito nell'update_display()
 
         # Display iniziale
         self.update_display()
 
+    def update_selected_graph(self):
+        # La selezione del grafico è semplicemente l'indice selezionato nel combo box
+        self.selected_graph = self.graph_selection_combo.currentIndex()
+        print(f"[DEBUG] Selected graph index: {self.selected_graph}")
+
     def update_display(self):
+        print("[DEBUG] Updating display...")
         self.figure.clear()
         fig = self.figure
 
@@ -204,41 +311,56 @@ class DEMAnalysisApp(QMainWindow):
 
         idx = self.current_index * 3
 
-        # Primo grafico (DEM)
-        ax1 = fig.add_subplot(gs[0, 0])
-        im1 = ax1.imshow(dem_data, cmap='terrain', origin='upper')
-        ax1.set_title(self.titles[idx], pad=10)
-        ax1.set_aspect('equal', adjustable='box')
-        cbar1 = ax1.figure.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
-        cbar1.set_label(f"Elevation ({self.units[idx]})", rotation=90)
-        ax1.text(
-            0.5, -0.15, self.descriptions[idx],
-            transform=ax1.transAxes, ha='center', fontsize=10, wrap=True
-        )
+        # Lista dei dati e titoli
+        data_list = [dem_data, data1, data2]
+        titles = self.titles[idx:idx + 3]
+        units = self.units[idx:idx + 3]
+        descriptions = self.descriptions[idx:idx + 3]
+        cmaps = self.cmaps[idx:idx + 3]
 
-        # Secondo grafico
-        ax2 = fig.add_subplot(gs[0, 1])
-        im2 = ax2.imshow(data1, cmap=self.cmaps[idx + 1], origin='upper')
-        ax2.set_title(self.titles[idx + 1], pad=10)
-        ax2.set_aspect('equal', adjustable='box')
-        cbar2 = ax2.figure.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
-        cbar2.set_label(f"{self.units[idx + 1]}", rotation=90)
-        ax2.text(
-            0.5, -0.15, self.descriptions[idx + 1],
-            transform=ax2.transAxes, ha='center', fontsize=10, wrap=True
-        )
+        # Pulisci le liste di immagini, colorbar e assi dei grafici
+        self.images = [None, None, None]
+        self.colorbars = [None, None, None]
+        self.image_axes = [None, None, None]
+        # Disattiva e cancella i RectangleSelector precedenti
+        for selector in self.rectangle_selectors:
+            if selector is not None:
+                selector.set_active(False)
+        self.rectangle_selectors = [None, None, None]  # Reset dei RectangleSelector
 
-        # Terzo grafico
-        ax3 = fig.add_subplot(gs[0, 2])
-        im3 = ax3.imshow(data2, cmap=self.cmaps[idx + 2], origin='upper')
-        ax3.set_title(self.titles[idx + 2], pad=10)
-        ax3.set_aspect('equal', adjustable='box')
-        cbar3 = ax3.figure.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
-        cbar3.set_label(f"{self.units[idx + 2]}", rotation=90)
-        ax3.text(
-            0.5, -0.15, self.descriptions[idx + 2],
-            transform=ax3.transAxes, ha='center', fontsize=10, wrap=True
-        )
+        # Plot dei tre grafici
+        for i in range(3):
+            try:
+                ax = fig.add_subplot(gs[0, i])
+                im = ax.imshow(data_list[i], cmap=cmaps[i], origin='upper')
+                ax.set_title(titles[i], pad=10)
+                ax.set_aspect('equal', adjustable='box')
+
+                # Crea la colorbar e memorizza la referenza
+                cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                cbar.set_label(f"{units[i]}", rotation=90)
+
+                # Aggiungi descrizione
+                ax.text(
+                    0.5, -0.15, descriptions[i],
+                    transform=ax.transAxes, ha='center', fontsize=10, wrap=True
+                )
+
+                # Memorizza le referenze
+                self.images[i] = im
+                self.colorbars[i] = cbar
+                self.image_axes[i] = ax  # Memorizza l'asse del grafico principale
+
+                # Aggiungi RectangleSelector per la selezione di regioni
+                self.rectangle_selectors[i] = RectangleSelector(
+                    ax, self.on_select, drawtype='box',
+                    useblit=True, button=[1],  # Solo il tasto sinistro del mouse
+                    minspanx=5, minspany=5, spancoords='pixels',
+                    interactive=True
+                )
+                print(f"[DEBUG] Plotted graph {i} with title '{titles[i]}'")
+            except Exception as e:
+                print(f"[ERROR] Error plotting graph {i}: {e}")
 
         self.canvas.draw()
 
@@ -253,177 +375,369 @@ class DEMAnalysisApp(QMainWindow):
             self.prev_button.setVisible(True)
             self.next_button.setVisible(True)
 
+        # Aggiorna il ComboBox per la selezione del grafico
+        self.graph_selection_combo.blockSignals(True)  # Blocca segnali temporaneamente
+        self.graph_selection_combo.clear()
+        current_titles = self.titles[idx:idx + 3]
+        self.graph_selection_combo.addItems(current_titles)
+        # Reset la selezione al primo grafico
+        self.graph_selection_combo.setCurrentIndex(0)
+        self.selected_graph = 0
+        self.graph_selection_combo.blockSignals(False)  # Riattiva segnali
+        print("[DEBUG] Display update complete.")
+
     def next_triplet(self):
         if self.current_index < len(self.analysis_triplets) - 1:
             self.current_index += 1
+            print(f"[DEBUG] Moving to next triplet: {self.current_index}")
             self.update_display()
 
     def previous_triplet(self):
         if self.current_index > 0:
             self.current_index -= 1
+            print(f"[DEBUG] Moving to previous triplet: {self.current_index}")
             self.update_display()
 
     def display_volcano_3d(self):
-        # Creazione di una nuova finestra per il modello 3D
-        self.three_d_window = QtWidgets.QMainWindow()
-        self.three_d_window.setWindowTitle('3D Model')
-        central_widget = QtWidgets.QWidget()
-        self.three_d_window.setCentralWidget(central_widget)
-        layout = QVBoxLayout(central_widget)
+        try:
+            print("[DEBUG] Displaying 3D model window.")
+            # Creazione di una nuova finestra per il modello 3D
+            self.three_d_window = QtWidgets.QMainWindow()
+            self.three_d_window.setWindowTitle('3D Model')
+            central_widget = QtWidgets.QWidget()
+            self.three_d_window.setCentralWidget(central_widget)
+            layout = QVBoxLayout(central_widget)
 
-        figure_3d = Figure(figsize=(10, 8))
-        canvas_3d = FigureCanvas(figure_3d)
-        layout.addWidget(canvas_3d)
+            figure_3d = Figure(figsize=(10, 8))
+            canvas_3d = FigureCanvas(figure_3d)
+            layout.addWidget(canvas_3d)
 
-        ax = figure_3d.add_subplot(111, projection='3d')
+            ax = figure_3d.add_subplot(111, projection='3d')
 
-        x = np.arange(0, self.dem.shape[1])
-        y = np.arange(0, self.dem.shape[0])
-        x, y = np.meshgrid(x, y)
+            x = np.arange(0, self.dem.shape[1])
+            y = np.arange(0, self.dem.shape[0])
+            x, y = np.meshgrid(x, y)
 
-        # Scala l'asse z se necessario
-        z = self.dem
+            # Scala l'asse z se necessario
+            z = self.dem
 
-        surface = ax.plot_surface(
-            x, y, z, cmap='terrain', edgecolor='none',
-            rstride=1, cstride=1, antialiased=True
-        )
+            surface = ax.plot_surface(
+                x, y, z, cmap=self.selected_colormap, edgecolor='none',
+                rstride=1, cstride=1, antialiased=True
+            )
 
-        figure_3d.colorbar(surface, ax=ax, shrink=0.5, aspect=5)
-        ax.set_title('3D Model', fontsize=15)
-        ax.set_xlabel('X Coordinate', fontsize=12)
-        ax.set_ylabel('Y Coordinate', fontsize=12)
-        ax.set_zlabel('Elevation (m)', fontsize=12)
-        ax.view_init(elev=60, azim=20)
+            figure_3d.colorbar(surface, ax=ax, shrink=0.5, aspect=5)
+            ax.set_title('3D Model', fontsize=15)
+            ax.set_xlabel('X Coordinate', fontsize=12)
+            ax.set_ylabel('Y Coordinate', fontsize=12)
+            ax.set_zlabel('Elevation (m)', fontsize=12)
+            ax.view_init(elev=60, azim=20)
 
-        canvas_3d.draw()
-        self.three_d_window.show()
+            canvas_3d.draw()
+            self.three_d_window.show()
+            print("[DEBUG] 3D model window displayed successfully.")
+        except Exception as e:
+            QMessageBox.critical(
+                self, 
+                "3D Model Error", 
+                f"An error occurred while displaying the 3D model: {e}"
+            )
+            print(f"[ERROR] Error in display_volcano_3d: {e}")
 
     # ### Funzione Aggiunta per Scaricare il Grafico in Formato PNG o JPG ###
     def download_graph_image(self):
-        # Apri una finestra di dialogo per scegliere la destinazione e il formato
-        options = QFileDialog.Options()
-        file_path, selected_filter = QFileDialog.getSaveFileName(
-            self,
-            "Save Graph As",
-            "",
-            "PNG Files (*.png);;JPG Files (*.jpg);;All Files (*)",
-            options=options
-        )
-        if file_path:
-            # Determina il formato basato sul filtro selezionato o sull'estensione del file
-            if selected_filter.startswith("PNG"):
-                format = 'png'
-                if not file_path.lower().endswith('.png'):
-                    file_path += '.png'
-            elif selected_filter.startswith("JPG"):
-                format = 'jpg'
-                if not file_path.lower().endswith('.jpg') and not file_path.lower().endswith('.jpeg'):
-                    file_path += '.jpg'
-            else:
-                # Default a PNG se nessun formato specifico è selezionato
-                format = 'png'
-                if not file_path.lower().endswith('.png'):
-                    file_path += '.png'
+        try:
+            # Apri una finestra di dialogo per scegliere la destinazione e il formato
+            options = QFileDialog.Options()
+            file_path, selected_filter = QFileDialog.getSaveFileName(
+                self,
+                "Save Graph As",
+                "",
+                "PNG Files (*.png);;JPG Files (*.jpg);;All Files (*)",
+                options=options
+            )
+            if file_path:
+                # Determina il formato basato sul filtro selezionato o sull'estensione del file
+                if selected_filter.startswith("PNG"):
+                    format = 'png'
+                    if not file_path.lower().endswith('.png'):
+                        file_path += '.png'
+                elif selected_filter.startswith("JPG"):
+                    format = 'jpg'
+                    if not file_path.lower().endswith('.jpg') and not file_path.lower().endswith('.jpeg'):
+                        file_path += '.jpg'
+                else:
+                    # Default a PNG se nessun formato specifico è selezionato
+                    format = 'png'
+                    if not file_path.lower().endswith('.png'):
+                        file_path += '.png'
 
-            try:
-                # Salva la figura corrente nel formato scelto
-                self.figure.savefig(file_path, format=format)
-                QMessageBox.information(
-                    self, 
-                    "Success", 
-                    f"Graph successfully saved as {format.upper()} to {file_path}"
-                )
-            except Exception as e:
-                QMessageBox.critical(
-                    self, 
-                    "Save Error", 
-                    f"An error occurred while saving the graph: {e}"
-                )
-                # Opzionale: loggare l'errore o gestirlo come necessario
-                # print(f"Error during graph saving: {e}")
+                try:
+                    # Salva la figura corrente nel formato scelto
+                    self.figure.savefig(file_path, format=format)
+                    QMessageBox.information(
+                        self, 
+                        "Success", 
+                        f"Graph successfully saved as {format.upper()} to {file_path}"
+                    )
+                    print(f"[DEBUG] Graph saved successfully as {format.upper()} to {file_path}")
+                except Exception as e:
+                    QMessageBox.critical(
+                        self, 
+                        "Save Error", 
+                        f"An error occurred while saving the graph: {e}"
+                    )
+                    print(f"[ERROR] Error during graph saving: {e}")
+        except Exception as e:
+            QMessageBox.critical(
+                self, 
+                "Save Error", 
+                f"An error occurred while initiating the save dialog: {e}"
+            )
+            print(f"[ERROR] Error initiating graph saving: {e}")
+
+    # ### Funzione Aggiunta per Selezionare il Colormap ###
+    def select_colormap(self):
+        try:
+            dialog = ColormapDialog(self)
+            if dialog.exec_() == QDialog.Accepted:
+                new_colormap = dialog.get_selected_colormap()
+                # Aggiorna il colormap selezionato
+                self.selected_colormap = new_colormap
+                print(f"[DEBUG] Selected new colormap: {self.selected_colormap}")
+                # Applica il nuovo colormap al grafico selezionato
+                self.apply_colormap_to_selected_graph()
+        except Exception as e:
+            QMessageBox.critical(
+                self, 
+                "Colormap Selection Error", 
+                f"An error occurred while selecting the colormap: {e}"
+            )
+            print(f"[ERROR] Error in select_colormap: {e}")
+
+    def apply_colormap_to_selected_graph(self):
+        try:
+            # Verifica che l'indice del grafico selezionato sia valido
+            if self.selected_graph not in [0, 1, 2]:
+                print(f"[DEBUG] Invalid selected_graph index: {self.selected_graph}")
+                return
+
+            fig = self.figure
+
+            # Ottieni l'asse corrispondente dal list degli assi dei grafici principali
+            ax = self.image_axes[self.selected_graph]
+            im = self.images[self.selected_graph]
+            cbar = self.colorbars[self.selected_graph]
+
+            if im is None:
+                print(f"[DEBUG] No image associated with graph index: {self.selected_graph}")
+                return  # Nessuna immagine associata
+
+            # Aggiorna il colormap dell'immagine
+            im.set_cmap(self.selected_colormap)
+            print(f"[DEBUG] Updated colormap for graph {self.selected_graph} to {self.selected_colormap}")
+
+            # Rimuovi la vecchia colorbar
+            if cbar is not None:
+                cbar.remove()
+                print(f"[DEBUG] Removed old colorbar for graph {self.selected_graph}")
+
+            # Crea una nuova colorbar
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label(f"{self.units[self.current_index * 3 + self.selected_graph]}", rotation=90)
+
+            # Aggiorna le referenze
+            self.colorbars[self.selected_graph] = cbar
+
+            # Aggiorna il canvas
+            self.canvas.draw()
+            print(f"[DEBUG] Applied new colormap and updated colorbar for graph {self.selected_graph}")
+        except Exception as e:
+            QMessageBox.critical(
+                self, 
+                "Colormap Application Error", 
+                f"An error occurred while applying the colormap: {e}"
+            )
+            print(f"[ERROR] Error in apply_colormap_to_selected_graph: {e}")
 
     # ### Funzione Aggiunta per Esportare i Dati Analizzati ###
     def export_data(self):
-        # Chiedi all'utente di scegliere il formato di esportazione
-        format_dialog = QMessageBox(self)
-        format_dialog.setWindowTitle("Select Export Format")
-        format_dialog.setText("Choose the format to export the data:")
-        format_dialog.setIcon(QMessageBox.Question)
-        csv_button = format_dialog.addButton("CSV", QMessageBox.AcceptRole)
-        geotiff_button = format_dialog.addButton("GeoTIFF", QMessageBox.AcceptRole)
-        cancel_button = format_dialog.addButton(QMessageBox.Cancel)
-        format_dialog.exec_()
-
-        if format_dialog.clickedButton() == csv_button:
-            export_format = 'CSV'
-        elif format_dialog.clickedButton() == geotiff_button:
-            export_format = 'GeoTIFF'
-        else:
-            # L'utente ha annullato l'operazione
-            return
-
-        # Apri una finestra di dialogo per scegliere la destinazione
-        options = QFileDialog.Options()
-        directory = QFileDialog.getExistingDirectory(
-            self,
-            "Select Export Directory",
-            "",
-            options=options
-        )
-        if not directory:
-            # L'utente ha annullato l'operazione
-            return
-
-        # Inizia l'esportazione dei dati
         try:
-            for i, (dem_data, data1, data2) in enumerate(self.analysis_triplets, start=1):
-                # Mappatura dei nomi delle analisi
-                data_names = ['DEM', 'Shaded Relief', 'Hillshade', 'Aspect', 'Slope', 'Roughness', 'Convexity',
-                              'Amplified and Smoothed Curvature', 'Logarithmic Amplified Gaussian Curvature']
-                # Per ogni triplet, identifica i nomi corretti
-                if i == 1:
-                    current_titles = self.titles[0:3]
-                elif i == 2:
-                    current_titles = self.titles[3:6]
-                elif i == 3:
-                    current_titles = self.titles[6:9]
-                elif i == 4:
-                    current_titles = self.titles[9:12]
-                else:
-                    current_titles = [f"Data{j}" for j in range(1,4)]
+            # Chiedi all'utente di scegliere il formato di esportazione
+            format_dialog = QMessageBox(self)
+            format_dialog.setWindowTitle("Select Export Format")
+            format_dialog.setText("Choose the format to export the data:")
+            format_dialog.setIcon(QMessageBox.Question)
+            csv_button = format_dialog.addButton("CSV", QMessageBox.AcceptRole)
+            geotiff_button = format_dialog.addButton("GeoTIFF", QMessageBox.AcceptRole)
+            cancel_button = format_dialog.addButton(QMessageBox.Cancel)
+            format_dialog.exec_()
 
-                data_arrays = [dem_data, data1, data2]
+            if format_dialog.clickedButton() == csv_button:
+                export_format = 'CSV'
+            elif format_dialog.clickedButton() == geotiff_button:
+                export_format = 'GeoTIFF'
+            else:
+                # L'utente ha annullato l'operazione
+                print("[DEBUG] Export operation canceled by user.")
+                return
 
-                for title, data in zip(current_titles, data_arrays):
-                    safe_title = title.replace(" ", "_").replace("/", "_")
-                    if export_format == 'CSV':
-                        # Esporta in CSV usando Pandas
-                        df = pd.DataFrame(data)
-                        csv_filename = os.path.join(directory, f"Triplet{i}_{safe_title}.csv")
-                        df.to_csv(csv_filename, index=False, header=False)
-                    elif export_format == 'GeoTIFF':
-                        # Esporta in GeoTIFF usando Rasterio
-                        geotiff_filename = os.path.join(directory, f"Triplet{i}_{safe_title}.tif")
-                        # Aggiorna il profilo per riflettere i nuovi dati
-                        new_profile = self.profile.copy()
-                        new_profile.update(dtype=rasterio.float32, count=1)
-                        with rasterio.open(geotiff_filename, 'w', **new_profile) as dst:
-                            dst.write(data.astype(rasterio.float32), 1)
-            # Mostra un messaggio di successo
-            QMessageBox.information(
-                self, 
-                "Export Successful", 
-                f"All data successfully exported as {export_format} to {directory}"
+            # Apri una finestra di dialogo per scegliere la destinazione
+            options = QFileDialog.Options()
+            directory = QFileDialog.getExistingDirectory(
+                self,
+                "Select Export Directory",
+                "",
+                options=options
             )
+            if not directory:
+                # L'utente ha annullato l'operazione
+                print("[DEBUG] Export directory selection canceled by user.")
+                return
+
+            # Inizia l'esportazione dei dati
+            try:
+                for i, (dem_data, data1, data2) in enumerate(self.analysis_triplets, start=1):
+                    # Determina le analisi correnti basandoti sui titoli
+                    current_titles = self.titles[(i-1)*3:i*3]
+
+                    data_arrays = [dem_data, data1, data2]
+
+                    for title, data in zip(current_titles, data_arrays):
+                        safe_title = title.replace(" ", "_").replace("/", "_")
+                        if export_format == 'CSV':
+                            # Esporta in CSV usando Pandas
+                            df = pd.DataFrame(data)
+                            csv_filename = os.path.join(directory, f"Triplet{i}_{safe_title}.csv")
+                            df.to_csv(csv_filename, index=False, header=False, na_rep="NaN")
+                            print(f"[DEBUG] Exported {csv_filename}")
+                        elif export_format == 'GeoTIFF':
+                            # Esporta in GeoTIFF usando Rasterio
+                            geotiff_filename = os.path.join(directory, f"Triplet{i}_{safe_title}.tif")
+                            # Aggiorna il profilo per riflettere i nuovi dati
+                            new_profile = self.profile.copy()
+                            new_profile.update(dtype=rasterio.float32, count=1, nodata=None)
+                            with rasterio.open(geotiff_filename, 'w', **new_profile) as dst:
+                                dst.write(data.astype(rasterio.float32), 1)
+                            print(f"[DEBUG] Exported {geotiff_filename}")
+                # Mostra un messaggio di successo
+                QMessageBox.information(
+                    self, 
+                    "Export Successful", 
+                    f"All data successfully exported as {export_format} to {directory}"
+                )
+                print(f"[DEBUG] All data successfully exported as {export_format} to {directory}")
+            except Exception as e:
+                QMessageBox.critical(
+                    self, 
+                    "Export Error", 
+                    f"An error occurred while exporting the data: {e}"
+                )
+                print(f"[ERROR] Error during data export: {e}")
         except Exception as e:
             QMessageBox.critical(
                 self, 
                 "Export Error", 
-                f"An error occurred while exporting the data: {e}"
+                f"An error occurred during export setup: {e}"
             )
-            # Opzionale: loggare l'errore o gestirlo come necessario
-            # print(f"Error during data export: {e}")
+            print(f"[ERROR] Error in export_data setup: {e}")
+
+    # ### Funzionalità Aggiunte ###
+    # Evento di movimento del mouse per i tooltips
+    def on_motion(self, event):
+        try:
+            if event.inaxes in self.image_axes:
+                ax_index = self.image_axes.index(event.inaxes)
+                if ax_index == -1:
+                    self.tooltip_label.setVisible(False)
+                    return
+                im = self.images[ax_index]
+                if im is None:
+                    self.tooltip_label.setVisible(False)
+                    return
+                if event.xdata is None or event.ydata is None:
+                    self.tooltip_label.setVisible(False)
+                    return
+                xdata = int(event.xdata)
+                ydata = int(event.ydata)
+                if 0 <= xdata < self.dem.shape[1] and 0 <= ydata < self.dem.shape[0]:
+                    z = self.dem[ydata, xdata]
+                    self.tooltip_label.setText(f"X: {xdata}, Y: {ydata}, Elevation: {z:.2f} m")
+                    self.tooltip_label.adjustSize()
+                    # Posiziona il tooltip vicino al cursore
+                    cursor_pos = QCursor.pos()
+                    window_pos = self.mapFromGlobal(cursor_pos)
+                    self.tooltip_label.move(window_pos.x() + 10, window_pos.y() + 10)
+                    self.tooltip_label.setVisible(True)
+                else:
+                    self.tooltip_label.setVisible(False)
+            else:
+                self.tooltip_label.setVisible(False)
+        except Exception as e:
+            print(f"[ERROR] Error in on_motion: {e}")
+            self.tooltip_label.setVisible(False)
+
+    # Funzione di callback per la selezione di una regione
+    def on_select(self, eclick, erelease):
+        try:
+            # Ottieni i limiti della selezione
+            x1, y1 = eclick.xdata, eclick.ydata
+            x2, y2 = erelease.xdata, erelease.ydata
+
+            if x1 is None or y1 is None or x2 is None or y2 is None:
+                print("[DEBUG] Selection coordinates are None.")
+                return
+
+            x1, y1 = int(x1), int(y1)
+            x2, y2 = int(x2), int(y2)
+
+            # Assicurati che x1 < x2 e y1 < y2
+            x_min, x_max = sorted([x1, x2])
+            y_min, y_max = sorted([y1, y2])
+
+            # Controlla i limiti
+            x_min = max(x_min, 0)
+            y_min = max(y_min, 0)
+            x_max = min(x_max, self.dem.shape[1])
+            y_max = min(y_max, self.dem.shape[0])
+
+            # Estrai la regione selezionata
+            selected_region = self.dem[y_min:y_max, x_min:x_max]
+
+            if selected_region.size == 0:
+                QMessageBox.warning(self, "Selection Warning", "Selected region is empty.")
+                print("[DEBUG] Selected region is empty.")
+                return
+
+            # Calcola statistiche locali
+            local_stats = {
+                'min': float(np.min(selected_region)),
+                'max': float(np.max(selected_region)),
+                'mean': float(np.mean(selected_region)),
+                'median': float(np.median(selected_region)),
+                'std': float(np.std(selected_region))
+            }
+
+            # Mostra le statistiche in una finestra di dialogo
+            stats_text = (
+                f"Selected Region Statistics:\n"
+                f"Min: {local_stats['min']}\n"
+                f"Max: {local_stats['max']}\n"
+                f"Mean: {local_stats['mean']:.2f}\n"
+                f"Median: {local_stats['median']}\n"
+                f"Std Dev: {local_stats['std']:.2f}"
+            )
+            QMessageBox.information(self, "Local Statistics", stats_text)
+            print("[DEBUG] Displayed local statistics for selected region.")
+        except Exception as e:
+            QMessageBox.critical(
+                self, 
+                "Selection Error", 
+                f"An error occurred during region selection: {e}"
+            )
+            print(f"[ERROR] Error in on_select: {e}")
+
+    # ### Fine Funzionalità Aggiunte ###
 
 # Funzione principale
 def main():
@@ -493,7 +807,6 @@ def main():
         curvature_smoothed_normalized = (
             curvature_smoothed - np.min(curvature_smoothed)
         ) / (np.max(curvature_smoothed) - np.min(curvature_smoothed))
-
     except Exception as e:
         print(f"Error during analysis calculations: {e}")
         sys.exit(1)
@@ -508,6 +821,7 @@ def main():
 
     # Scrivi le statistiche in un file JSON
     write_statistics_to_json(total_statistics, filename="output_statistics.json")
+    print("[DEBUG] Statistics written to output_statistics.json")
 
     # Organizza le analisi in triplette
     print("[DEBUG] Preparing analysis triplets.")
@@ -562,16 +876,21 @@ def main():
             print(f"[ERROR] Error sending completion notification: {e}")
 
     # Avvia l'applicazione PyQt5 con un piccolo ritardo per assicurare che la richiesta sia completata
-    app = QApplication(sys.argv)
-    ex = DEMAnalysisApp(
-        dem, profile, analysis_triplets, titles, cmaps, units, descriptions, original_file_name
-    )
+    try:
+        app = QApplication(sys.argv)
+        ex = DEMAnalysisApp(
+            dem, profile, analysis_triplets, titles, cmaps, units, descriptions, original_file_name
+        )
 
-    def show_main_window():
-        ex.showMaximized()
+        def show_main_window():
+            ex.showMaximized()
+            print("[DEBUG] Main window displayed.")
 
-    QTimer.singleShot(0, show_main_window)
-    sys.exit(app.exec_())
+        QTimer.singleShot(0, show_main_window)
+        sys.exit(app.exec_())
+    except Exception as e:
+        print(f"[ERROR] Error starting the application: {e}")
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
