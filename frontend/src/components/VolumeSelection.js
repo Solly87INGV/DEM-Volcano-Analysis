@@ -173,6 +173,10 @@ const VolumeSelection = ({ demFile, onBack }) => {
               <CircularProgress />
             </Box>
           )}
+          {/* 🔁 Ordine invertito: Back prima, Calculate dopo */}
+          <Button variant="contained" color="secondary" onClick={onBack} startIcon={<ArrowBackIcon />}>
+            Back to Upload
+          </Button>
           <Button
             variant="contained"
             color="primary"
@@ -181,9 +185,6 @@ const VolumeSelection = ({ demFile, onBack }) => {
             disabled={isLoading}
           >
             Calculate Volume
-          </Button>
-            <Button variant="contained" color="secondary" onClick={onBack} startIcon={<ArrowBackIcon />}>
-            Back to Upload
           </Button>
         </Box>
       )}
