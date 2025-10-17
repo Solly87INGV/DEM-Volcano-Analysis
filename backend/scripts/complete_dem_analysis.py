@@ -8,8 +8,11 @@ import rasterio
 import time
 import psutil
 from contextlib import contextmanager
-from scipy.ndimage import gaussian_filter, sobel
-from skimage import measure
+
+from scipy.ndimage import gaussian_filter   # ← niente 'sobel'
+# (niente: from scipy import ndimage as ndi)
+# (niente: from skimage import measure)
+
 from PyQt5 import QtWidgets
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QFileDialog, QMessageBox,
@@ -17,15 +20,21 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QCursor
+
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5 import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
-from matplotlib import gridspec  # For advanced subplot layout
-from mpl_toolkits.mplot3d import Axes3D  # Necessary for 3D plots
-import requests  # Per inviare richieste HTTP al server Node.js
-import pandas as pd  # Per esportare i dati in CSV
-import matplotlib.cm as cm  # Per accedere ai colormap
-from matplotlib.widgets import RectangleSelector  # Per la selezione di regioni
+
+# (niente: from mpl_toolkits.axes_grid1.inset_locator import inset_axes)
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from matplotlib import gridspec
+# (niente: from mpl_toolkits.mplot3d import Axes3D)
+
+import requests
+import pandas as pd
+import matplotlib.cm as cm
+from matplotlib.widgets import RectangleSelector
+import matplotlib.pyplot as plt
 
 # ==== Memory & timing helpers ======================================
 _process = psutil.Process(os.getpid())
@@ -192,6 +201,293 @@ class ColormapDialog(QDialog):
     def get_selected_colormap(self):
         return self.combo_box.currentText()
 
+# ==================== NUOVE UTILITY PER PNG + MANIFEST ====================
+
+def _resolve_process_id(cli_process_id: str | None) -> str:
+    """
+    Ritorna il PROCESS_ID da usare per gli output:
+    - priorità all'env var PROCESS_ID (iniettata dal server)
+    - altrimenti usa cli_process_id (argv[3])
+    - se assenti, genera un id locale
+    """
+    env_id = os.environ.get("PROCESS_ID")
+    if env_id and len(env_id) > 0:
+        return env_id
+    if cli_process_id and len(cli_process_id) > 0:
+        return cli_process_id
+    # fallback: locale
+    return f"local_{int(time.time())}"
+
+def _ensure_outputs_dir(process_id: str) -> str:
+    """
+    Crea la cartella ./outputs/<process_id> accanto a questo script
+    e la ritorna.
+    """
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    out_dir = os.path.join(base_dir, "outputs", process_id)
+    os.makedirs(out_dir, exist_ok=True)
+    return out_dir
+
+def _save_triplets_pngs(analysis_triplets, titles, cmaps, units, descriptions, file_name, out_dir):
+    """
+    Salva PNG 1×3 (DEM, data1, data2) ottimizzati per occupare molta più
+    larghezza nel PDF (figura larga/bassa, margini ridotti, colorbar stretta).
+    """
+    saved = []
+    num_triplets = len(analysis_triplets)
+
+    # Manopole principali per triplete larghe
+    FIG_W, FIG_H   = 18.0, 5.0     # figura molto larga e poco alta
+    LEFT, RIGHT    = 0.015, 0.985  # margini orizzontali ridotti
+    TOP, BOTTOM    = 0.92, 0.20    # margini verticali
+    WSPACE         = 0.05          # spazio tra i tre pannelli
+    CB_FRACTION    = 0.035         # spessore colorbar
+    CB_PAD         = 0.015         # distanza immagine↔colorbar
+    TITLE_PAD      = 8             # padding del titolo del pannello
+    DESC_Y         = -0.20         # posizione descrizione sotto ciascun pannello
+    DPI_SAVE       = 180           # dpi del PNG
+
+    for i in range(num_triplets):
+        dem_data, data1, data2 = analysis_triplets[i]
+        idx = i * 3
+        t_list = titles[idx:idx+3]
+        u_list = units[idx:idx+3]
+        d_list = descriptions[idx:idx+3]
+        c_list = cmaps[idx:idx+3]
+
+        fig = plt.figure(figsize=(FIG_W, FIG_H))
+        gs = gridspec.GridSpec(1, 3, figure=fig, wspace=WSPACE)
+        fig.subplots_adjust(left=LEFT, right=RIGHT, top=TOP, bottom=BOTTOM, wspace=WSPACE)
+
+        data_arrays = [dem_data, data1, data2]
+        for j in range(3):
+            ax = fig.add_subplot(gs[0, j])
+            im = ax.imshow(
+                data_arrays[j],
+                cmap=c_list[j],
+                origin='upper',
+                interpolation='nearest',
+                resample=False
+            )
+            ax.set_title(t_list[j], pad=TITLE_PAD, fontsize=11)
+            ax.set_aspect('equal', adjustable='box')
+
+            # Crea colorbar con bordo nero
+            divider = make_axes_locatable(ax)
+            cax = divider.append_axes("right", size=CB_FRACTION, pad=CB_PAD)
+            cbar = fig.colorbar(im, cax=cax)
+            cbar.set_label(f"{u_list[j]}", rotation=90, fontsize=9)
+            
+            # Aggiungi bordo nero alla colorbar
+            for spine in cax.spines.values():
+                spine.set_visible(True)
+                spine.set_edgecolor('black')
+                spine.set_linewidth(0.8)
+
+            ax.text(0.5, DESC_Y, d_list[j], transform=ax.transAxes,
+                    ha='center', fontsize=8, wrap=True)
+
+        fig.suptitle(f"Location: {file_name} ({i+1}/{num_triplets})", fontsize=13)
+
+        fname = f"triplet_{i+1:02d}.png"
+        fpath = os.path.join(out_dir, fname)
+        try:
+            fig.savefig(fpath, dpi=DPI_SAVE)
+            saved.append({
+                "filename": fname,
+                "abs_path": fpath,
+                "public_path": f"/outputs/{os.path.basename(out_dir)}/{fname}",
+                "titles": t_list,
+                "units": u_list,
+                "descriptions": d_list
+            })
+            print(f"[DEBUG] Saved analysis PNG: {fpath}")
+        except Exception as e:
+            print(f"[ERROR] Failed to save {fpath}: {e}")
+        finally:
+            plt.close(fig)
+
+    return saved
+
+
+def _write_manifest_json(process_id: str, out_dir: str, saved_entries: list, source: str = "complete_dem_analysis", original_file_name: str = ""):
+    """
+    Scrive analysis_images.json in out_dir con i metadati delle immagini generate.
+    """
+    manifest = {
+        "processId": process_id,
+        "source": source,
+        "original_file_name": original_file_name,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "images": saved_entries
+    }
+    manifest_path = os.path.join(out_dir, "analysis_images.json")
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+        print(f"[DEBUG] Wrote manifest: {manifest_path}")
+    except Exception as e:
+        print(f"[ERROR] Failed to write manifest JSON: {e}")
+
+
+# --- NEW: salva il DEM una sola volta ---
+def _save_dem_overview_png(dem, out_dir, file_name, nodata_value=None):
+    # Figura con proporzioni simili ai doppietti e niente tight bbox
+    fig = plt.figure(figsize=(14.5, 5.5))  # come i doublets
+    ax = fig.add_subplot(111)
+
+    # ====== 1) MASK ROBUSTA + FILL "SCURO" PER CUCITURE ======
+    # Mask di base: non finito
+    mask = ~np.isfinite(dem)
+    # Mask anche del nodata esplicito (se fornito)
+    if nodata_value is not None:
+        mask |= np.isclose(dem, nodata_value)
+
+    # Valore di riempimento: minimo valido (es. mare/valle) per evitare "colonne bianche"
+    if mask.any():
+        valid_min = np.nanmin(dem[~mask]) if (~mask).any() else 0.0
+        dem_filled = dem.copy()
+        dem_filled[mask] = valid_min
+    else:
+        dem_filled = dem
+
+    # ====== 2) IMMAGINE SENZA RESAMPLING / ALIASING ======
+    h, w = dem_filled.shape
+    im = ax.imshow(
+        dem_filled,
+        cmap='terrain',
+        origin='upper',
+        interpolation='nearest',  # evita blending tra colonne/righe
+        resample=False,
+        extent=(-0.5, w - 0.5, h - 0.5, -0.5)
+    )
+    ax.set_title("DEM", pad=8)
+    ax.set_aspect('equal', adjustable='box')
+
+    # --- Colorbar DEM esterna con pad in pollici (valori TUA "quadra") ---
+    CB_SIZE = "4%"   # spessore cbar
+    CB_PAD  = 0.3    # distanza DEM↔cbar in pollici
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size=CB_SIZE, pad=CB_PAD)
+
+    # === Colorbar + CORNICE nera sottile (come le altre) ===
+    cbar = fig.colorbar(im, cax=cax)
+    cbar.set_label("Elevation (m)", rotation=90)
+
+    # usa le spines dell'axes della colorbar per il bordo
+    cbar.outline.set_visible(False)  # evita doppio bordo
+    for side in ("left", "right", "top", "bottom"):
+        sp = cax.spines[side]
+        sp.set_visible(True)
+        sp.set_linewidth(0.6)        # regola qui lo spessore (0.5–0.8)
+        try:
+            sp.set_edgecolor("black")  # mpl >= 3.8
+        except Exception:
+            sp.set_color("black")      # fallback per versioni precedenti
+
+    cax.set_facecolor('none')
+    cax.grid(False)
+    cax.tick_params(length=3)
+
+    # Lascia spazio ai lati (no constrained_layout) e non stringere i margini
+    fig.subplots_adjust(left=0.050, right=0.890, top=0.88, bottom=0.16)
+    fig.suptitle(f"Location: {file_name}", fontsize=14)
+
+    out_path = os.path.join(out_dir, "dem_overview.png")
+    fig.savefig(out_path, dpi=170)  # <-- NO bbox_inches='tight'
+    plt.close(fig)
+
+    return {
+        "filename": "dem_overview.png",
+        "abs_path": out_path,
+        "public_path": f"/outputs/{os.path.basename(out_dir)}/dem_overview.png",
+        "titles": ["DEM"],
+        "units": ["m"],
+        "descriptions": ["Represents terrain elevation in meters above sea level."]
+    }
+
+
+# --- NEW: salva “doppietti” (i pannelli 2 e 3 di ciascuna tripletta), senza DEM ---
+def _save_doublets_from_arrays(analysis_triplets, titles, cmaps, units, descriptions, file_name, out_dir):
+    """
+    Per ogni tripletta (DEM, data1, data2) crea un PNG 1x3 con:
+      - sinistra: data1
+      - centro : SPACER (asse invisibile) per distanziare orizzontalmente
+      - destra : data2
+    Restituisce la lista entries per la manifest.
+    """
+    saved = []
+    num_triplets = len(analysis_triplets)
+
+    for i in range(num_triplets):
+        dem_data, data1, data2 = analysis_triplets[i]
+        base_idx = i * 3
+        # Prendi SOLO i pannelli 1 e 2 della tripletta (skip DEM che è 0)
+        t_list = titles[base_idx+1:base_idx+3]
+        c_list = cmaps[base_idx+1:base_idx+3]
+        u_list = units[base_idx+1:base_idx+3]
+        d_list = descriptions[base_idx+1:base_idx+3]
+
+        # Figura più larga e SENZA constrained_layout
+        fig = plt.figure(figsize=(14.5, 5.5))
+        # Gridspec a 3 colonne: sinistra, SPACER, destra
+        # La colonna centrale è un "cuscinetto" orizzontale reale.
+        gs = gridspec.GridSpec(
+            1, 3, figure=fig,
+            width_ratios=[1.0, 0.08, 1.0],  # 0.08 ~ 8% della larghezza come spazio
+            wspace=0.15                      # ulteriore margine tra le colonne
+        )
+
+        # Pannello sinistro (data1)
+        ax1 = fig.add_subplot(gs[0, 0])
+        im1 = ax1.imshow(data1, cmap=c_list[0], origin='upper')
+        ax1.set_title(t_list[0], pad=8)
+        ax1.set_aspect('equal', adjustable='box')
+        # Colorbar con pad più grande per staccarla dal pannello
+        cbar1 = fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.08)
+        cbar1.set_label(f"{u_list[0]}", rotation=90)
+        ax1.text(0.5, -0.18, d_list[0], transform=ax1.transAxes, ha='center', fontsize=9, wrap=True)
+
+        # SPACER al centro (asse invisibile)
+        ax_spacer = fig.add_subplot(gs[0, 1])
+        ax_spacer.axis('off')
+
+        # Pannello destro (data2)
+        ax2 = fig.add_subplot(gs[0, 2])
+        im2 = ax2.imshow(data2, cmap=c_list[1], origin='upper')
+        ax2.set_title(t_list[1], pad=8)
+        ax2.set_aspect('equal', adjustable='box')
+        cbar2 = fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.08)
+        cbar2.set_label(f"{u_list[1]}", rotation=90)
+        ax2.text(0.5, -0.18, d_list[1], transform=ax2.transAxes, ha='center', fontsize=9, wrap=True)
+
+        # Titolo generale
+        fig.suptitle(f"Location: {file_name} — Panel {i+1}/{num_triplets}", fontsize=13)
+
+        fname = f"double_{i+1:02d}.png"
+        fpath = os.path.join(out_dir, fname)
+        try:
+            # NIENTE bbox_inches='tight': altrimenti ri-stringe i margini
+            fig.savefig(fpath, dpi=170)
+            saved.append({
+                "filename": fname,
+                "abs_path": fpath,
+                "public_path": f"/outputs/{os.path.basename(out_dir)}/{fname}",
+                "titles": t_list,
+                "units": u_list,
+                "descriptions": d_list
+            })
+            print(f"[DEBUG] Saved analysis double-panel PNG: {fpath}")
+        except Exception as e:
+            print(f"[ERROR] Failed to save {fpath}: {e}")
+        finally:
+            plt.close(fig)
+
+    return saved
+
+
+# ==================== FINE UTILITY PNG + MANIFEST ====================
+
 # Classe PyQt5 Application con le modifiche richieste
 class DEMAnalysisApp(QMainWindow):
     def __init__(self, dem, profile, analysis_triplets, titles, cmaps, units, descriptions, file_name):
@@ -353,7 +649,7 @@ class DEMAnalysisApp(QMainWindow):
         for selector in self.rectangle_selectors:
             if selector is not None:
                 selector.set_active(False)
-        self.rectangle_selectors = [None, None, None]  # Reset dei RectangleSelector
+        self.rectangle_selectors = [None, None, None]
 
         # Plot dei tre grafici
         for i in range(3):
@@ -376,14 +672,14 @@ class DEMAnalysisApp(QMainWindow):
                 # Memorizza le referenze
                 self.images[i] = im
                 self.colorbars[i] = cbar
-                self.image_axes[i] = ax  # Memorizza l'asse del grafico principale
+                self.image_axes[i] = ax
 
                 # Aggiungi RectangleSelector per la selezione di regioni
                 self.rectangle_selectors[i] = RectangleSelector(
-                ax, self.on_select,
-                useblit=True, button=[1],
-                 minspanx=5, minspany=5, spancoords='pixels',
-                interactive=True
+                    ax, self.on_select,
+                    useblit=True, button=[1],
+                    minspanx=5, minspany=5, spancoords='pixels',
+                    interactive=True
                 )
 
                 print(f"[DEBUG] Plotted graph {i} with title '{titles[i]}'")
@@ -404,14 +700,13 @@ class DEMAnalysisApp(QMainWindow):
             self.next_button.setVisible(True)
 
         # Aggiorna il ComboBox per la selezione del grafico
-        self.graph_selection_combo.blockSignals(True)  # Blocca segnali temporaneamente
+        self.graph_selection_combo.blockSignals(True)
         self.graph_selection_combo.clear()
         current_titles = self.titles[idx:idx + 3]
         self.graph_selection_combo.addItems(current_titles)
-        # Reset la selezione al primo grafico
         self.graph_selection_combo.setCurrentIndex(0)
         self.selected_graph = 0
-        self.graph_selection_combo.blockSignals(False)  # Riattiva segnali
+        self.graph_selection_combo.blockSignals(False)
         print("[DEBUG] Display update complete.")
 
     def next_triplet(self):
@@ -429,7 +724,6 @@ class DEMAnalysisApp(QMainWindow):
     def display_volcano_3d(self):
         try:
             print("[DEBUG] Displaying 3D model window.")
-            # Creazione di una nuova finestra per il modello 3D
             self.three_d_window = QtWidgets.QMainWindow()
             self.three_d_window.setWindowTitle('3D Model')
             central_widget = QtWidgets.QWidget()
@@ -446,7 +740,6 @@ class DEMAnalysisApp(QMainWindow):
             y = np.arange(0, self.dem.shape[0])
             x, y = np.meshgrid(x, y)
 
-            # Scala l'asse z se necessario
             z = self.dem
 
             surface = ax.plot_surface(
@@ -472,10 +765,8 @@ class DEMAnalysisApp(QMainWindow):
             )
             print(f"[ERROR] Error in display_volcano_3d: {e}")
 
-    # ### Funzione Aggiunta per Scaricare il Grafico in Formato PNG o JPG ###
     def download_graph_image(self):
         try:
-            # Apri una finestra di dialogo per scegliere la destinazione e il formato
             options = QFileDialog.Options()
             file_path, selected_filter = QFileDialog.getSaveFileName(
                 self,
@@ -485,7 +776,6 @@ class DEMAnalysisApp(QMainWindow):
                 options=options
             )
             if file_path:
-                # Determina il formato basato sul filtro selezionato o sull'estensione del file
                 if selected_filter.startswith("PNG"):
                     format = 'png'
                     if not file_path.lower().endswith('.png'):
@@ -495,13 +785,11 @@ class DEMAnalysisApp(QMainWindow):
                     if not file_path.lower().endswith('.jpg') and not file_path.lower().endswith('.jpeg'):
                         file_path += '.jpg'
                 else:
-                    # Default a PNG se nessun formato specifico è selezionato
                     format = 'png'
                     if not file_path.lower().endswith('.png'):
                         file_path += '.png'
 
                 try:
-                    # Salva la figura corrente nel formato scelto
                     self.figure.savefig(file_path, format=format)
                     QMessageBox.information(
                         self, 
@@ -524,16 +812,13 @@ class DEMAnalysisApp(QMainWindow):
             )
             print(f"[ERROR] Error initiating graph saving: {e}")
 
-    # ### Funzione Aggiunta per Selezionare il Colormap ###
     def select_colormap(self):
         try:
             dialog = ColormapDialog(self)
             if dialog.exec_() == QDialog.Accepted:
                 new_colormap = dialog.get_selected_colormap()
-                # Aggiorna il colormap selezionato
                 self.selected_colormap = new_colormap
                 print(f"[DEBUG] Selected new colormap: {self.selected_colormap}")
-                # Applica il nuovo colormap al grafico selezionato
                 self.apply_colormap_to_selected_graph()
         except Exception as e:
             QMessageBox.critical(
@@ -545,39 +830,32 @@ class DEMAnalysisApp(QMainWindow):
 
     def apply_colormap_to_selected_graph(self):
         try:
-            # Verifica che l'indice del grafico selezionato sia valido
             if self.selected_graph not in [0, 1, 2]:
                 print(f"[DEBUG] Invalid selected_graph index: {self.selected_graph}")
                 return
 
             fig = self.figure
 
-            # Ottieni l'asse corrispondente dal list degli assi dei grafici principali
             ax = self.image_axes[self.selected_graph]
             im = self.images[self.selected_graph]
             cbar = self.colorbars[self.selected_graph]
 
             if im is None:
                 print(f"[DEBUG] No image associated with graph index: {self.selected_graph}")
-                return  # Nessuna immagine associata
+                return
 
-            # Aggiorna il colormap dell'immagine
             im.set_cmap(self.selected_colormap)
             print(f"[DEBUG] Updated colormap for graph {self.selected_graph} to {self.selected_colormap}")
 
-            # Rimuovi la vecchia colorbar
             if cbar is not None:
                 cbar.remove()
                 print(f"[DEBUG] Removed old colorbar for graph {self.selected_graph}")
 
-            # Crea una nuova colorbar
             cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             cbar.set_label(f"{self.units[self.current_index * 3 + self.selected_graph]}", rotation=90)
 
-            # Aggiorna le referenze
             self.colorbars[self.selected_graph] = cbar
 
-            # Aggiorna il canvas
             self.canvas.draw()
             print(f"[DEBUG] Applied new colormap and updated colorbar for graph {self.selected_graph}")
         except Exception as e:
@@ -588,10 +866,8 @@ class DEMAnalysisApp(QMainWindow):
             )
             print(f"[ERROR] Error in apply_colormap_to_selected_graph: {e}")
 
-    # ### Funzione Aggiunta per Esportare i Dati Analizzati ###
     def export_data(self):
         try:
-            # Chiedi all'utente di scegliere il formato di esportazione
             format_dialog = QMessageBox(self)
             format_dialog.setWindowTitle("Select Export Format")
             format_dialog.setText("Choose the format to export the data:")
@@ -606,11 +882,9 @@ class DEMAnalysisApp(QMainWindow):
             elif format_dialog.clickedButton() == geotiff_button:
                 export_format = 'GeoTIFF'
             else:
-                # L'utente ha annullato l'operazione
                 print("[DEBUG] Export operation canceled by user.")
                 return
 
-            # Apri una finestra di dialogo per scegliere la destinazione
             options = QFileDialog.Options()
             directory = QFileDialog.getExistingDirectory(
                 self,
@@ -619,36 +893,28 @@ class DEMAnalysisApp(QMainWindow):
                 options=options
             )
             if not directory:
-                # L'utente ha annullato l'operazione
                 print("[DEBUG] Export directory selection canceled by user.")
                 return
 
-            # Inizia l'esportazione dei dati
             try:
                 for i, (dem_data, data1, data2) in enumerate(self.analysis_triplets, start=1):
-                    # Determina le analisi correnti basandoti sui titoli
                     current_titles = self.titles[(i-1)*3:i*3]
-
                     data_arrays = [dem_data, data1, data2]
 
                     for title, data in zip(current_titles, data_arrays):
                         safe_title = title.replace(" ", "_").replace("/", "_")
                         if export_format == 'CSV':
-                            # Esporta in CSV usando Pandas
                             df = pd.DataFrame(data)
                             csv_filename = os.path.join(directory, f"Triplet{i}_{safe_title}.csv")
                             df.to_csv(csv_filename, index=False, header=False, na_rep="NaN")
                             print(f"[DEBUG] Exported {csv_filename}")
                         elif export_format == 'GeoTIFF':
-                            # Esporta in GeoTIFF usando Rasterio
                             geotiff_filename = os.path.join(directory, f"Triplet{i}_{safe_title}.tif")
-                            # Aggiorna il profilo per riflettere i nuovi dati
                             new_profile = self.profile.copy()
                             new_profile.update(dtype=rasterio.float32, count=1, nodata=None)
                             with rasterio.open(geotiff_filename, 'w', **new_profile) as dst:
                                 dst.write(data.astype(rasterio.float32), 1)
                             print(f"[DEBUG] Exported {geotiff_filename}")
-                # Mostra un messaggio di successo
                 QMessageBox.information(
                     self, 
                     "Export Successful", 
@@ -670,7 +936,6 @@ class DEMAnalysisApp(QMainWindow):
             )
             print(f"[ERROR] Error in export_data setup: {e}")
 
-    # ### Funzionalità Aggiunte ###
     # Evento di movimento del mouse per i tooltips
     def on_motion(self, event):
         try:
@@ -692,7 +957,6 @@ class DEMAnalysisApp(QMainWindow):
                     z = self.dem[ydata, xdata]
                     self.tooltip_label.setText(f"X: {xdata}, Y: {ydata}, Elevation: {z:.2f} m")
                     self.tooltip_label.adjustSize()
-                    # Posiziona il tooltip vicino al cursore
                     cursor_pos = QCursor.pos()
                     window_pos = self.mapFromGlobal(cursor_pos)
                     self.tooltip_label.move(window_pos.x() + 10, window_pos.y() + 10)
@@ -708,7 +972,6 @@ class DEMAnalysisApp(QMainWindow):
     # Funzione di callback per la selezione di una regione
     def on_select(self, eclick, erelease):
         try:
-            # Ottieni i limiti della selezione
             x1, y1 = eclick.xdata, eclick.ydata
             x2, y2 = erelease.xdata, erelease.ydata
 
@@ -719,17 +982,14 @@ class DEMAnalysisApp(QMainWindow):
             x1, y1 = int(x1), int(y1)
             x2, y2 = int(x2), int(y2)
 
-            # Assicurati che x1 < x2 e y1 < y2
             x_min, x_max = sorted([x1, x2])
             y_min, y_max = sorted([y1, y2])
 
-            # Controlla i limiti
             x_min = max(x_min, 0)
             y_min = max(y_min, 0)
             x_max = min(x_max, self.dem.shape[1])
             y_max = min(y_max, self.dem.shape[0])
 
-            # Estrai la regione selezionata
             selected_region = self.dem[y_min:y_max, x_min:x_max]
 
             if selected_region.size == 0:
@@ -737,7 +997,6 @@ class DEMAnalysisApp(QMainWindow):
                 print("[DEBUG] Selected region is empty.")
                 return
 
-            # Calcola statistiche locali
             local_stats = {
                 'min': float(np.min(selected_region)),
                 'max': float(np.max(selected_region)),
@@ -746,7 +1005,6 @@ class DEMAnalysisApp(QMainWindow):
                 'std': float(np.std(selected_region))
             }
 
-            # Mostra le statistiche in una finestra di dialogo
             stats_text = (
                 f"Selected Region Statistics:\n"
                 f"Min: {local_stats['min']}\n"
@@ -765,8 +1023,6 @@ class DEMAnalysisApp(QMainWindow):
             )
             print(f"[ERROR] Error in on_select: {e}")
 
-    # ### Fine Funzionalità Aggiunte ###
-
 # Funzione principale
 def main():
     if len(sys.argv) < 2:
@@ -779,7 +1035,9 @@ def main():
     original_file_name = sys.argv[2] if len(sys.argv) > 2 else "Unknown"
 
     # Ottieni il process_id dagli argomenti della riga di comando
-    process_id = sys.argv[3] if len(sys.argv) > 3 else None
+    cli_process_id = sys.argv[3] if len(sys.argv) > 3 else None
+    # Preferisci l'env var PROCESS_ID se presente
+    process_id = _resolve_process_id(cli_process_id)
     if process_id:
         print(f"[DEBUG] Process ID: {process_id}")
 
@@ -913,6 +1171,32 @@ def main():
         ]
         log_memory("after_prepare_triplets")
 
+    # ========== NEW: salvataggio DEM singolo + doppietti e manifest ==========
+    with phase("save_pngs_and_manifest"):
+        try:
+            out_dir = _ensure_outputs_dir(process_id)
+
+            # 1) DEM una sola volta
+            dem_entry = _save_dem_overview_png(dem, out_dir, original_file_name)
+
+            # 2) Per ogni tripletta, salva SOLO i pannelli 2 e 3 (senza DEM)
+            double_entries = _save_doublets_from_arrays(
+                analysis_triplets, titles, cmaps, units, descriptions, original_file_name, out_dir
+            )
+
+            saved_entries = [dem_entry] + double_entries
+
+            _write_manifest_json(
+                process_id,
+                out_dir,
+                saved_entries,
+                source="complete_dem_analysis",
+                original_file_name=original_file_name
+            )
+        except Exception as e:
+            print(f"[ERROR] Error during PNG/manifest generation: {e}")
+    # ================================================================================
+
     # Invia notifica di completamento al server Node.js (timed, se presente process_id)
     if process_id:
         with phase("notify_server"):
@@ -929,7 +1213,7 @@ def main():
     print(f"[TIMING] total_end_to_end = {time.time() - _t_all_start:.3f} s")
     log_memory("before_gui_start")
 
-    # Avvia l'applicazione PyQt5 con un piccolo ritardo per assicurare che la richiesta sia completata
+    # Avvia l'applicazione PyQt5
     try:
         app = QApplication(sys.argv)
         ex = DEMAnalysisApp(

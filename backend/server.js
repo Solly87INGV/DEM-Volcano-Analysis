@@ -11,12 +11,19 @@ const { performance } = require('perf_hooks'); // <-- per timing lato server
 const app = express();
 app.use(cors());
 
-// Configurazione di multer per gestire l'upload
+// Assicurati che esistano le directory fondamentali
+const uploadsDir = path.join(__dirname, 'uploads');
+const outputsDir = path.join(__dirname, 'outputs');
+fs.mkdirSync(uploadsDir, { recursive: true });
+fs.mkdirSync(outputsDir, { recursive: true });
+
+// Servi anche gli output (PNG/PDF) come statici
+app.use('/outputs', express.static(outputsDir));
+
+// Configurazione di multer per gestire l'upload (usa percorso assoluto)
 const storage = multer.diskStorage({
-  destination: 'uploads/',
-  filename: function (req, file, cb) {
-    cb(null, file.originalname); // preserva il nome originale
-  }
+  destination: (req, file, cb) => cb(null, uploadsDir),
+  filename: (req, file, cb) => cb(null, file.originalname) // preserva il nome originale
 });
 const upload = multer({ storage });
 
@@ -44,13 +51,16 @@ app.post('/process', upload.single('demFile'), (req, res) => {
   const processId = uuidv4();
   processingStatus[processId] = { status: 'processing' };
 
+  // Path assoluto del file caricato
+  const absFilePath = path.resolve(file.path);
+
   // AVVIO PYTHON **NON** DETACHED + piping degli stream
   const child = spawn(
     pythonPath,
-    [scriptPath, file.path, originalFileName, processId],
+    [scriptPath, absFilePath, originalFileName, processId],
     {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, PYTHONUNBUFFERED: '1' } // log immediati
+      env: { ...process.env, PYTHONUNBUFFERED: '1', PROCESS_ID: processId } // <-- passa PROCESS_ID
     }
   );
 
@@ -110,6 +120,10 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
     ? req.body.originalFileName.split('.')[0]
     : "Unknown";
 
+  // Riusa il processId della fase precedente se lo ricevi dal client,
+  // altrimenti creane uno (retro-compatibile).
+  const processId = req.body.processId ? String(req.body.processId) : uuidv4();
+
   if (!file || !volumeType || !approximationType || !originalFileName) {
     console.error("[ERROR] Missing required fields.");
     return res.status(400).json({ error: "Missing required fields." });
@@ -131,12 +145,15 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
   }
   if (!scriptPath) return res.status(400).json({ error: 'Invalid volumeType or approximationType' });
 
+  // Path assoluto del file caricato
+  const absFilePath = path.resolve(file.path);
+
   const child = spawn(
     pythonPath,
-    [scriptPath, file.path, originalFileName],
+    [scriptPath, absFilePath, originalFileName],
     {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, PYTHONUNBUFFERED: '1' }
+      env: { ...process.env, PYTHONUNBUFFERED: '1', PROCESS_ID: processId } // <-- passa PROCESS_ID
     }
   );
 
@@ -147,14 +164,14 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
     resultData += s;
     // Mostra comunque i log in console
     s.split(/\r?\n/).forEach(line => {
-      if (line.trim()) console.log(`[PY VOL] ${line.trim()}`);
+      if (line.trim()) console.log(`[PY VOL ${processId}] ${line.trim()}`);
     });
   });
 
   child.stderr.on('data', d => {
     const s = d.toString();
     s.split(/\r?\n/).forEach(line => {
-      if (line.trim()) console.error(`[PY VOL ERR] ${line.trim()}`);
+      if (line.trim()) console.error(`[PY VOL ${processId} ERR] ${line.trim()}`);
     });
   });
 
@@ -162,7 +179,18 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
     const dt = (performance.now() - t0).toFixed(1);
     console.log(`[TIMING][SERVER] /calculateVolume finished in ${dt} ms (code=${code})`);
     if (code === 0) {
-      res.json({ result: resultData });
+      // Tenta di interpretare l'output come JSON strutturato { result, images: [...] }
+      try {
+        const parsed = JSON.parse(resultData);
+        // Se mancano campi attesi, mantieni retro-compatibilità
+        if (parsed && (parsed.result || parsed.images)) {
+          return res.json(parsed);
+        }
+      } catch (e) {
+        // non è JSON -> fallback
+      }
+      // Fallback: vecchio comportamento testuale
+      return res.json({ result: resultData });
     } else {
       res.status(500).json({ error: 'Error calculating volume' });
     }
@@ -175,7 +203,8 @@ app.post('/shadedRelief', upload.single('demFile'), (req, res) => {
   if (!file) return res.status(400).send('Nessun file caricato.');
 
   const scriptPath = path.join(__dirname, 'scripts', 'generate_shaded_relief.py');
-  const child = spawn(pythonPath, [scriptPath, file.path], {
+  const absFilePath = path.resolve(file.path);
+  const child = spawn(pythonPath, [scriptPath, absFilePath], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, PYTHONUNBUFFERED: '1' }
   });
@@ -198,7 +227,8 @@ app.post('/calculateSlopes', upload.single('demFile'), (req, res) => {
   if (!file) return res.status(400).send('Nessun file caricato.');
 
   const scriptPath = path.join(__dirname, 'scripts', 'generate_slopes.py');
-  const child = spawn(pythonPath, [scriptPath, file.path], {
+  const absFilePath = path.resolve(file.path);
+  const child = spawn(pythonPath, [scriptPath, absFilePath], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, PYTHONUNBUFFERED: '1' }
   });
@@ -221,7 +251,8 @@ app.post('/calculateCurvatures', upload.single('demFile'), (req, res) => {
   if (!file) return res.status(400).send('Nessun file caricato.');
 
   const scriptPath = path.join(__dirname, 'scripts', 'calculate_curvatures.py');
-  const child = spawn(pythonPath, [scriptPath, file.path], {
+  const absFilePath = path.resolve(file.path);
+  const child = spawn(pythonPath, [scriptPath, absFilePath], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, PYTHONUNBUFFERED: '1' }
   });

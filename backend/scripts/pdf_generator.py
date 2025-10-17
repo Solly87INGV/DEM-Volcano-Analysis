@@ -9,6 +9,7 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_JUSTIFY  # Importa l'enum per la giustificazione
 
+
 class ImageWithText(Flowable):
     """
     Custom Flowable to draw an image with overlaid text.
@@ -32,38 +33,61 @@ class ImageWithText(Flowable):
             # If image does not exist, fill with a rectangle
             self.canv.setFillColor(colors.lightgrey)
             self.canv.rect(0, 0, self.width, self.height, fill=1)
-        
+
         # Set the font and color for the text
         self.canv.setFont("Helvetica-Bold", self.font_size)
         self.canv.setFillColor(self.text_color)
-        
+
         # Draw the text
         self.canv.drawString(self.x, self.y, self.text)
 
-def generate_pdf(file_path, results_list, title="Calculation Results"):
-    """
-    Genera un PDF con un'immagine di intestazione, un logo, una tabella di risultati e descrizioni dettagliate.
 
-    Parametri:
-    - file_path (str): Percorso dove verrà salvato il PDF.
-    - results_list (list): Lista di stringhe contenenti "Descrizione: Valore".
-    - title (str): Titolo del documento PDF, include informazioni sul processo.
+def generate_pdf(file_path, results_list, title="Calculation Results",
+                 image_paths=None, captions=None):
+    """
+    Genera un PDF con un'immagine di intestazione, un logo, una tabella di risultati,
+    descrizioni dettagliate e (opzionale) un blocco di figure alla fine inserite
+    una dopo l'altra (senza page break forzati).
     """
     try:
-        # Definisci le dimensioni del carattere come variabili
-        TITLE_FONT_SIZE = 14  # Ridotto per adattarsi in una singola riga
+        # Font sizes
+        TITLE_FONT_SIZE = 14
         DESCRIPTION_FONT_SIZE = 10
         METHOD_TITLE_FONT_SIZE = 10
         METHOD_BODY_FONT_SIZE = 9
-        HEADER_TITLE_FONT_SIZE = 10  # Dimensione del font per il titolo sull'immagine
+        HEADER_TITLE_FONT_SIZE = 10
 
-        # Crea un documento usando SimpleDocTemplate
-        doc = SimpleDocTemplate(file_path, pagesize=letter)
+        # Padding attorno alle immagini (in punti)
+        IMG_HPAD = 14           # padding orizzontale standard (doppiette)
+        IMG_HPAD_DEM = 22       # padding orizzontale extra per il DEM singolo
+        IMG_VPAD = 6            # padding verticale
+
+        # Fattori di larghezza (percentuale della larghezza utile del frame)
+        TARGET_W_ALL = 0.92     # doppiette
+        TARGET_W_DEM = 0.88     # DEM leggermente più stretto per compensare la colorbar nel PNG
+
+        # Correzione visiva DEM: spazio vuoto a destra per "compensare" la colorbar
+        # Aumenta questo valore se vuoi spostare il DEM un po' più a sinistra.
+        DEM_RIGHT_SPACER = 200  # punti
+
+        # Tripleta (3 pannelli) - SOLO per i file che contengono "triplet"
+        TARGET_W_TRIPLET = 1.00   # 100% della larghezza utile
+        TRIPLET_HPAD     = 0      # (non più usato, lascio il nome per compatibilità)
+        TRIPLET_MAX_HFR  = None   # <<< MODIFICA: nessun cap in altezza per le triplette
+
+        # Documento
+        doc = SimpleDocTemplate(
+            file_path,
+            pagesize=letter,
+            leftMargin=18,   # <<< MODIFICA: margini piccoli = più larghezza utile
+            rightMargin=18,  # <<< MODIFICA
+            topMargin=24,
+            bottomMargin=24
+        )
         elements = []
 
-        # Ottieni gli stili predefiniti
+        # Stili
         styles = getSampleStyleSheet()
-        # Definisci stili personalizzati con dimensioni del carattere ridotte e giustificazione
         styles.add(ParagraphStyle(
             name='DescriptionTitle',
             fontSize=12,
@@ -103,109 +127,89 @@ def generate_pdf(file_path, results_list, title="Calculation Results"):
             alignment=TA_JUSTIFY,
             fontName='Helvetica-Bold'
         ))
-        # Definisci un nuovo stile per il titolo ridotto
         styles.add(ParagraphStyle(
             name='TitleSmall',
             parent=styles['Title'],
-            fontSize=TITLE_FONT_SIZE,  # Ridotto per adattarsi in una singola riga
+            fontSize=TITLE_FONT_SIZE,
             alignment=TA_JUSTIFY
         ))
 
-        # Percorsi alle immagini
+        # Percorsi immagini header
         script_dir = os.path.dirname(os.path.abspath(__file__))
         header_image_path = os.path.join(script_dir, '..', '..', 'frontend', 'public', 'images', 'ingv_Etna.jpg')
         logo_image_path = os.path.join(script_dir, '..', '..', 'frontend', 'public', 'images', 'logo-ingv.jpeg')
 
-        header_image_path = os.path.normpath(header_image_path)  # Normalizza il percorso per compatibilità cross-platform
+        header_image_path = os.path.normpath(header_image_path)
         logo_image_path = os.path.normpath(logo_image_path)
 
-        # Verifica che entrambe le immagini esistano
         if not os.path.exists(header_image_path):
             raise FileNotFoundError(f"Immagine di intestazione non trovata nel percorso: {header_image_path}")
         if not os.path.exists(logo_image_path):
             raise FileNotFoundError(f"Logo non trovato nel percorso: {logo_image_path}")
 
-        # Crea oggetti Image per il logo
+        # Logo + header image
         logo = Image(logo_image_path)
-
-        # Imposta le dimensioni delle immagini
-        logo_width = 80  # Larghezza desiderata per il logo
-        logo_height = 80  # Altezza desiderata per il logo
+        logo_width = 80
+        logo_height = 80
         logo.drawWidth = logo_width
         logo.drawHeight = logo_height
 
-        # Crea il paragrafo per il titolo sull'immagine dell'Etna
         header_title_text = "Interface for DEM processing"
-
-        # Crea un Flowable con l'immagine dell'Etna e il testo sovrapposto
         etna_with_text = ImageWithText(
             image_path=header_image_path,
             text=header_title_text,
             font_size=HEADER_TITLE_FONT_SIZE,
             text_color=colors.white,
-            x=10,  # Posizione orizzontale del testo
-            y=10,  # Posizione verticale del testo
-            width=400,  # Larghezza dell'immagine
-            height=100  # Altezza dell'immagine
+            x=10,
+            y=10,
+            width=400,
+            height=100
         )
 
-        # Crea una tabella con due colonne: sinistra (logo) e destra (Etna con testo)
         header_table = Table([
             [logo, etna_with_text]
-        ], colWidths=[logo_width + 20, 400 + 20])  # Aggiungi padding tra le immagini
+        ], colWidths=[logo_width + 20, 400 + 20])
 
-        # Definisci lo stile della tabella principale
         header_table.setStyle(TableStyle([
-            ('VALIGN', (0, 0), (-1, -1), 'TOP'),  # Allinea verticalmente al top
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
             ('LEFTPADDING', (0, 0), (-1, -1), 10),
             ('RIGHTPADDING', (0, 0), (-1, -1), 10),
             ('TOPPADDING', (0, 0), (-1, -1), 10),
             ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
         ]))
 
-        # Aggiungi la tabella all'elemento del documento
         elements.append(header_table)
-        elements.append(Spacer(1, 12))  # Aggiungi spazio dopo l'intestazione
+        elements.append(Spacer(1, 12))
 
-        # Aggiungi il titolo al PDF con lo stile 'TitleSmall'
-        title_paragraph = Paragraph(title, styles['TitleSmall'])
-        elements.append(title_paragraph)
-        elements.append(Spacer(1, 12))  # Aggiungi spazio verticale dopo il titolo
+        # Titolo
+        elements.append(Paragraph(title, styles['TitleSmall']))
+        elements.append(Spacer(1, 12))
 
-        # Prepara i dati per la tabella dei risultati
+        # Tabella risultati
         table_data = [["Description", "Value"]]
-
-        for line in results_list:
+        for line in (results_list or []):
             if ':' in line:
                 description, value = line.split(':', 1)
                 table_data.append([description.strip(), value.strip()])
             else:
-                # Se la riga non contiene ':', aggiungi solo la descrizione
                 table_data.append([line.strip(), ""])
 
-        # Crea la tabella con larghezze delle colonne adeguate
-        table = Table(table_data, colWidths=[300, 200])  # Regola le larghezze secondo necessità
-
-        # Definisci lo stile della tabella
+        table = Table(table_data, colWidths=[300, 200])
         style = TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),  # Sfondo della prima riga
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),  # Colore del testo della prima riga
-
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),  # Allinea il testo al centro
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),  # Font della prima riga
-            ('FONTSIZE', (0, 0), (-1, 0), 12),  # Dimensione del font della prima riga
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),  # Padding inferiore della prima riga
-
-            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),  # Sfondo delle righe rimanenti
-            ('GRID', (0, 0), (-1, -1), 1, colors.black),  # Bordi della tabella
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
         ])
         table.setStyle(style)
-
-        # Aggiungi la tabella agli elementi del documento
         elements.append(table)
-        elements.append(Spacer(1, 36))  # Aggiungi più spazio dopo la tabella
+        elements.append(Spacer(1, 36))
 
-        # Definisci le descrizioni dettagliate
+        # ====== DESCRIZIONI DETTAGLIATE ======
         descriptions = [
             {
                 'title': '1. Base Area of the Volcano',
@@ -235,7 +239,7 @@ def generate_pdf(file_path, results_list, title="Calculation Results"):
                 'title': '4. Caldera Width (Distance between Opposite Points of the Caldera)',
                 'description': 'The caldera width is the distance measured between two opposite points along the caldera\'s contour. This measure provides information about the central depression\'s dimensions of the volcano.',
                 'method': [
-                    'Identification of Opposite Points on the Caldera: Using the slope map derived from the DEM, points with the maximum slopes on the caldera are identified. Subsequently, points opposite to these maximum slope points along the caldera contour are selected.',
+                    'Identification of Opposite Points on the Caldera: Using the slope map derived from the DEM, points with the highest slopes on the caldera are identified. Subsequently, points opposite to these maximum slope points along the caldera contour are selected.',
                     'Distance Calculation: The Euclidean distance between these two opposite points is calculated and converted from pixels to kilometers based on the DEM scale.'
                 ]
             },
@@ -270,44 +274,124 @@ def generate_pdf(file_path, results_list, title="Calculation Results"):
             }
         ]
 
-        # Aggiungi le descrizioni dettagliate come sezioni con titoli e paragrafi
         for idx, item in enumerate(descriptions):
-            # Titolo della sezione
-            title_paragraph = Paragraph(item['title'], styles['DescriptionTitle'])
-            elements.append(title_paragraph)
-
-            # Descrizione
-            description_paragraph = Paragraph(f"<b>Description:</b> {item['description']}", styles['DescriptionBody'])
-            elements.append(description_paragraph)
-
-            # Metodo di Calcolo
-            method_title_paragraph = Paragraph("<b>Method of Calculation:</b>", styles['DescriptionBody'])
-            elements.append(method_title_paragraph)
+            elements.append(Paragraph(item['title'], styles['DescriptionTitle']))
+            elements.append(Paragraph(f"<b>Description:</b> {item['description']}", styles['DescriptionBody']))
+            elements.append(Paragraph("<b>Method of Calculation:</b>", styles['DescriptionBody']))
 
             for method in item['method']:
                 if isinstance(method, str):
-                    # Verifica se il metodo inizia con un numero per formattarlo correttamente
-                    if method.strip()[0].isdigit():
-                        # Usa un elenco numerato
-                        method_paragraph = Paragraph(method, styles['MethodBody'])
+                    if method.strip() and method.strip()[0].isdigit():
+                        elements.append(Paragraph(method, styles['MethodBody']))
                     else:
-                        # Usa un elenco puntato manuale
-                        method_paragraph = Paragraph(f"- {method}", styles['MethodBody'])
-                    elements.append(method_paragraph)
-                elif isinstance(method, dict):
-                    # Metodo con immagine (non presente nel tuo attuale codice)
-                    pass  # Poiché l'immagine non è desiderata, non fare nulla
-                # Puoi estendere qui per altri tipi di metodi se necessario
+                        elements.append(Paragraph(f"- {method}", styles['MethodBody']))
 
-            # Dopo il primo punto, inserisci un PageBreak
+            # Page break dopo la prima sezione (coerente con il tuo originale)
             if idx == 0:
                 elements.append(PageBreak())
 
-            # Aggiungi uno spazio dopo ogni sezione
             elements.append(Spacer(1, 12))
 
-        # Costruisci il PDF
+        # ====== BLOCCHI FIGURE (una dopo l'altra, senza PageBreak forzati) ======
+        if image_paths:
+            if captions is None or len(captions) != len(image_paths):
+                captions = [None] * len(image_paths)
+
+            # Altezza max standard (solo per NON triplette)
+            max_h_fraction = 0.36
+
+            for img_path, cap in zip(image_paths, captions):
+                if not img_path or not os.path.exists(img_path):
+                    continue
+
+                img = Image(img_path)
+                base = os.path.basename(img_path).lower()
+                is_dem = ('dem_overview' in base)  # DEM standalone
+                is_triplet = ('triplet' in base)   # TRIPLETTE
+
+                # Larghezza target
+                if is_dem:
+                    target_w_factor = TARGET_W_DEM
+                elif is_triplet:
+                    target_w_factor = TARGET_W_TRIPLET  # 100% della larghezza per triplette
+                else:
+                    target_w_factor = TARGET_W_ALL      # doppiette standard
+
+                target_w = doc.width * target_w_factor
+                img.drawWidth = target_w
+                img.drawHeight = img.imageHeight * (img.drawWidth / float(img.imageWidth))
+
+                # Cap in altezza:
+                # - per le triplette: DISATTIVATO (TRIPLET_MAX_HFR=None)
+                # - per altri: mantieni max_h_fraction
+                if (not is_triplet) and (max_h_fraction is not None):
+                    max_draw_h = doc.height * max_h_fraction
+                    if img.drawHeight > max_draw_h:
+                        scale = max_draw_h / float(img.drawHeight)
+                        img.drawWidth *= scale
+                        img.drawHeight *= scale
+                        target_w = img.drawWidth  # aggiorna se scalato
+
+                # Spazio prima dell'immagine
+                elements.append(Spacer(1, 12))
+
+                if is_dem:
+                    # ---------- DEM standalone: "shift" visivo a sinistra ----------
+                    # Tabella 2 colonne: [ immagine | spacer destro fisso ]
+                    dem_inner = Table(
+                        [[img]],
+                        colWidths=[doc.width - DEM_RIGHT_SPACER],
+                        style=TableStyle([
+                            ('LEFTPADDING',  (0, 0), (-1, -1), IMG_HPAD_DEM),
+                            ('RIGHTPADDING', (0, 0), (-1, -1), IMG_HPAD_DEM),
+                            ('TOPPADDING',   (0, 0), (-1, -1), IMG_VPAD),
+                            ('BOTTOMPADDING',(0, 0), (-1, -1), IMG_VPAD),
+                            ('ALIGN',        (0, 0), (-1, -1), 'CENTER'),
+                            ('VALIGN',       (0, 0), (-1, -1), 'MIDDLE'),
+                            ('BOX',          (0, 0), (-1, -1), 0, colors.white),
+                        ])
+                    )
+                    # wrapper con seconda colonna vuota a destra
+                    dem_wrapper = Table(
+                        [[dem_inner, ""]],
+                        colWidths=[doc.width - DEM_RIGHT_SPACER, DEM_RIGHT_SPACER],
+                        style=TableStyle([
+                            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                            ('BOX',    (0, 0), (-1, -1), 0, colors.white),
+                        ])
+                    )
+                    elements.append(dem_wrapper)
+
+                elif is_triplet:
+                    # ---------- TRIPLETTE: niente Table → vera larghezza piena ----------
+                    elements.append(img)
+
+                else:
+                    # ---------- Doppiette: centratura "pulita" ----------
+                    img_container = Table(
+                        [[img]],
+                        colWidths=[doc.width],
+                        style=TableStyle([
+                            ('LEFTPADDING',  (0, 0), (-1, -1), IMG_HPAD),
+                            ('RIGHTPADDING', (0, 0), (-1, -1), IMG_HPAD),
+                            ('TOPPADDING',   (0, 0), (-1, -1), IMG_VPAD),
+                            ('BOTTOMPADDING',(0, 0), (-1, -1), IMG_VPAD),
+                            ('ALIGN',        (0, 0), (-1, -1), 'CENTER'),
+                            ('VALIGN',       (0, 0), (-1, -1), 'MIDDLE'),
+                            ('BOX',          (0, 0), (-1, -1), 0, colors.white),
+                        ])
+                    )
+                    elements.append(img_container)
+
+                # didascalia (opzionale)
+                if cap:
+                    elements.append(Spacer(1, 6))
+                    elements.append(Paragraph(cap, styles['DescriptionBody']))
+
+            # piccolo spazio finale
+            elements.append(Spacer(1, 18))
+
+        # Build
         doc.build(elements)
     except Exception as e:
-        # Per ora, solleva l'eccezione per notificare il chiamante
         raise e

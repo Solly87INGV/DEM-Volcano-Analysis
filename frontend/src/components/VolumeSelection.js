@@ -6,9 +6,8 @@ import AssessmentIcon from '@mui/icons-material/Assessment';
 import CardSelection from './CardSelection';
 import axios from 'axios';
 import './VolumeSelection.css';
-import DownloadResults from './DownloadResults';
 
-const VolumeSelection = ({ demFile, onBack }) => {
+const VolumeSelection = ({ demFile, onBack, processId }) => {
   const [volumeType, setVolumeType] = useState('');
   const [approximationType, setApproximationType] = useState('');
   const [selectedApproximation, setSelectedApproximation] = useState('');
@@ -56,33 +55,45 @@ const VolumeSelection = ({ demFile, onBack }) => {
     formData.append('volumeType', volumeType);
     formData.append('approximationType', approximationType);
 
+    // 👉 passa il processId della fase /process (prop o fallback da localStorage)
+    const effectiveProcessId = processId || localStorage.getItem('lastProcessId');
+    if (effectiveProcessId) formData.append('processId', String(effectiveProcessId));
+
     try {
-      // ⏱️ start cronometro /calculateVolume
       const t0 = performance.now();
 
       const response = await axios.post('http://localhost:5000/calculateVolume', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
 
-      // ⏱️ stop cronometro
       const t1 = performance.now();
       const dt = t1 - t0;
       setCalcWallMs(dt);
       console.info(`[TIMING] POST /calculateVolume end-to-end: ${dt.toFixed(1)} ms`);
 
-      // prova a leggere fasi server (se il backend le fornisce come header)
+      // fasi lato server (se presenti come header)
       const phaseHeader = response?.headers?.['x-server-phase'];
       if (phaseHeader) {
         try {
           const phasesObj = JSON.parse(phaseHeader);
           setServerPhasesCalc(phasesObj);
           console.info('[PHASES][/calculateVolume]', phasesObj);
-        } catch {
-          /* header non JSON */
-        }
+        } catch { /* header non JSON */ }
       }
 
-      setResult(response.data.result);
+      // Supporta risposta strutturata { result, images } o fallback testuale
+      let resText = '';
+      if (response?.data && typeof response.data === 'object') {
+        resText = response.data.result || '';
+      } else if (typeof response?.data === 'string') {
+        try {
+          const maybe = JSON.parse(response.data);
+          resText = typeof maybe.result === 'string' ? maybe.result : response.data;
+        } catch {
+          resText = response.data;
+        }
+      }
+      setResult(resText);
     } catch (error) {
       console.error('Error calculating volume:', error);
       alert('Si è verificato un errore durante il calcolo del volume.');
@@ -173,7 +184,6 @@ const VolumeSelection = ({ demFile, onBack }) => {
               <CircularProgress />
             </Box>
           )}
-          {/* 🔁 Ordine invertito: Back prima, Calculate dopo */}
           <Button variant="contained" color="secondary" onClick={onBack} startIcon={<ArrowBackIcon />}>
             Back to Upload
           </Button>
@@ -189,7 +199,6 @@ const VolumeSelection = ({ demFile, onBack }) => {
         </Box>
       )}
 
-      {/* Risultati + diagnostica tempi */}
       {(result || calcWallMs != null || serverPhasesCalc) && (
         <>
           <Divider sx={{ my: 2 }} />
@@ -197,14 +206,15 @@ const VolumeSelection = ({ demFile, onBack }) => {
             <Box className="results-container">
               <Typography variant="h6">Summary of Results</Typography>
               <Typography sx={{ mt: 1, whiteSpace: 'pre-line' }}>{result}</Typography>
-              <DownloadResults result={result} className="download-button" />
             </Box>
           )}
           {(calcWallMs != null || serverPhasesCalc) && (
             <Box sx={{ mt: 2 }}>
               <Typography variant="h6" sx={{ mb: 1 }}>Diagnostics (client-side timings)</Typography>
               {calcWallMs != null && (
-                <Typography variant="body2">POST /calculateVolume — wall-time: <b>{calcWallMs.toFixed(1)} ms</b></Typography>
+                <Typography variant="body2">
+                  POST /calculateVolume — wall-time: <b>{calcWallMs.toFixed(1)} ms</b>
+                </Typography>
               )}
               {serverPhasesCalc && (
                 <Typography variant="body2" sx={{ mt: 1 }}>
