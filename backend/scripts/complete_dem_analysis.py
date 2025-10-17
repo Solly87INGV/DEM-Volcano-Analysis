@@ -431,35 +431,44 @@ def _save_doublets_from_arrays(analysis_triplets, titles, cmaps, units, descript
         # Figura più larga e SENZA constrained_layout
         fig = plt.figure(figsize=(14.5, 5.5))
         # Gridspec a 3 colonne: sinistra, SPACER, destra
-        # La colonna centrale è un "cuscinetto" orizzontale reale.
         gs = gridspec.GridSpec(
             1, 3, figure=fig,
-            width_ratios=[1.0, 0.08, 1.0],  # 0.08 ~ 8% della larghezza come spazio
-            wspace=0.15                      # ulteriore margine tra le colonne
+            width_ratios=[1.0, 0.08, 1.0],
+            wspace=0.15
         )
 
-        # Pannello sinistro (data1)
+        # ==== Pannello sinistro (data1)
         ax1 = fig.add_subplot(gs[0, 0])
         im1 = ax1.imshow(data1, cmap=c_list[0], origin='upper')
         ax1.set_title(t_list[0], pad=8)
         ax1.set_aspect('equal', adjustable='box')
-        # Colorbar con pad più grande per staccarla dal pannello
-        cbar1 = fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.08)
-        cbar1.set_label(f"{u_list[0]}", rotation=90)
-        ax1.text(0.5, -0.18, d_list[0], transform=ax1.transAxes, ha='center', fontsize=9, wrap=True)
 
-        # SPACER al centro (asse invisibile)
+        # Colorbar con stessa altezza immagine e spessore/distanza simili a prima
+        divider1 = make_axes_locatable(ax1)
+        cax1 = divider1.append_axes("right", size="4.6%", pad=0.25)  # ≈ fraction=0.046, pad più “aria”
+        cbar1 = fig.colorbar(im1, cax=cax1)
+        cbar1.set_label(f"{u_list[0]}", rotation=90)
+
+        ax1.text(0.5, -0.18, d_list[0], transform=ax1.transAxes,
+                 ha='center', fontsize=9, wrap=True)
+
+        # ==== SPACER centrale (asse invisibile)
         ax_spacer = fig.add_subplot(gs[0, 1])
         ax_spacer.axis('off')
 
-        # Pannello destro (data2)
+        # ==== Pannello destro (data2)
         ax2 = fig.add_subplot(gs[0, 2])
         im2 = ax2.imshow(data2, cmap=c_list[1], origin='upper')
         ax2.set_title(t_list[1], pad=8)
         ax2.set_aspect('equal', adjustable='box')
-        cbar2 = fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.08)
+
+        divider2 = make_axes_locatable(ax2)
+        cax2 = divider2.append_axes("right", size="4.6%", pad=0.25)
+        cbar2 = fig.colorbar(im2, cax=cax2)
         cbar2.set_label(f"{u_list[1]}", rotation=90)
-        ax2.text(0.5, -0.18, d_list[1], transform=ax2.transAxes, ha='center', fontsize=9, wrap=True)
+
+        ax2.text(0.5, -0.18, d_list[1], transform=ax2.transAxes,
+                 ha='center', fontsize=9, wrap=True)
 
         # Titolo generale
         fig.suptitle(f"Location: {file_name} — Panel {i+1}/{num_triplets}", fontsize=13)
@@ -467,7 +476,7 @@ def _save_doublets_from_arrays(analysis_triplets, titles, cmaps, units, descript
         fname = f"double_{i+1:02d}.png"
         fpath = os.path.join(out_dir, fname)
         try:
-            # NIENTE bbox_inches='tight': altrimenti ri-stringe i margini
+            # NIENTE bbox_inches='tight': mantiene i margini desiderati
             fig.savefig(fpath, dpi=170)
             saved.append({
                 "filename": fname,
@@ -484,6 +493,7 @@ def _save_doublets_from_arrays(analysis_triplets, titles, cmaps, units, descript
             plt.close(fig)
 
     return saved
+
 
 
 # ==================== FINE UTILITY PNG + MANIFEST ====================
