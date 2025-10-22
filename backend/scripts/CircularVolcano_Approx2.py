@@ -1,99 +1,123 @@
 # CircularVolcano_Approx2.py
+# ——————————————————————————————————————————————————————————
+# Approx2: mantiene i calcoli esistenti.
+# Report:
+#  - usa DEM + doppiette dal manifest (se presente), rimuovendo SOLO le triplette
+#  - aggiunge in coda la nuova DOPPIETTA “Base vs Caldera” (stessa gabbia delle doppiette buone)
+#  - fail-safe: se la lista è vuota, usa almeno la doppietta
+# GUI: 3 pannelli (DEM, Base opposta, Caldera max slope) + overview PNG + payload JSON.
 
 import sys
 import os
 import json
 import time
-import glob
 import numpy as np
-import rasterio  # To read DEM files in .tif format
+import rasterio
 from scipy.ndimage import sobel
 from skimage import measure
+
 from PyQt5 import QtWidgets, QtGui, QtCore
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QMessageBox, QFileDialog
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QMessageBox, QFileDialog
 )
+
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+import matplotlib.pyplot as plt
 from matplotlib import gridspec
+
 import pdf_generator
 
-# ========== small helpers for outputs ==========
 
-def _resolve_process_id() -> str:
-    """Usa PROCESS_ID dall'env, altrimenti fallback deterministico."""
-    env_id = os.environ.get("PROCESS_ID")
-    if env_id:
-        return env_id
-    return f"local_{int(time.time())}"
+# ========== helpers path/manifest ==========
 
-def _base_dir():
+def _script_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
+def _resolve_process_id() -> str:
+    return os.environ.get("PROCESS_ID") or f"local_{int(time.time())}"
+
 def _ensure_outputs_dir(process_id: str) -> str:
-    out_dir = os.path.join(_base_dir(), "outputs", process_id)
+    out_dir = os.path.join(_script_dir(), "outputs", process_id)
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
 
-def _manifest_path_for(out_dir: str) -> str:
-    return os.path.join(out_dir, "analysis_images.json")
+def _find_manifest():
+    """
+    Restituisce (outputs_dir, manifest_path) se trovati.
+    Priorità: env PROCESS_ID -> outputs/<PROCESS_ID>/analysis_images.json
+    Fallback: manifest più recente in outputs/*/analysis_images.json (se esiste).
+    """
+    base = os.path.join(_script_dir(), "outputs")
 
-def _read_json(path: str):
+    # 1) PROCESS_ID esplicito
+    pid = os.environ.get("PROCESS_ID")
+    if pid:
+        out_dir = os.path.join(base, pid)
+        mp = os.path.join(out_dir, "analysis_images.json")
+        if os.path.exists(mp):
+            return out_dir, mp
+
+    # 2) fallback: ultimo manifest disponibile
+    if os.path.isdir(base):
+        candidates = []
+        for name in os.listdir(base):
+            p = os.path.join(base, name, "analysis_images.json")
+            if os.path.exists(p):
+                candidates.append(p)
+        if candidates:
+            candidates.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+            mp = candidates[0]
+            return os.path.dirname(mp), mp
+
+    return None, None
+
+def _load_manifest_images(manifest_path):
+    """Estrae dal JSON la lista di immagini (preferendo abs_path; fallback a filename)."""
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        images = data.get("images", [])
+        paths = []
+        for it in images:
+            p = it.get("abs_path") or it.get("filename")
+            if p:
+                paths.append(p)
+        return paths
+    except Exception as e:
+        print(f"[WARN] Could not read manifest '{manifest_path}': {e}")
+        return []
 
-def _load_analysis_manifest_with_fallback(out_dir: str):
-    """
-    1) prova manifest in out_dir
-    2) se non c'è, cerca il manifest più recente in outputs/*/
-    3) se ancora nulla, fallback a lista immagini triplet_*.png nell'out_dir
-    Ritorna (manifest_dict | None, origin_out_dir)
-    """
-    # 1) manifest nella cartella del processId corrente
-    manifest_path = _manifest_path_for(out_dir)
-    if os.path.exists(manifest_path):
-        data = _read_json(manifest_path)
-        if data:
-            return data, out_dir
+def _normalize_and_filter_paths(paths, base_dir=None):
+    """Normalizza e tiene solo i file realmente esistenti."""
+    norm = []
+    for p in paths:
+        if not p:
+            continue
+        pp = p
+        if not os.path.isabs(pp) and base_dir:
+            pp = os.path.join(base_dir, os.path.basename(p))
+        pp = os.path.normpath(pp)
+        if os.path.exists(pp):
+            norm.append(pp)
+        else:
+            print(f"[WARN] Missing image on disk (skipped): {pp}")
+    return norm
 
-    # 2) cerca manifest più recente in qualunque outputs/<pid>/
-    outputs_root = os.path.join(_base_dir(), "outputs")
-    candidates = glob.glob(os.path.join(outputs_root, "*", "analysis_images.json"))
-    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    for cand in candidates:
-        data = _read_json(cand)
-        if data and isinstance(data.get("images"), list) and data["images"]:
-            return data, os.path.dirname(cand)  # la dir del manifest trovato
+def _remove_triplets(paths):
+    """Rimuove ogni triplet_*.png dalla lista (non toccare le doppiette)."""
+    return [p for p in paths if "triplet_" not in os.path.basename(p).lower()]
 
-    # 3) fallback "grezzo": usa triplet_*.png presenti in out_dir (se ci sono)
-    triplets = sorted(glob.glob(os.path.join(out_dir, "triplet_*.png")))
-    if triplets:
-        fake = {
-            "images": [
-                {
-                    "abs_path": p,
-                    "public_path": f"/outputs/{os.path.basename(os.path.dirname(p))}/{os.path.basename(p)}",
-                    "titles": []
-                }
-                for p in triplets
-            ]
-        }
-        return fake, out_dir
 
-    return None, out_dir
-
-# ========== Analysis Functions ==========
+# ========== Analysis functions (calcoli invariati) ==========
 
 def find_lowest_base_contour(matrix, base_elevation_ratio=0.05):
     base_level = matrix.min() + (matrix.max() - matrix.min()) * base_elevation_ratio
     contours = measure.find_contours(matrix, base_level)
     if len(contours) == 0:
         raise ValueError("No contours found for the given base elevation ratio.")
-    base_contour = max(contours, key=len)
-    return base_contour
+    return max(contours, key=len)
 
 def find_opposite_base_points(contour):
     contour = np.round(contour).astype(int)
@@ -110,26 +134,22 @@ def calculate_area(contour, pixel_size):
     x = contour[:, 1]
     y = contour[:, 0]
     area_in_pixels = 0.5 * np.abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
-    area_in_meters = area_in_pixels * (pixel_size ** 2)
-    return area_in_meters
+    return area_in_pixels * (pixel_size ** 2)
 
 def calculate_slope(matrix):
     dx = sobel(matrix, axis=1)
     dy = sobel(matrix, axis=0)
-    slope = np.hypot(dx, dy)
-    return slope
+    return np.hypot(dx, dy)
 
 def find_caldera_contour(matrix, level_ratio=0.8):
     contour_level = matrix.max() * level_ratio
     contours = measure.find_contours(matrix, contour_level)
     if len(contours) == 0:
         raise ValueError("No contours found for the given level ratio.")
-    main_contour = max(contours, key=len)
-    return main_contour
+    return max(contours, key=len)
 
 def find_opposite_slope_points(slope_matrix, contour):
     contour = np.round(contour).astype(int)
-    # Evita indici fuori matrice
     contour = contour[
         (contour[:,0] >= 0) & (contour[:,0] < slope_matrix.shape[0]) &
         (contour[:,1] >= 0) & (contour[:,1] < slope_matrix.shape[1])
@@ -143,6 +163,7 @@ def find_opposite_slope_points(slope_matrix, contour):
     max_slope_index2 = tuple(contour[opposite_index])
     return max_slope_index1, max_slope_index2
 
+
 # ========== Main App ==========
 
 class VolumeAnalysisApp(QMainWindow):
@@ -150,16 +171,16 @@ class VolumeAnalysisApp(QMainWindow):
         super().__init__()
         self.setWindowTitle('Volcano Volume Analysis')
         self.dem = dem
+        self.original_file_name = original_file_name
 
         # outputs context
         self.process_id = _resolve_process_id()
         self.out_dir = _ensure_outputs_dir(self.process_id)
-        self.original_file_name = original_file_name
 
         self.calculate_results()  # prima dei widget
         self.initUI()
 
-        # salva overview + emetti payload JSON (non blocca la GUI in caso di errore)
+        # salva overview + payload (non blocca la GUI)
         try:
             self._save_overview_png()
             self._emit_stdout_payload()
@@ -167,19 +188,15 @@ class VolumeAnalysisApp(QMainWindow):
             print(f"[PY VOL WARN] post-render saving/payload failed: {e}")
 
     def initUI(self):
-        # Widget centrale
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
 
-        # Layout principale
         main_layout = QVBoxLayout(central_widget)
 
-        # Figura Matplotlib e Canvas
         self.figure = Figure(figsize=(18, 14))
         self.canvas = FigureCanvas(self.figure)
         main_layout.addWidget(self.canvas)
 
-        # Pulsanti
         button_layout = QHBoxLayout()
         main_layout.addLayout(button_layout)
 
@@ -197,11 +214,11 @@ class VolumeAnalysisApp(QMainWindow):
 
     def calculate_results(self):
         try:
-            pixel_size = 30  # adattabile
+            pixel_size = 30
             self.base_contour = find_lowest_base_contour(self.dem, base_elevation_ratio=0.05)
             self.base_point1, self.base_point2 = find_opposite_base_points(self.base_contour)
 
-            # Base distances
+            # Distanze base
             self.distance_pixel_base = distance_between_points(
                 self.base_point1[0], self.base_point1[1], self.base_point2[0], self.base_point2[1]
             )
@@ -213,7 +230,7 @@ class VolumeAnalysisApp(QMainWindow):
             self.caldera_contour = find_caldera_contour(self.dem, level_ratio=0.8)
             self.max_slope_index1, self.max_slope_index2 = find_opposite_slope_points(self.slope, self.caldera_contour)
 
-            # Caldera distances
+            # Distanze caldera
             self.distance_pixel_caldera = distance_between_points(
                 self.max_slope_index1[0], self.max_slope_index1[1],
                 self.max_slope_index2[0], self.max_slope_index2[1]
@@ -221,11 +238,11 @@ class VolumeAnalysisApp(QMainWindow):
             self.distance_meters_caldera = self.distance_pixel_caldera * pixel_size
             self.distance_caldera_km = self.distance_meters_caldera * 1e-3
 
-            # Areas
+            # Aree
             self.area_base = calculate_area(self.base_contour, pixel_size) * 1e-6
             self.area_caldera = calculate_area(self.caldera_contour, pixel_size) * 1e-6
 
-            # Volumes (Approx2: caldera cilindro h=r)
+            # Volumi (Approx2: caldera cilindro h=r)
             self.h_max = np.max(self.dem)
             self.R1 = self.distance_meters_base / 2
             self.R2 = self.distance_meters_caldera / 2
@@ -285,7 +302,7 @@ class VolumeAnalysisApp(QMainWindow):
 
         gs = gridspec.GridSpec(nrows=3, ncols=3, height_ratios=[4, 1, 1.5], figure=fig, wspace=0.4, hspace=0.6)
 
-        # Plot 1
+        # Plot 1: DEM
         ax1 = fig.add_subplot(gs[0, 0])
         im1 = ax1.imshow(self.dem, cmap='terrain', origin='upper')
         cbar1 = fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
@@ -293,7 +310,7 @@ class VolumeAnalysisApp(QMainWindow):
         ax1.set_title("Volcano DEM", fontsize=14, pad=20, y=1.02)
         ax1.axis('on')
 
-        # Plot 2
+        # Plot 2: Base opposta
         ax2 = fig.add_subplot(gs[0, 1])
         im2 = ax2.imshow(self.dem, cmap='terrain', origin='upper')
         cbar2 = fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
@@ -304,7 +321,7 @@ class VolumeAnalysisApp(QMainWindow):
         ax2.set_title("Opposite Points of the Volcano Base", fontsize=14, pad=20, y=1.02)
         ax2.axis('on')
 
-        # Plot 3
+        # Plot 3: Caldera max slope
         ax3 = fig.add_subplot(gs[0, 2])
         im3 = ax3.imshow(self.dem, cmap='terrain', origin='upper')
         cbar3 = fig.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
@@ -342,78 +359,89 @@ class VolumeAnalysisApp(QMainWindow):
         fig.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05, wspace=0.4, hspace=0.6)
         self.canvas.draw()
 
-    # ----- save overview and emit JSON payload -----
+    # ----- overview + payload -----
     def _save_overview_png(self):
         try:
             out_png = os.path.join(self.out_dir, "circular_approx2_overview.png")
-            self.figure.savefig(out_png, dpi=150, bbox_inches='tight')
+            self.figure.savefig(out_png, dpi=150)  # niente bbox_inches='tight'
             print(f"[PY VOL {self.process_id}] saved {out_png}")
         except Exception as e:
             print(f"[PY VOL ERR] failed to save overview png: {e}")
 
     def _emit_stdout_payload(self):
         images = []
-
-        # 1) manifest (con fallback a manifest più recente o triplet_*.png)
-        manifest, origin_dir = _load_analysis_manifest_with_fallback(self.out_dir)
-        if manifest and isinstance(manifest.get("images"), list):
-            for entry in manifest["images"]:
-                public = entry.get("public_path")
-                if public:
-                    images.append(public)
-
-        # 2) overview corrente
-        images.append(f"/outputs/{self.process_id}/circular_approx2_overview.png")
-
-        payload = {
-            "result": self.results_text,
-            "images": images
-        }
-        print(json.dumps(payload), flush=True)
-
-    # ----- collect images for PDF (absolute paths + captions) -----
-    def _collect_report_images(self):
-        """
-        Raccoglie percorsi ASSOLUTI immagini per PDF:
-        - tutte le triplette da analysis_images.json (con fallback a manifest più recente o triplet_*.png)
-        - l’overview di questa GUI.
-        Ritorna (paths, captions).
-        """
-        paths, captions = [], []
-
-        manifest, origin_dir = _load_analysis_manifest_with_fallback(self.out_dir)
-        if manifest and isinstance(manifest.get("images"), list):
-            for i, entry in enumerate(manifest["images"], start=1):
-                abs_path = entry.get("abs_path")
-                public_path = entry.get("public_path")
-                titles = entry.get("titles") or []
-
-                # Se l'abs_path manca o non esiste, ricostruisci da public_path
-                if not abs_path or not os.path.exists(abs_path):
-                    if public_path:
-                        candidate = os.path.join(origin_dir, os.path.basename(public_path))
-                        if os.path.exists(candidate):
-                            abs_path = candidate
-
-                # Se ancora nulla, prova triplet_*.png in origin_dir
-                if (not abs_path or not os.path.exists(abs_path)) and public_path and "triplet_" in public_path:
-                    candidate = os.path.join(origin_dir, os.path.basename(public_path))
-                    if os.path.exists(candidate):
-                        abs_path = candidate
-
-                if abs_path and os.path.exists(abs_path):
-                    paths.append(abs_path)
-                    cap = " | ".join(titles) if titles else f"Triplet {i}"
-                    captions.append(cap)
+        # manifest standard (se presente)
+        outputs_dir, manifest_path = _find_manifest()
+        if manifest_path and os.path.exists(manifest_path):
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for entry in data.get("images", []):
+                    public = entry.get("public_path")
+                    if public:
+                        images.append(public)
+            except Exception as e:
+                print(f"[PY VOL WARN] failed reading manifest for stdout payload: {e}")
 
         # overview corrente
-        overview_path = os.path.join(self.out_dir, "circular_approx2_overview.png")
-        if os.path.exists(overview_path):
-            paths.append(overview_path)
-            captions.append("Circular Approximation 2 — Overview")
+        images.append(f"/outputs/{self.process_id}/circular_approx2_overview.png")
 
-        return paths, captions
+        payload = {"result": self.results_text, "images": images}
+        print(json.dumps(payload), flush=True)
 
+    # ----- doppietta finale (stessa gabbia delle doppiette buone) -----
+    def _save_final_doublet_png(self, out_path):
+        """
+        Salva una DOPPIETTA 1x2 (base vs caldera) con la STESSA gabbia
+        delle doppiette precedenti: 14.5x5.5, spacer centrale, colorbar 4.6%.
+        """
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+        FIG_W, FIG_H = 14.5, 5.5
+        fig = plt.figure(figsize=(FIG_W, FIG_H))
+        gs = gridspec.GridSpec(
+            1, 3, figure=fig,
+            width_ratios=[1.0, 0.08, 1.0],   # sinistra | SPACER | destra
+            wspace=0.15
+        )
+
+        # Sinistra: BASE
+        ax1 = fig.add_subplot(gs[0, 0])
+        im1 = ax1.imshow(self.dem, cmap='terrain', origin='upper',
+                         interpolation='nearest', resample=False)
+        ax1.plot(self.base_contour[:, 1], self.base_contour[:, 0], 'w-', linewidth=1)
+        ax1.plot(self.base_point1[1], self.base_point1[0], 'ro', markersize=8)
+        ax1.plot(self.base_point2[1], self.base_point2[0], 'yo', markersize=8)
+        ax1.set_title("Opposite Points of the Volcano Base", pad=8, fontsize=12)
+        ax1.set_aspect('equal', adjustable='box')
+        div1 = make_axes_locatable(ax1)
+        cax1 = div1.append_axes("right", size="4.6%", pad=0.25)
+        cbar1 = fig.colorbar(im1, cax=cax1); cbar1.set_label("Elevation (m)", rotation=90)
+
+        # Spacer
+        ax_spacer = fig.add_subplot(gs[0, 1]); ax_spacer.axis('off')
+
+        # Destra: CALDERA
+        ax2 = fig.add_subplot(gs[0, 2])
+        im2 = ax2.imshow(self.dem, cmap='terrain', origin='upper',
+                         interpolation='nearest', resample=False)
+        ax2.plot(self.caldera_contour[:, 1], self.caldera_contour[:, 0], 'b-', linewidth=1)
+        ax2.plot(self.max_slope_index1[1], self.max_slope_index1[0], 'ro', markersize=8)
+        ax2.plot(self.max_slope_index2[1], self.max_slope_index2[0], 'yo', markersize=8)
+        ax2.set_title("Opposite Maximum Slope Points on the Caldera", pad=8, fontsize=12)
+        ax2.set_aspect('equal', adjustable='box')
+        div2 = make_axes_locatable(ax2)
+        cax2 = div2.append_axes("right", size="4.6%", pad=0.25)
+        cbar2 = fig.colorbar(im2, cax=cax2); cbar2.set_label("Elevation (m)", rotation=90)
+
+        fig.savefig(out_path, dpi=170)  # no bbox_inches='tight'
+        plt.close(fig)
+
+        if not os.path.exists(out_path):
+            raise RuntimeError(f"Doublet not saved: {out_path}")
+
+    # ----- UI actions -----
     def show_results(self):
         msg_box = QMessageBox()
         msg_box.setWindowTitle("Summary Results")
@@ -426,26 +454,65 @@ class VolumeAnalysisApp(QMainWindow):
             self.download_results()
 
     def download_results(self):
+        """
+        Genera il PDF finale:
+        - prova a caricare DEM + doppiette dal manifest (se presente)
+        - rimuove SOLO le triplette
+        - aggiunge in coda la nuova DOPPIETTA
+        - fail-safe: se lista vuota, usa almeno la doppietta
+        """
         options = QFileDialog.Options()
         file_path, _ = QFileDialog.getSaveFileName(self, "Save Results As", "", "PDF Files (*.pdf)", options=options)
-        if file_path:
-            if not file_path.lower().endswith('.pdf'):
-                file_path += '.pdf'
-            try:
-                title = "Calculation Results - Circular Base, Approximation Type 2"
-                img_paths, img_caps = self._collect_report_images()
-                pdf_generator.generate_pdf(
-                    file_path=file_path,
-                    results_list=self.results_list,
-                    title=title,
-                    image_paths=img_paths,
-                    captions=img_caps
-                )
-                QMessageBox.information(self, "Download Complete", "The results have been saved successfully.")
-            except Exception as e:
-                QMessageBox.critical(self, "PDF Error", f"An error occurred while generating the PDF: {e}")
+        if not file_path:
+            return
+        if not file_path.lower().endswith('.pdf'):
+            file_path += '.pdf'
 
-    # ### Download PNG/JPG ###
+        try:
+            title = "Calculation Results - Circular Base, Approximation Type 2"
+
+            # 1) salva SEMPRE la doppietta accanto al PDF
+            out_dir_for_doublet = os.path.dirname(file_path) if os.path.dirname(file_path) else os.getcwd()
+            doublet_png = os.path.join(out_dir_for_doublet, "final_doublet_base_vs_caldera.png")
+            self._save_final_doublet_png(doublet_png)
+
+            # 2) carica immagini dal manifest
+            image_paths = []
+            outputs_dir, manifest_path = _find_manifest()
+            if manifest_path:
+                manifest_imgs = _load_manifest_images(manifest_path)
+                image_paths = _normalize_and_filter_paths(manifest_imgs, base_dir=outputs_dir)
+                image_paths = _remove_triplets(image_paths)  # togli solo triplette
+                print(f"[INFO] Loaded {len(image_paths)} images from manifest (triplets removed).")
+            else:
+                print("[WARN] Manifest not found. Proceeding with doublet only if needed.")
+
+            # 3) aggiungi SEMPRE la nuova doppietta
+            if os.path.exists(doublet_png):
+                image_paths.append(doublet_png)
+            else:
+                print(f"[WARN] Doublet PNG missing unexpectedly: {doublet_png}")
+
+            # 4) fail-safe
+            if not image_paths:
+                image_paths = [doublet_png]
+
+            print("[INFO] Images in PDF (count={}):".format(len(image_paths)))
+            for p in image_paths:
+                print("   -", p)
+
+            # 5) genera PDF
+            pdf_generator.generate_pdf(
+                file_path=file_path,
+                results_list=self.results_list,
+                title=title,
+                image_paths=image_paths,
+                captions=[None]*len(image_paths)
+            )
+            QMessageBox.information(self, "Success", f"PDF successfully saved to {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "PDF Error", f"An error occurred while generating the PDF: {e}")
+
     def download_graph_image(self):
         options = QFileDialog.Options()
         file_path, selected_filter = QFileDialog.getSaveFileName(
@@ -455,26 +522,30 @@ class VolumeAnalysisApp(QMainWindow):
             "PNG Files (*.png);;JPG Files (*.jpg);;All Files (*)",
             options=options
         )
-        if file_path:
-            if selected_filter.startswith("PNG"):
-                fmt = 'png'
-                if not file_path.lower().endswith('.png'):
-                    file_path += '.png'
-            elif selected_filter.startswith("JPG"):
-                fmt = 'jpg'
-                if not file_path.lower().endswith('.jpg') and not file_path.lower().endswith('.jpeg'):
-                    file_path += '.jpg'
-            else:
-                fmt = 'png'
-                if not file_path.lower().endswith('.png'):
-                    file_path += '.png'
-            try:
-                self.figure.savefig(file_path, format=fmt)
-                QMessageBox.information(self, "Success", f"Graph successfully saved as {fmt.upper()} to {file_path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Save Error", f"An error occurred while saving the graph: {e}")
+        if not file_path:
+            return
 
-# ### Entry point ###
+        if selected_filter.startswith("PNG"):
+            fmt = 'png'
+            if not file_path.lower().endswith('.png'):
+                file_path += '.png'
+        elif selected_filter.startswith("JPG"):
+            fmt = 'jpg'
+            if not file_path.lower().endswith('.jpg') and not file_path.lower().endswith('.jpeg'):
+                file_path += '.jpg'
+        else:
+            fmt = 'png'
+            if not file_path.lower().endswith('.png'):
+                file_path += '.png'
+
+        try:
+            self.figure.savefig(file_path, format=fmt)
+            QMessageBox.information(self, "Success", f"Graph successfully saved as {fmt.upper()} to {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", f"An error occurred while saving the graph: {e}")
+
+
+# ========== Entry point ==========
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
