@@ -63,7 +63,7 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
         IMG_VPAD = 6            # padding verticale
 
         # Fattori di larghezza (percentuale della larghezza utile del frame)
-        TARGET_W_ALL = 0.92     # doppiette
+        TARGET_W_ALL = 0.88     # doppiette
         TARGET_W_DEM = 0.88     # DEM leggermente più stretto per compensare la colorbar nel PNG
 
         # Correzione visiva DEM: spazio vuoto a destra per "compensare" la colorbar
@@ -297,7 +297,7 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
                 captions = [None] * len(image_paths)
 
             # Altezza max standard (solo per NON triplette)
-            max_h_fraction = 0.36
+            max_h_fraction = 0.34
 
             for img_path, cap in zip(image_paths, captions):
                 if not img_path or not os.path.exists(img_path):
