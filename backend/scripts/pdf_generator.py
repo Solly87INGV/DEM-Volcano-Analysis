@@ -67,20 +67,19 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
         TARGET_W_DEM = 0.88     # DEM leggermente più stretto per compensare la colorbar nel PNG
 
         # Correzione visiva DEM: spazio vuoto a destra per "compensare" la colorbar
-        # Aumenta questo valore se vuoi spostare il DEM un po' più a sinistra.
         DEM_RIGHT_SPACER = 200  # punti
 
         # Tripleta (3 pannelli) - SOLO per i file che contengono "triplet"
-        TARGET_W_TRIPLET = 1.00   # 100% della larghezza utile
-        TRIPLET_HPAD     = 0      # (non più usato, lascio il nome per compatibilità)
-        TRIPLET_MAX_HFR  = None   # <<< MODIFICA: nessun cap in altezza per le triplette
+        TARGET_W_TRIPLET = 1.00
+        TRIPLET_HPAD     = 0
+        TRIPLET_MAX_HFR  = None   # nessun cap in altezza per le triplette
 
         # Documento
         doc = SimpleDocTemplate(
             file_path,
             pagesize=letter,
-            leftMargin=18,   # <<< MODIFICA: margini piccoli = più larghezza utile
-            rightMargin=18,  # <<< MODIFICA
+            leftMargin=18,
+            rightMargin=18,
             topMargin=24,
             bottomMargin=24
         )
@@ -306,38 +305,49 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
 
                 img = Image(img_path)
                 base = os.path.basename(img_path).lower()
-                is_dem = ('dem_overview' in base)  # DEM standalone
-                is_triplet = ('triplet' in base)   # TRIPLETTE
+
+                # Classificazioni
+                is_dem            = ('dem_overview' in base)    # DEM standalone
+                is_triplet        = ('triplet' in base)         # TRIPLETTE
+                is_final_doublet  = base.startswith('final_doublet_') or ('final_doublet' in base)
 
                 # Larghezza target
                 if is_dem:
                     target_w_factor = TARGET_W_DEM
                 elif is_triplet:
-                    target_w_factor = TARGET_W_TRIPLET  # 100% della larghezza per triplette
+                    target_w_factor = TARGET_W_TRIPLET
                 else:
-                    target_w_factor = TARGET_W_ALL      # doppiette standard
+                    target_w_factor = TARGET_W_ALL
 
                 target_w = doc.width * target_w_factor
                 img.drawWidth = target_w
                 img.drawHeight = img.imageHeight * (img.drawWidth / float(img.imageWidth))
 
                 # Cap in altezza:
-                # - per le triplette: DISATTIVATO (TRIPLET_MAX_HFR=None)
-                # - per altri: mantieni max_h_fraction
+                # - triplette: disattivato
+                # - doppiette/DEM: applicato
                 if (not is_triplet) and (max_h_fraction is not None):
                     max_draw_h = doc.height * max_h_fraction
-                    if img.drawHeight > max_draw_h:
-                        scale = max_draw_h / float(img.drawHeight)
-                        img.drawWidth *= scale
-                        img.drawHeight *= scale
-                        target_w = img.drawWidth  # aggiorna se scalato
+
+                    if is_final_doublet:
+                        # Forza SEMPRE la doppietta finale a questa altezza per uniformità
+                        if img.drawHeight > 0:
+                            scale = max_draw_h / float(img.drawHeight)
+                            img.drawWidth *= scale
+                            img.drawHeight = max_draw_h
+                    else:
+                        # comportamento standard per tutte le altre immagini
+                        if img.drawHeight > max_draw_h:
+                            scale = max_draw_h / float(img.drawHeight)
+                            img.drawWidth *= scale
+                            img.drawHeight *= scale
+                            target_w = img.drawWidth  # aggiorna se scalato
 
                 # Spazio prima dell'immagine
                 elements.append(Spacer(1, 12))
 
                 if is_dem:
                     # ---------- DEM standalone: "shift" visivo a sinistra ----------
-                    # Tabella 2 colonne: [ immagine | spacer destro fisso ]
                     dem_inner = Table(
                         [[img]],
                         colWidths=[doc.width - DEM_RIGHT_SPACER],
@@ -351,7 +361,6 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
                             ('BOX',          (0, 0), (-1, -1), 0, colors.white),
                         ])
                     )
-                    # wrapper con seconda colonna vuota a destra
                     dem_wrapper = Table(
                         [[dem_inner, ""]],
                         colWidths=[doc.width - DEM_RIGHT_SPACER, DEM_RIGHT_SPACER],
@@ -367,7 +376,7 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
                     elements.append(img)
 
                 else:
-                    # ---------- Doppiette: centratura "pulita" ----------
+                    # ---------- Doppiette (incl. doppietta finale): centratura "pulita" ----------
                     img_container = Table(
                         [[img]],
                         colWidths=[doc.width],
