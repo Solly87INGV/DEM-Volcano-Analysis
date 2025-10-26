@@ -10,8 +10,6 @@ import psutil
 from contextlib import contextmanager
 
 from scipy.ndimage import gaussian_filter   # ← niente 'sobel'
-# (niente: from scipy import ndimage as ndi)
-# (niente: from skimage import measure)
 
 from PyQt5 import QtWidgets
 from PyQt5.QtWidgets import (
@@ -25,10 +23,9 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5 import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 
-# (niente: from mpl_toolkits.axes_grid1.inset_locator import inset_axes)
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes  # non usato nella GUI, ma lasciato
 from matplotlib import gridspec
-# (niente: from mpl_toolkits.mplot3d import Axes3D)
 
 import requests
 import pandas as pd
@@ -204,48 +201,32 @@ class ColormapDialog(QDialog):
 # ==================== NUOVE UTILITY PER PNG + MANIFEST ====================
 
 def _resolve_process_id(cli_process_id: str | None) -> str:
-    """
-    Ritorna il PROCESS_ID da usare per gli output:
-    - priorità all'env var PROCESS_ID (iniettata dal server)
-    - altrimenti usa cli_process_id (argv[3])
-    - se assenti, genera un id locale
-    """
     env_id = os.environ.get("PROCESS_ID")
     if env_id and len(env_id) > 0:
         return env_id
     if cli_process_id and len(cli_process_id) > 0:
         return cli_process_id
-    # fallback: locale
     return f"local_{int(time.time())}"
 
 def _ensure_outputs_dir(process_id: str) -> str:
-    """
-    Crea la cartella ./outputs/<process_id> accanto a questo script
-    e la ritorna.
-    """
     base_dir = os.path.dirname(os.path.abspath(__file__))
     out_dir = os.path.join(base_dir, "outputs", process_id)
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
 
 def _save_triplets_pngs(analysis_triplets, titles, cmaps, units, descriptions, file_name, out_dir):
-    """
-    Salva PNG 1×3 (DEM, data1, data2) ottimizzati per occupare molta più
-    larghezza nel PDF (figura larga/bassa, margini ridotti, colorbar stretta).
-    """
     saved = []
     num_triplets = len(analysis_triplets)
 
-    # Manopole principali per triplete larghe
-    FIG_W, FIG_H   = 18.0, 5.0     # figura molto larga e poco alta
-    LEFT, RIGHT    = 0.015, 0.985  # margini orizzontali ridotti
-    TOP, BOTTOM    = 0.92, 0.20    # margini verticali
-    WSPACE         = 0.05          # spazio tra i tre pannelli
-    CB_FRACTION    = 0.035         # spessore colorbar
-    CB_PAD         = 0.015         # distanza immagine↔colorbar
-    TITLE_PAD      = 8             # padding del titolo del pannello
-    DESC_Y         = -0.20         # posizione descrizione sotto ciascun pannello
-    DPI_SAVE       = 180           # dpi del PNG
+    FIG_W, FIG_H   = 18.0, 5.0
+    LEFT, RIGHT    = 0.015, 0.985
+    TOP, BOTTOM    = 0.92, 0.20
+    WSPACE         = 0.05
+    CB_FRACTION    = 0.035
+    CB_PAD         = 0.015
+    TITLE_PAD      = 8
+    DESC_Y         = -0.20
+    DPI_SAVE       = 180
 
     for i in range(num_triplets):
         dem_data, data1, data2 = analysis_triplets[i]
@@ -272,13 +253,11 @@ def _save_triplets_pngs(analysis_triplets, titles, cmaps, units, descriptions, f
             ax.set_title(t_list[j], pad=TITLE_PAD, fontsize=11)
             ax.set_aspect('equal', adjustable='box')
 
-            # Crea colorbar con bordo nero
             divider = make_axes_locatable(ax)
-            cax = divider.append_axes("right", size=CB_FRACTION, pad=CB_PAD)
+            cax = divider.append_axes("right", size="3.5%", pad=0.20)
             cbar = fig.colorbar(im, cax=cax)
             cbar.set_label(f"{u_list[j]}", rotation=90, fontsize=9)
-            
-            # Aggiungi bordo nero alla colorbar
+
             for spine in cax.spines.values():
                 spine.set_visible(True)
                 spine.set_edgecolor('black')
@@ -311,9 +290,6 @@ def _save_triplets_pngs(analysis_triplets, titles, cmaps, units, descriptions, f
 
 
 def _write_manifest_json(process_id: str, out_dir: str, saved_entries: list, source: str = "complete_dem_analysis", original_file_name: str = ""):
-    """
-    Scrive analysis_images.json in out_dir con i metadati delle immagini generate.
-    """
     manifest = {
         "processId": process_id,
         "source": source,
@@ -330,20 +306,14 @@ def _write_manifest_json(process_id: str, out_dir: str, saved_entries: list, sou
         print(f"[ERROR] Failed to write manifest JSON: {e}")
 
 
-# --- NEW: salva il DEM una sola volta ---
 def _save_dem_overview_png(dem, out_dir, file_name, nodata_value=None):
-    # Figura con proporzioni simili ai doppietti e niente tight bbox
-    fig = plt.figure(figsize=(14.5, 5.5))  # come i doublets
+    fig = plt.figure(figsize=(14.5, 5.5))
     ax = fig.add_subplot(111)
 
-    # ====== 1) MASK ROBUSTA + FILL "SCURO" PER CUCITURE ======
-    # Mask di base: non finito
     mask = ~np.isfinite(dem)
-    # Mask anche del nodata esplicito (se fornito)
     if nodata_value is not None:
         mask |= np.isclose(dem, nodata_value)
 
-    # Valore di riempimento: minimo valido (es. mare/valle) per evitare "colonne bianche"
     if mask.any():
         valid_min = np.nanmin(dem[~mask]) if (~mask).any() else 0.0
         dem_filled = dem.copy()
@@ -351,50 +321,45 @@ def _save_dem_overview_png(dem, out_dir, file_name, nodata_value=None):
     else:
         dem_filled = dem
 
-    # ====== 2) IMMAGINE SENZA RESAMPLING / ALIASING ======
     h, w = dem_filled.shape
     im = ax.imshow(
         dem_filled,
         cmap='terrain',
         origin='upper',
-        interpolation='nearest',  # evita blending tra colonne/righe
+        interpolation='nearest',
         resample=False,
         extent=(-0.5, w - 0.5, h - 0.5, -0.5)
     )
     ax.set_title("DEM", pad=8)
     ax.set_aspect('equal', adjustable='box')
 
-    # --- Colorbar DEM esterna con pad in pollici (valori TUA "quadra") ---
-    CB_SIZE = "4%"   # spessore cbar
-    CB_PAD  = 0.3    # distanza DEM↔cbar in pollici
+    CB_SIZE = "4%"
+    CB_PAD  = 0.3
     divider = make_axes_locatable(ax)
     cax = divider.append_axes("right", size=CB_SIZE, pad=CB_PAD)
 
-    # === Colorbar + CORNICE nera sottile (come le altre) ===
     cbar = fig.colorbar(im, cax=cax)
     cbar.set_label("Elevation (m)", rotation=90)
 
-    # usa le spines dell'axes della colorbar per il bordo
-    cbar.outline.set_visible(False)  # evita doppio bordo
+    cbar.outline.set_visible(False)
     for side in ("left", "right", "top", "bottom"):
         sp = cax.spines[side]
         sp.set_visible(True)
-        sp.set_linewidth(0.6)        # regola qui lo spessore (0.5–0.8)
+        sp.set_linewidth(0.6)
         try:
-            sp.set_edgecolor("black")  # mpl >= 3.8
+            sp.set_edgecolor("black")
         except Exception:
-            sp.set_color("black")      # fallback per versioni precedenti
+            sp.set_color("black")
 
     cax.set_facecolor('none')
     cax.grid(False)
     cax.tick_params(length=3)
 
-    # Lascia spazio ai lati (no constrained_layout) e non stringere i margini
     fig.subplots_adjust(left=0.050, right=0.890, top=0.88, bottom=0.16)
     fig.suptitle(f"Location: {file_name}", fontsize=14)
 
     out_path = os.path.join(out_dir, "dem_overview.png")
-    fig.savefig(out_path, dpi=170)  # <-- NO bbox_inches='tight'
+    fig.savefig(out_path, dpi=170)
     plt.close(fig)
 
     return {
@@ -406,57 +371,41 @@ def _save_dem_overview_png(dem, out_dir, file_name, nodata_value=None):
         "descriptions": ["Represents terrain elevation in meters above sea level."]
     }
 
-
-# --- NEW: salva “doppietti” (i pannelli 2 e 3 di ciascuna tripletta), senza DEM ---
 def _save_doublets_from_arrays(analysis_triplets, titles, cmaps, units, descriptions, file_name, out_dir):
-    """
-    Per ogni tripletta (DEM, data1, data2) crea un PNG 1x3 con:
-      - sinistra: data1
-      - centro : SPACER (asse invisibile) per distanziare orizzontalmente
-      - destra : data2
-    Restituisce la lista entries per la manifest.
-    """
     saved = []
     num_triplets = len(analysis_triplets)
 
     for i in range(num_triplets):
         dem_data, data1, data2 = analysis_triplets[i]
         base_idx = i * 3
-        # Prendi SOLO i pannelli 1 e 2 della tripletta (skip DEM che è 0)
         t_list = titles[base_idx+1:base_idx+3]
         c_list = cmaps[base_idx+1:base_idx+3]
         u_list = units[base_idx+1:base_idx+3]
         d_list = descriptions[base_idx+1:base_idx+3]
 
-        # Figura più larga e SENZA constrained_layout
         fig = plt.figure(figsize=(14.5, 5.5))
-        # Gridspec a 3 colonne: sinistra, SPACER, destra
         gs = gridspec.GridSpec(
             1, 3, figure=fig,
             width_ratios=[1.0, 0.08, 1.0],
             wspace=0.15
         )
 
-        # ==== Pannello sinistro (data1)
         ax1 = fig.add_subplot(gs[0, 0])
         im1 = ax1.imshow(data1, cmap=c_list[0], origin='upper')
         ax1.set_title(t_list[0], pad=8)
         ax1.set_aspect('equal', adjustable='box')
 
-        # Colorbar con stessa altezza immagine e spessore/distanza simili a prima
         divider1 = make_axes_locatable(ax1)
-        cax1 = divider1.append_axes("right", size="4.6%", pad=0.25)  # ≈ fraction=0.046, pad più “aria”
+        cax1 = divider1.append_axes("right", size="4.6%", pad=0.25)
         cbar1 = fig.colorbar(im1, cax=cax1)
         cbar1.set_label(f"{u_list[0]}", rotation=90)
 
         ax1.text(0.5, -0.18, d_list[0], transform=ax1.transAxes,
                  ha='center', fontsize=9, wrap=True)
 
-        # ==== SPACER centrale (asse invisibile)
         ax_spacer = fig.add_subplot(gs[0, 1])
         ax_spacer.axis('off')
 
-        # ==== Pannello destro (data2)
         ax2 = fig.add_subplot(gs[0, 2])
         im2 = ax2.imshow(data2, cmap=c_list[1], origin='upper')
         ax2.set_title(t_list[1], pad=8)
@@ -470,13 +419,11 @@ def _save_doublets_from_arrays(analysis_triplets, titles, cmaps, units, descript
         ax2.text(0.5, -0.18, d_list[1], transform=ax2.transAxes,
                  ha='center', fontsize=9, wrap=True)
 
-        # Titolo generale
         fig.suptitle(f"Location: {file_name} — Panel {i+1}/{num_triplets}", fontsize=13)
 
         fname = f"double_{i+1:02d}.png"
         fpath = os.path.join(out_dir, fname)
         try:
-            # NIENTE bbox_inches='tight': mantiene i margini desiderati
             fig.savefig(fpath, dpi=170)
             saved.append({
                 "filename": fname,
@@ -493,8 +440,6 @@ def _save_doublets_from_arrays(analysis_triplets, titles, cmaps, units, descript
             plt.close(fig)
 
     return saved
-
-
 
 # ==================== FINE UTILITY PNG + MANIFEST ====================
 
@@ -520,8 +465,9 @@ class DEMAnalysisApp(QMainWindow):
         # Liste per memorizzare immagini, colorbar e assi dei grafici
         self.images = [None, None, None]
         self.colorbars = [None, None, None]
-        self.image_axes = [None, None, None]  # Nuova lista per gli assi dei grafici
-        self.rectangle_selectors = [None, None, None]  # Per la selezione di regioni
+        self.image_axes = [None, None, None]
+        self.cbar_axes = [None, None, None]  # <-- NUOVO: axes dedicati delle colorbar
+        self.rectangle_selectors = [None, None, None]
 
         # Etichetta per i tooltips
         self.tooltip_label = QLabel("", self)
@@ -548,17 +494,13 @@ class DEMAnalysisApp(QMainWindow):
         # Creazione della Custom Navigation Toolbar (senza pulsante di salvataggio)
         self.toolbar = CustomNavigationToolbar(self.canvas, self)
         
-        # Pulsanti di navigazione e nuove funzionalità in un'unica riga
+        # Pulsanti e toolbar
         nav_layout = QHBoxLayout()
         main_layout.addLayout(nav_layout)
 
-        # Allineamento orizzontale: Toolbar + Spacer + Pulsanti
         nav_layout.addWidget(self.toolbar)
-
-        # Spacer tra la toolbar e i pulsanti
         nav_layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
 
-        # Pulsanti di navigazione: Previous e Next
         self.prev_button = QPushButton('Previous')
         self.prev_button.setFixedSize(100, 40)
         self.prev_button.clicked.connect(self.previous_triplet)
@@ -569,49 +511,40 @@ class DEMAnalysisApp(QMainWindow):
         self.next_button.clicked.connect(self.next_triplet)
         nav_layout.addWidget(self.next_button)
 
-        # Pulsante per visualizzare il modello 3D
         self.view3d_button = QPushButton('View 3D Model')
         self.view3d_button.setFixedSize(120, 40)
         self.view3d_button.clicked.connect(self.display_volcano_3d)
         nav_layout.addWidget(self.view3d_button)
 
-        # Spacer tra i pulsanti di navigazione e i controlli di selezione
         nav_layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
 
-        # Label "Select Graph:"
         self.graph_selection_label = QLabel("Select Graph:")
         self.graph_selection_label.setFixedSize(100, 40)
-        self.graph_selection_label.setAlignment(Qt.AlignVCenter | Qt.AlignRight)  # Allineamento verticale
+        self.graph_selection_label.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
         nav_layout.addWidget(self.graph_selection_label)
 
-        # ComboBox per selezionare il grafico
         self.graph_selection_combo = QComboBox()
         self.graph_selection_combo.setFixedSize(200, 40)
         self.graph_selection_combo.currentIndexChanged.connect(self.update_selected_graph)
         nav_layout.addWidget(self.graph_selection_combo)
 
-        # Pulsante "Select Colormap"
         self.select_colormap_button = QPushButton('Select Colormap')
         self.select_colormap_button.setFixedSize(150, 40)
         self.select_colormap_button.clicked.connect(self.select_colormap)
         nav_layout.addWidget(self.select_colormap_button)
 
-        # Spacer tra i controlli di selezione e gli altri pulsanti
         nav_layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
 
-        # Pulsante di Download
         self.download_image_button = QPushButton('Download as PNG or JPG')
         self.download_image_button.setFixedSize(200, 40)
         self.download_image_button.clicked.connect(self.download_graph_image)
         nav_layout.addWidget(self.download_image_button)
 
-        # Pulsante di Esportazione dei Dati
         self.export_data_button = QPushButton('Export Data')
         self.export_data_button.setFixedSize(120, 40)
         self.export_data_button.clicked.connect(self.export_data)
         nav_layout.addWidget(self.export_data_button)
 
-        # Spacer per equidistanza a destra
         nav_layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
 
         # Connessione degli eventi per i tooltips
@@ -621,7 +554,6 @@ class DEMAnalysisApp(QMainWindow):
         self.update_display()
 
     def update_selected_graph(self):
-        # La selezione del grafico è semplicemente l'indice selezionato nel combo box
         self.selected_graph = self.graph_selection_combo.currentIndex()
         print(f"[DEBUG] Selected graph index: {self.selected_graph}")
 
@@ -630,8 +562,11 @@ class DEMAnalysisApp(QMainWindow):
         self.figure.clear()
         fig = self.figure
 
-        # Configurazione di GridSpec
-        gs = gridspec.GridSpec(1, 3, figure=fig)
+        # === Margine esterno per non tagliare la 3ª colorbar ===
+        fig.set_constrained_layout_pads(w_pad=0.60, h_pad=0.02, wspace=0.16, hspace=0.08)
+
+        # Gridspec: spazio tra i pannelli (non i bordi esterni)
+        gs = gridspec.GridSpec(1, 3, figure=fig, wspace=0.16)
 
         # Ottieni il tripletto corrente
         dem_data, data1, data2 = self.analysis_triplets[self.current_index]
@@ -651,11 +586,11 @@ class DEMAnalysisApp(QMainWindow):
         descriptions = self.descriptions[idx:idx + 3]
         cmaps = self.cmaps[idx:idx + 3]
 
-        # Pulisci le liste di immagini, colorbar e assi dei grafici
+        # Reset handle
         self.images = [None, None, None]
         self.colorbars = [None, None, None]
         self.image_axes = [None, None, None]
-        # Disattiva e cancella i RectangleSelector precedenti
+        self.cbar_axes = [None, None, None]
         for selector in self.rectangle_selectors:
             if selector is not None:
                 selector.set_active(False)
@@ -669,8 +604,11 @@ class DEMAnalysisApp(QMainWindow):
                 ax.set_title(titles[i], pad=10)
                 ax.set_aspect('equal', adjustable='box')
 
-                # Crea la colorbar e memorizza la referenza
-                cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                # === Colorbar accanto al riquadro dati, stessa altezza dell'immagine ===
+                divider = make_axes_locatable(ax)
+                cax = divider.append_axes("right", size="4.6%", pad=0.10)
+                cax.set_in_layout(True)  # IMPORTANT: la cbar entra nel layout → niente clip
+                cbar = fig.colorbar(im, cax=cax)
                 cbar.set_label(f"{units[i]}", rotation=90)
 
                 # Aggiungi descrizione
@@ -683,8 +621,9 @@ class DEMAnalysisApp(QMainWindow):
                 self.images[i] = im
                 self.colorbars[i] = cbar
                 self.image_axes[i] = ax
+                self.cbar_axes[i] = cax
 
-                # Aggiungi RectangleSelector per la selezione di regioni
+                # Selettore rettangolo
                 self.rectangle_selectors[i] = RectangleSelector(
                     ax, self.on_select,
                     useblit=True, button=[1],
@@ -698,7 +637,7 @@ class DEMAnalysisApp(QMainWindow):
 
         self.canvas.draw()
 
-        # Gestisci la visibilità dei pulsanti
+        # Pulsanti
         if self.current_index == 0:
             self.prev_button.setVisible(False)
             self.next_button.setVisible(True)
@@ -709,7 +648,7 @@ class DEMAnalysisApp(QMainWindow):
             self.prev_button.setVisible(True)
             self.next_button.setVisible(True)
 
-        # Aggiorna il ComboBox per la selezione del grafico
+        # ComboBox
         self.graph_selection_combo.blockSignals(True)
         self.graph_selection_combo.clear()
         current_titles = self.titles[idx:idx + 3]
@@ -849,19 +788,35 @@ class DEMAnalysisApp(QMainWindow):
             ax = self.image_axes[self.selected_graph]
             im = self.images[self.selected_graph]
             cbar = self.colorbars[self.selected_graph]
+            cax_saved = self.cbar_axes[self.selected_graph]
 
-            if im is None:
-                print(f"[DEBUG] No image associated with graph index: {self.selected_graph}")
+            if im is None or ax is None:
+                print(f"[DEBUG] No image/axis associated with graph {self.selected_graph}")
                 return
 
             im.set_cmap(self.selected_colormap)
             print(f"[DEBUG] Updated colormap for graph {self.selected_graph} to {self.selected_colormap}")
 
+            # rimuovi la vecchia cbar
             if cbar is not None:
-                cbar.remove()
-                print(f"[DEBUG] Removed old colorbar for graph {self.selected_graph}")
+                try:
+                    cbar.remove()
+                except Exception:
+                    pass
 
-            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            # usa lo stesso cax se disponibile; altrimenti creane uno nuovo accanto all'ax
+            if cax_saved is None:
+                divider = make_axes_locatable(ax)
+                cax = divider.append_axes("right", size="4.6%", pad=0.10)
+                cax.set_in_layout(True)  # IMPORTANT: evita il clipping a destra
+                self.cbar_axes[self.selected_graph] = cax
+            else:
+                cax = cax_saved
+                cax.set_in_layout(True)
+                cax.cla()
+
+            # ricrea la colorbar nel cax dedicato → stessa altezza del box immagine
+            cbar = fig.colorbar(im, cax=cax)
             cbar.set_label(f"{self.units[self.current_index * 3 + self.selected_graph]}", rotation=90)
 
             self.colorbars[self.selected_graph] = cbar
@@ -1207,7 +1162,7 @@ def main():
             print(f"[ERROR] Error during PNG/manifest generation: {e}")
     # ================================================================================
 
-    # Invia notifica di completamento al server Node.js (timed, se presente process_id)
+    # Invia notifica (opzionale)
     if process_id:
         with phase("notify_server"):
             try:
@@ -1218,7 +1173,6 @@ def main():
             except Exception as e:
                 print(f"[ERROR] Error sending completion notification: {e}")
 
-    # ==== Benchmark: final summary (prima di avviare la GUI) ====
     print(f"[RESULT] Peak RAM = {_peak_mb:.1f} MB")
     print(f"[TIMING] total_end_to_end = {time.time() - _t_all_start:.3f} s")
     log_memory("before_gui_start")
