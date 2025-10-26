@@ -3,7 +3,8 @@
 import os
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import (
-    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image, PageBreak, Flowable
+    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image, PageBreak, Flowable,
+    KeepTogether
 )
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -206,7 +207,9 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
         ])
         table.setStyle(style)
         elements.append(table)
-        elements.append(Spacer(1, 36))
+
+        # Recupera spazio per far stare 1+2 nella prima pagina
+        elements.append(Spacer(1, 12))  # (era 36)
 
         # ====== DESCRIZIONI DETTAGLIATE ======
         descriptions = [
@@ -273,23 +276,40 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
             }
         ]
 
-        for idx, item in enumerate(descriptions):
-            elements.append(Paragraph(item['title'], styles['DescriptionTitle']))
-            elements.append(Paragraph(f"<b>Description:</b> {item['description']}", styles['DescriptionBody']))
-            elements.append(Paragraph("<b>Method of Calculation:</b>", styles['DescriptionBody']))
+        # ---------- Costruisco i blocchi delle singole sezioni ----------
+        section_blocks = []
+        for item in descriptions:
+            block = []
+            block.append(Paragraph(item['title'], styles['DescriptionTitle']))
+            block.append(Paragraph(f"<b>Description:</b> {item['description']}", styles['DescriptionBody']))
+            block.append(Paragraph("<b>Method of Calculation:</b>", styles['DescriptionBody']))
 
             for method in item['method']:
                 if isinstance(method, str):
                     if method.strip() and method.strip()[0].isdigit():
-                        elements.append(Paragraph(method, styles['MethodBody']))
+                        block.append(Paragraph(method, styles['MethodBody']))
                     else:
-                        elements.append(Paragraph(f"- {method}", styles['MethodBody']))
+                        block.append(Paragraph(f"- {method}", styles['MethodBody']))
 
-            # Page break dopo la prima sezione (coerente con il tuo originale)
-            if idx == 0:
-                elements.append(PageBreak())
+            block.append(Spacer(1, 12))
+            section_blocks.append(block)
 
-            elements.append(Spacer(1, 12))
+        # ---------- Sezione 1 + Sezione 2 insieme (mai spezzate) ----------
+        if len(section_blocks) >= 2:
+            first_two_together = []
+            first_two_together.extend(section_blocks[0])
+            first_two_together.extend(section_blocks[1])
+            elements.append(KeepTogether(first_two_together))
+        elif len(section_blocks) == 1:
+            elements.append(KeepTogether(section_blocks[0]))
+
+        # ---------- Page break PRIMA della Sezione 3 ----------
+        if len(section_blocks) >= 3:
+            elements.append(PageBreak())
+
+        # ---------- Dalla Sezione 3 in poi normalmente (ogni sezione come blocco unico) ----------
+        for blk in section_blocks[2:]:
+            elements.append(KeepTogether(blk))  # ⬅️ FIX: non appendere la lista pura!
 
         # ====== BLOCCHI FIGURE (una dopo l'altra, senza PageBreak forzati) ======
         if image_paths:
