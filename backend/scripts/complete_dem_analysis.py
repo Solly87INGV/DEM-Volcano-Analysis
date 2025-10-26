@@ -1168,9 +1168,9 @@ def main():
         descriptions = [
             "Represents terrain elevation in meters above sea level.",
             "Simulates light and shadow effects on the terrain.",
-            "Represents relative illumination intensity on the terrain.\nSun position Altitude=45° - Azimuth=45°",
+            "Relative terrain illumination (Sun Alt 45°, Az 45°).",
             "Represents terrain elevation in meters above sea level.",
-            "Indicates the direction of the slope in degrees.\nWith 0° representing north, increasing clockwise to 360°",
+            "Direction of slope (°): 0°=N, clockwise to 360°.",
             "Measures terrain slope in degrees.",
             "Represents terrain elevation in meters above sea level.",
             "Measures local variations in elevation.",
