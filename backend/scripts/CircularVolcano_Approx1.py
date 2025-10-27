@@ -27,6 +27,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
+from mpl_toolkits.axes_grid1 import make_axes_locatable  # <-- PER cbar co-alte accanto all'immagine
 
 # Generatore PDF (non modificato)
 import pdf_generator
@@ -179,8 +180,8 @@ class VolumeAnalysisApp(QMainWindow):
 
         main_layout = QVBoxLayout(central_widget)
 
-        # Figura Matplotlib
-        self.figure = Figure(figsize=(18, 14))
+        # Figura Matplotlib — constrained layout per gestione margini/cbar
+        self.figure = Figure(figsize=(18, 14), constrained_layout=True)
         self.canvas = FigureCanvas(self.figure)
         main_layout.addWidget(self.canvas)
 
@@ -292,21 +293,41 @@ class VolumeAnalysisApp(QMainWindow):
         self.figure.clear()
         fig = self.figure
 
+        # Margine esterno per non tagliare numeri/label della 3ª cbar
+        fig.set_constrained_layout_pads(w_pad=0.12, h_pad=0.02, wspace=0.40, hspace=0.60)
+
         gs = gridspec.GridSpec(nrows=3, ncols=3, height_ratios=[4, 1, 1.5], figure=fig, wspace=0.4, hspace=0.6)
 
         # Pannello 1: DEM
         ax1 = fig.add_subplot(gs[0, 0])
         im1 = ax1.imshow(self.dem, cmap='terrain', origin='upper')
-        cbar1 = fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+        # Colorbar accanto all'immagine: stessa altezza e vicina
+        div1 = make_axes_locatable(ax1)
+        cax1 = div1.append_axes("right", size="4.6%", pad=0.10)
+        cax1.set_in_layout(True)
+        cbar1 = fig.colorbar(im1, cax=cax1)
         cbar1.set_label("Elevation (m)", rotation=90)
+        cbar1.ax.yaxis.set_ticks_position('right')
+        cbar1.ax.yaxis.set_label_position('right')
+        cbar1.ax.tick_params(labelsize=9, pad=1)
+        cbar1.ax.yaxis.labelpad = 2
+
         ax1.set_title("Volcano DEM", fontsize=14, pad=20, y=1.02)
         ax1.axis('on')
 
         # Pannello 2: Base opposta
         ax2 = fig.add_subplot(gs[0, 1])
         im2 = ax2.imshow(self.dem, cmap='terrain', origin='upper')
-        cbar2 = fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+        div2 = make_axes_locatable(ax2)
+        cax2 = div2.append_axes("right", size="4.6%", pad=0.10)
+        cax2.set_in_layout(True)
+        cbar2 = fig.colorbar(im2, cax=cax2)
         cbar2.set_label("Elevation (m)", rotation=90)
+        cbar2.ax.yaxis.set_ticks_position('right')
+        cbar2.ax.yaxis.set_label_position('right')
+        cbar2.ax.tick_params(labelsize=9, pad=1)
+        cbar2.ax.yaxis.labelpad = 2
+
         p1, = ax2.plot(self.base_point1[1], self.base_point1[0], 'ro', markersize=10, label='Base 1')
         p2, = ax2.plot(self.base_point2[1], self.base_point2[0], 'yo', markersize=10, label='Base 2')
         pc, = ax2.plot(self.base_contour[:, 1], self.base_contour[:, 0], 'w-', linewidth=1, label="Base Contour")
@@ -316,8 +337,16 @@ class VolumeAnalysisApp(QMainWindow):
         # Pannello 3: Caldera max slope
         ax3 = fig.add_subplot(gs[0, 2])
         im3 = ax3.imshow(self.dem, cmap='terrain', origin='upper')
-        cbar3 = fig.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+        div3 = make_axes_locatable(ax3)
+        cax3 = div3.append_axes("right", size="4.6%", pad=0.10)
+        cax3.set_in_layout(True)
+        cbar3 = fig.colorbar(im3, cax=cax3)
         cbar3.set_label("Elevation (m)", rotation=90)
+        cbar3.ax.yaxis.set_ticks_position('right')
+        cbar3.ax.yaxis.set_label_position('right')
+        cbar3.ax.tick_params(labelsize=9, pad=1)
+        cbar3.ax.yaxis.labelpad = 2
+
         s1, = ax3.plot(self.max_slope_index1[1], self.max_slope_index1[0], 'ro', markersize=10, label='Max Slope 1')
         s2, = ax3.plot(self.max_slope_index2[1], self.max_slope_index2[0], 'yo', markersize=10, label='Max Slope 2')
         cc, = ax3.plot(self.caldera_contour[:, 1], self.caldera_contour[:, 0], 'b-', linewidth=1, label="Caldera Contour")
@@ -346,7 +375,7 @@ class VolumeAnalysisApp(QMainWindow):
                  bbox=dict(boxstyle="round,pad=0.5", edgecolor="black", facecolor="white"),
                  wrap=True, transform=da3.transAxes)
 
-        fig.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05, wspace=0.4, hspace=0.6)
+        # NIENTE fig.subplots_adjust(...): interferisce con constrained_layout
         self.canvas.draw()
 
     # ———— NUOVO: salva la DOPPIETTA finale (Base vs Caldera) ————
@@ -367,42 +396,47 @@ class VolumeAnalysisApp(QMainWindow):
             wspace=0.15
         )
 
-        # === Sinistra: BASE (identico stile) ===
+        # === Sinistra: BASE ===
         ax1 = fig.add_subplot(gs[0, 0])
         im1 = ax1.imshow(self.dem, cmap='terrain', origin='upper',
-                        interpolation='nearest', resample=False)
+                         interpolation='nearest', resample=False)
         ax1.plot(self.base_contour[:, 1], self.base_contour[:, 0], 'w-', linewidth=1)
         ax1.plot(self.base_point1[1], self.base_point1[0], 'ro', markersize=8)
         ax1.plot(self.base_point2[1], self.base_point2[0], 'yo', markersize=8)
         ax1.set_title("Opposite Points of the Volcano Base", pad=8, fontsize=12)
         ax1.set_aspect('equal', adjustable='box')
         div1 = make_axes_locatable(ax1)
-        cax1 = div1.append_axes("right", size="4.6%", pad=0.25)
+        cax1 = div1.append_axes("right", size="4.6%", pad=0.10)
         cbar1 = fig.colorbar(im1, cax=cax1)
         cbar1.set_label("Elevation (m)", rotation=90)
+        cbar1.ax.yaxis.set_ticks_position('right')
+        cbar1.ax.yaxis.set_label_position('right')
+        cbar1.ax.tick_params(labelsize=9, pad=1)
+        cbar1.ax.yaxis.labelpad = 2
 
-        # === Spacer centrale (come le doppiette precedenti) ===
+        # === Spacer centrale ===
         ax_spacer = fig.add_subplot(gs[0, 1])
         ax_spacer.axis('off')
 
-        # === Destra: CALDERA (identico stile) ===
+        # === Destra: CALDERA ===
         ax2 = fig.add_subplot(gs[0, 2])
         im2 = ax2.imshow(self.dem, cmap='terrain', origin='upper',
-                        interpolation='nearest', resample=False)
+                         interpolation='nearest', resample=False)
         ax2.plot(self.caldera_contour[:, 1], self.caldera_contour[:, 0], 'b-', linewidth=1)
         ax2.plot(self.max_slope_index1[1], self.max_slope_index1[0], 'ro', markersize=8)
         ax2.plot(self.max_slope_index2[1], self.max_slope_index2[0], 'yo', markersize=8)
         ax2.set_title("Opposite Maximum Slope Points on the Caldera", pad=8, fontsize=12)
         ax2.set_aspect('equal', adjustable='box')
         div2 = make_axes_locatable(ax2)
-        cax2 = div2.append_axes("right", size="4.6%", pad=0.25)
+        cax2 = div2.append_axes("right", size="4.6%", pad=0.10)
         cbar2 = fig.colorbar(im2, cax=cax2)
         cbar2.set_label("Elevation (m)", rotation=90)
+        cbar2.ax.yaxis.set_ticks_position('right')
+        cbar2.ax.yaxis.set_label_position('right')
+        cbar2.ax.tick_params(labelsize=9, pad=1)
+        cbar2.ax.yaxis.labelpad = 2
 
-        # NOTE IMPORTANTI:
-        # - NIENTE subplots_adjust personalizzato (lasciamo i default)
-        # - NIENTE suptitle (coerenza con le doppiette precedenti)
-        # - NIENTE bbox_inches='tight' (evita resizing strano nel PNG)
+        # NIENTE subplots_adjust / suptitle / bbox_inches='tight'
         fig.savefig(out_path, dpi=170)
         plt.close(fig)
 
