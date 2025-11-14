@@ -382,6 +382,73 @@ def _save_dem_overview_png(dem, out_dir, file_name, nodata_value=None):
         "descriptions": ["Represents terrain elevation in meters above sea level."]
     }
 
+def _save_aspect_overview_png(aspect, out_dir, file_name):
+    """
+    Salva un overview singolo dell'ASPECT, simile al DEM, per il report PDF.
+    """
+    fig = plt.figure(figsize=(14.5, 5.5))
+    ax = fig.add_subplot(111)
+
+    # Gestione eventuali NaN / inf
+    mask = ~np.isfinite(aspect)
+    if mask.any():
+        valid_min = np.nanmin(aspect[~mask]) if (~mask).any() else 0.0
+        aspect_filled = aspect.copy()
+        aspect_filled[mask] = valid_min
+    else:
+        aspect_filled = aspect
+
+    h, w = aspect_filled.shape
+    im = ax.imshow(
+        aspect_filled,
+        cmap='twilight',   # colormap "circolare" adatta per angle
+        origin='upper',
+        interpolation='nearest',
+        resample=False,
+        extent=(-0.5, w - 0.5, h - 0.5, -0.5)
+    )
+    ax.set_title("Aspect", pad=8)
+    ax.set_aspect('equal', adjustable='box')
+
+    CB_SIZE = "4%"
+    CB_PAD  = 0.3
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size=CB_SIZE, pad=CB_PAD)
+
+    cbar = fig.colorbar(im, cax=cax)
+    cbar.set_label("Aspect (degrees)", rotation=90)
+
+    # Bordino nero come per il DEM
+    cbar.outline.set_visible(False)
+    for side in ("left", "right", "top", "bottom"):
+        sp = cax.spines[side]
+        sp.set_visible(True)
+        sp.set_linewidth(0.6)
+        try:
+            sp.set_edgecolor("black")
+        except Exception:
+            sp.set_color("black")
+
+    cax.set_facecolor('none')
+    cax.grid(False)
+    cax.tick_params(length=3)
+
+    fig.subplots_adjust(left=0.050, right=0.890, top=0.88, bottom=0.16)
+    fig.suptitle(f"Location: {file_name}", fontsize=14)
+
+    out_path = os.path.join(out_dir, "aspect_overview.png")
+    fig.savefig(out_path, dpi=170)
+    plt.close(fig)
+
+    return {
+        "filename": "aspect_overview.png",
+        "abs_path": out_path,
+        "public_path": f"/outputs/{os.path.basename(out_dir)}/aspect_overview.png",
+        "titles": ["Aspect"],
+        "units": ["Degrees"],
+        "descriptions": ["Slope direction (degrees): 0°=N, clockwise up to 360°."]
+    }
+
 def _save_doublets_from_arrays(analysis_triplets, titles, cmaps, units, descriptions, file_name, out_dir):
     saved = []
     num_triplets = len(analysis_triplets)
@@ -1161,12 +1228,16 @@ def main():
             # 1) DEM una sola volta
             dem_entry = _save_dem_overview_png(dem, out_dir, original_file_name)
 
-            # 2) Per ogni tripletta, salva SOLO i pannelli 2 e 3 (senza DEM / senza Aspect nel caso 4)
+            # 2) ASPECT singolo, per farlo comparire nel PDF
+            aspect_entry = _save_aspect_overview_png(aspect, out_dir, original_file_name)
+
+            # 3) Per ogni tripletta, salva SOLO i pannelli 2 e 3 (senza DEM / Aspect)
             double_entries = _save_doublets_from_arrays(
                 analysis_triplets, titles, cmaps, units, descriptions, original_file_name, out_dir
             )
 
-            saved_entries = [dem_entry] + double_entries
+            # DEM + ASPECT + tutte le doppiette
+            saved_entries = [dem_entry, aspect_entry] + double_entries
 
             _write_manifest_json(
                 process_id,
@@ -1177,6 +1248,7 @@ def main():
             )
         except Exception as e:
             print(f"[ERROR] Error during PNG/manifest generation: {e}")
+        log_memory("after_save_pngs_and_manifest")  
     # ================================================================================
 
     # Invia notifica (opzionale)
