@@ -437,9 +437,9 @@ class VolumeAnalysisApp(QMainWindow):
         ax1 = fig.add_subplot(gs[0, 0])
         im1 = ax1.imshow(self.dem, cmap='terrain', origin='upper',
                          interpolation='nearest', resample=False)
-        ax1.plot(self.base_contour[:, 1], self.base_contour[:, 0], 'w-', linewidth=1)
-        ax1.plot(self.base_point1[1], self.base_point1[0], 'ro', markersize=8)
-        ax1.plot(self.base_point2[1], self.base_point2[0], 'yo', markersize=8)
+        pc, = ax1.plot(self.base_contour[:, 1], self.base_contour[:, 0], 'w-', linewidth=1, label='Base Contour')
+        p1, = ax1.plot(self.base_point1[1], self.base_point1[0], 'ro', markersize=8, label='Base 1')
+        p2, = ax1.plot(self.base_point2[1], self.base_point2[0], 'yo', markersize=8, label='Base 2')
         ax1.set_title("Opposite Points of the Volcano Base", pad=8, fontsize=12)
         ax1.set_aspect('equal', adjustable='box')
         div1 = make_axes_locatable(ax1)
@@ -450,6 +450,17 @@ class VolumeAnalysisApp(QMainWindow):
         cbar1.ax.tick_params(labelsize=9, pad=1)
         cbar1.ax.yaxis.labelpad = 2
 
+        # 🔹 Legenda pannello sinistro
+        leg1 = ax1.legend(
+            handles=[p1, p2, pc],
+            labels=['Base 1', 'Base 2', 'Base Contour'],
+            loc='upper right',
+            frameon=True
+        )
+        leg1.get_frame().set_alpha(0.7)
+        leg1.get_frame().set_facecolor('white')
+        leg1.get_frame().set_edgecolor('black')
+
         # Spacer
         ax_spacer = fig.add_subplot(gs[0, 1]); ax_spacer.axis('off')
 
@@ -457,9 +468,9 @@ class VolumeAnalysisApp(QMainWindow):
         ax2 = fig.add_subplot(gs[0, 2])
         im2 = ax2.imshow(self.dem, cmap='terrain', origin='upper',
                          interpolation='nearest', resample=False)
-        ax2.plot(self.caldera_contour[:, 1], self.caldera_contour[:, 0], 'b-', linewidth=1)
-        ax2.plot(self.max_slope_index1[1], self.max_slope_index1[0], 'ro', markersize=8)
-        ax2.plot(self.max_slope_index2[1], self.max_slope_index2[0], 'yo', markersize=8)
+        cc, = ax2.plot(self.caldera_contour[:, 1], self.caldera_contour[:, 0], 'b-', linewidth=1, label='Caldera Contour')
+        s1, = ax2.plot(self.max_slope_index1[1], self.max_slope_index1[0], 'ro', markersize=8, label='Max Slope 1')
+        s2, = ax2.plot(self.max_slope_index2[1], self.max_slope_index2[0], 'yo', markersize=8, label='Max Slope 2')
         ax2.set_title("Opposite Maximum Slope Points on the Caldera", pad=8, fontsize=12)
         ax2.set_aspect('equal', adjustable='box')
         div2 = make_axes_locatable(ax2)
@@ -469,6 +480,17 @@ class VolumeAnalysisApp(QMainWindow):
         cbar2.ax.yaxis.set_label_position('right')
         cbar2.ax.tick_params(labelsize=9, pad=1)
         cbar2.ax.yaxis.labelpad = 2
+
+        # 🔹 Legenda pannello destro
+        leg2 = ax2.legend(
+            handles=[s1, s2, cc],
+            labels=['Max Slope 1', 'Max Slope 2', 'Caldera Contour'],
+            loc='upper right',
+            frameon=True
+        )
+        leg2.get_frame().set_alpha(0.7)
+        leg2.get_frame().set_facecolor('white')
+        leg2.get_frame().set_edgecolor('black')
 
         fig.savefig(out_path, dpi=170)  # niente bbox_inches='tight'
         plt.close(fig)
