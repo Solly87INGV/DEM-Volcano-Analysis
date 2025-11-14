@@ -5,8 +5,12 @@ import os
 import json
 import numpy as np
 import rasterio
-from scipy.ndimage import gaussian_filter, sobel
-from skimage import measure
+import time
+import psutil
+from contextlib import contextmanager
+
+from scipy.ndimage import gaussian_filter   # ← niente 'sobel'
+
 from PyQt5 import QtWidgets
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QFileDialog, QMessageBox,
@@ -14,15 +18,47 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QCursor
+
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5 import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
-from matplotlib import gridspec  # For advanced subplot layout
-from mpl_toolkits.mplot3d import Axes3D  # Necessary for 3D plots
-import requests  # Per inviare richieste HTTP al server Node.js
-import pandas as pd  # Per esportare i dati in CSV
-import matplotlib.cm as cm  # Per accedere ai colormap
-from matplotlib.widgets import RectangleSelector  # Per la selezione di regioni
+
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes  # non usato nella GUI, ma lasciato
+from matplotlib import gridspec
+
+import requests
+import pandas as pd
+import matplotlib.cm as cm
+from matplotlib.widgets import RectangleSelector
+import matplotlib.pyplot as plt
+
+# ==== Memory & timing helpers ======================================
+_process = psutil.Process(os.getpid())
+_peak_mb = 0.0
+
+def _mem_mb() -> float:
+    return _process.memory_info().rss / (1024 * 1024)
+
+def log_memory(tag: str = ""):
+    """Logga snapshot RAM corrente e aggiorna il picco."""
+    global _peak_mb
+    cur = _mem_mb()
+    if cur > _peak_mb:
+        _peak_mb = cur
+    print(f"[MEMORY] {tag}: {cur:.1f} MB (peak so far: {_peak_mb:.1f} MB)")
+
+@contextmanager
+def phase(name: str):
+    """Context manager per tempi + RAM."""
+    t0 = time.time()
+    log_memory(f"{name}::start")
+    try:
+        yield
+    finally:
+        log_memory(f"{name}::end")
+        dt = time.time() - t0
+        print(f"[TIMING] {name}: {dt:.3f} s")
 
 # ### Definizione della CustomNavigationToolbar ###
 class CustomNavigationToolbar(NavigationToolbar):
@@ -162,6 +198,251 @@ class ColormapDialog(QDialog):
     def get_selected_colormap(self):
         return self.combo_box.currentText()
 
+# ==================== NUOVE UTILITY PER PNG + MANIFEST ====================
+
+def _resolve_process_id(cli_process_id: str | None) -> str:
+    env_id = os.environ.get("PROCESS_ID")
+    if env_id and len(env_id) > 0:
+        return env_id
+    if cli_process_id and len(cli_process_id) > 0:
+        return cli_process_id
+    return f"local_{int(time.time())}"
+
+def _ensure_outputs_dir(process_id: str) -> str:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    out_dir = os.path.join(base_dir, "outputs", process_id)
+    os.makedirs(out_dir, exist_ok=True)
+    return out_dir
+
+def _save_triplets_pngs(analysis_triplets, titles, cmaps, units, descriptions, file_name, out_dir):
+    saved = []
+    num_triplets = len(analysis_triplets)
+
+    FIG_W, FIG_H   = 18.0, 5.0
+    LEFT, RIGHT    = 0.015, 0.985
+    TOP, BOTTOM    = 0.92, 0.20
+    WSPACE         = 0.05
+    CB_FRACTION    = 0.035
+    CB_PAD         = 0.015
+    TITLE_PAD      = 8
+    DESC_Y         = -0.20
+    DPI_SAVE       = 180
+
+    for i in range(num_triplets):
+        dem_data, data1, data2 = analysis_triplets[i]
+        idx = i * 3
+        t_list = titles[idx:idx+3]
+        u_list = units[idx:idx+3]
+        d_list = descriptions[idx:idx+3]
+        c_list = cmaps[idx:idx+3]
+
+        fig = plt.figure(figsize=(FIG_W, FIG_H))
+        gs = gridspec.GridSpec(1, 3, figure=fig, wspace=WSPACE)
+        fig.subplots_adjust(left=LEFT, right=RIGHT, top=TOP, bottom=BOTTOM, wspace=WSPACE)
+
+        data_arrays = [dem_data, data1, data2]
+        for j in range(3):
+            ax = fig.add_subplot(gs[0, j])
+            im = ax.imshow(
+                data_arrays[j],
+                cmap=c_list[j],
+                origin='upper',
+                interpolation='nearest',
+                resample=False
+            )
+            ax.set_title(t_list[j], pad=TITLE_PAD, fontsize=11)
+            ax.set_aspect('equal', adjustable='box')
+
+            divider = make_axes_locatable(ax)
+            cax = divider.append_axes("right", size="3.5%", pad=0.20)
+            cbar = fig.colorbar(im, cax=cax)
+            cbar.set_label(f"{u_list[j]}", rotation=90, fontsize=9)
+
+            for spine in cax.spines.values():
+                spine.set_visible(True)
+                spine.set_edgecolor('black')
+                spine.set_linewidth(0.8)
+
+            ax.text(0.5, DESC_Y, d_list[j], transform=ax.transAxes,
+                    ha='center', fontsize=8, wrap=True)
+
+        fig.suptitle(f"Location: {file_name} ({i+1}/{num_triplets})", fontsize=13)
+
+        fname = f"triplet_{i+1:02d}.png"
+        fpath = os.path.join(out_dir, fname)
+        try:
+            fig.savefig(fpath, dpi=DPI_SAVE)
+            saved.append({
+                "filename": fname,
+                "abs_path": fpath,
+                "public_path": f"/outputs/{os.path.basename(out_dir)}/{fname}",
+                "titles": t_list,
+                "units": u_list,
+                "descriptions": d_list
+            })
+            print(f"[DEBUG] Saved analysis PNG: {fpath}")
+        except Exception as e:
+            print(f"[ERROR] Failed to save {fpath}: {e}")
+        finally:
+            plt.close(fig)
+
+    return saved
+
+
+def _write_manifest_json(process_id: str, out_dir: str, saved_entries: list, source: str = "complete_dem_analysis", original_file_name: str = ""):
+    manifest = {
+        "processId": process_id,
+        "source": source,
+        "original_file_name": original_file_name,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "images": saved_entries
+    }
+    manifest_path = os.path.join(out_dir, "analysis_images.json")
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+        print(f"[DEBUG] Wrote manifest: {manifest_path}")
+    except Exception as e:
+        print(f"[ERROR] Failed to write manifest JSON: {e}")
+
+
+def _save_dem_overview_png(dem, out_dir, file_name, nodata_value=None):
+    fig = plt.figure(figsize=(14.5, 5.5))
+    ax = fig.add_subplot(111)
+
+    mask = ~np.isfinite(dem)
+    if nodata_value is not None:
+        mask |= np.isclose(dem, nodata_value)
+
+    if mask.any():
+        valid_min = np.nanmin(dem[~mask]) if (~mask).any() else 0.0
+        dem_filled = dem.copy()
+        dem_filled[mask] = valid_min
+    else:
+        dem_filled = dem
+
+    h, w = dem_filled.shape
+    im = ax.imshow(
+        dem_filled,
+        cmap='terrain',
+        origin='upper',
+        interpolation='nearest',
+        resample=False,
+        extent=(-0.5, w - 0.5, h - 0.5, -0.5)
+    )
+    ax.set_title("DEM", pad=8)
+    ax.set_aspect('equal', adjustable='box')
+
+    CB_SIZE = "4%"
+    CB_PAD  = 0.3
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size=CB_SIZE, pad=CB_PAD)
+
+    cbar = fig.colorbar(im, cax=cax)
+    cbar.set_label("Elevation (m)", rotation=90)
+
+    cbar.outline.set_visible(False)
+    for side in ("left", "right", "top", "bottom"):
+        sp = cax.spines[side]
+        sp.set_visible(True)
+        sp.set_linewidth(0.6)
+        try:
+            sp.set_edgecolor("black")
+        except Exception:
+            sp.set_color("black")
+
+    cax.set_facecolor('none')
+    cax.grid(False)
+    cax.tick_params(length=3)
+
+    fig.subplots_adjust(left=0.050, right=0.890, top=0.88, bottom=0.16)
+    fig.suptitle(f"Location: {file_name}", fontsize=14)
+
+    out_path = os.path.join(out_dir, "dem_overview.png")
+    fig.savefig(out_path, dpi=170)
+    plt.close(fig)
+
+    return {
+        "filename": "dem_overview.png",
+        "abs_path": out_path,
+        "public_path": f"/outputs/{os.path.basename(out_dir)}/dem_overview.png",
+        "titles": ["DEM"],
+        "units": ["m"],
+        "descriptions": ["Represents terrain elevation in meters above sea level."]
+    }
+
+def _save_doublets_from_arrays(analysis_triplets, titles, cmaps, units, descriptions, file_name, out_dir):
+    saved = []
+    num_triplets = len(analysis_triplets)
+
+    for i in range(num_triplets):
+        dem_data, data1, data2 = analysis_triplets[i]
+        base_idx = i * 3
+        t_list = titles[base_idx+1:base_idx+3]
+        c_list = cmaps[base_idx+1:base_idx+3]
+        u_list = units[base_idx+1:base_idx+3]
+        d_list = descriptions[base_idx+1:base_idx+3]
+
+        fig = plt.figure(figsize=(14.5, 5.5))
+        gs = gridspec.GridSpec(
+            1, 3, figure=fig,
+            width_ratios=[1.0, 0.08, 1.0],
+            wspace=0.15
+        )
+
+        ax1 = fig.add_subplot(gs[0, 0])
+        im1 = ax1.imshow(data1, cmap=c_list[0], origin='upper')
+        ax1.set_title(t_list[0], pad=8)
+        ax1.set_aspect('equal', adjustable='box')
+
+        divider1 = make_axes_locatable(ax1)
+        cax1 = divider1.append_axes("right", size="4.6%", pad=0.25)
+        cbar1 = fig.colorbar(im1, cax=cax1)
+        cbar1.set_label(f"{u_list[0]}", rotation=90)
+
+        ax1.text(0.5, -0.18, d_list[0], transform=ax1.transAxes,
+                 ha='center', fontsize=9, wrap=True)
+
+        ax_spacer = fig.add_subplot(gs[0, 1])
+        ax_spacer.axis('off')
+
+        ax2 = fig.add_subplot(gs[0, 2])
+        im2 = ax2.imshow(data2, cmap=c_list[1], origin='upper')
+        ax2.set_title(t_list[1], pad=8)
+        ax2.set_aspect('equal', adjustable='box')
+
+        divider2 = make_axes_locatable(ax2)
+        cax2 = divider2.append_axes("right", size="4.6%", pad=0.25)
+        cbar2 = fig.colorbar(im2, cax=cax2)
+        cbar2.set_label(f"{u_list[1]}", rotation=90)
+
+        ax2.text(0.5, -0.18, d_list[1], transform=ax2.transAxes,
+                 ha='center', fontsize=9, wrap=True)
+
+        fig.suptitle(f"Location: {file_name} — Panel {i+1}/{num_triplets}", fontsize=13)
+
+        fname = f"double_{i+1:02d}.png"
+        fpath = os.path.join(out_dir, fname)
+        try:
+            fig.savefig(fpath, dpi=170)
+            saved.append({
+                "filename": fname,
+                "abs_path": fpath,
+                "public_path": f"/outputs/{os.path.basename(out_dir)}/{fname}",
+                "titles": t_list,
+                "units": u_list,
+                "descriptions": d_list
+            })
+            print(f"[DEBUG] Saved analysis double-panel PNG: {fpath}")
+        except Exception as e:
+            print(f"[ERROR] Failed to save {fpath}: {e}")
+        finally:
+            plt.close(fig)
+
+    return saved
+
+# ==================== FINE UTILITY PNG + MANIFEST ====================
+
 # Classe PyQt5 Application con le modifiche richieste
 class DEMAnalysisApp(QMainWindow):
     def __init__(self, dem, profile, analysis_triplets, titles, cmaps, units, descriptions, file_name):
@@ -184,8 +465,9 @@ class DEMAnalysisApp(QMainWindow):
         # Liste per memorizzare immagini, colorbar e assi dei grafici
         self.images = [None, None, None]
         self.colorbars = [None, None, None]
-        self.image_axes = [None, None, None]  # Nuova lista per gli assi dei grafici
-        self.rectangle_selectors = [None, None, None]  # Per la selezione di regioni
+        self.image_axes = [None, None, None]
+        self.cbar_axes = [None, None, None]  # <-- NUOVO: axes dedicati delle colorbar
+        self.rectangle_selectors = [None, None, None]
 
         # Etichetta per i tooltips
         self.tooltip_label = QLabel("", self)
@@ -212,17 +494,13 @@ class DEMAnalysisApp(QMainWindow):
         # Creazione della Custom Navigation Toolbar (senza pulsante di salvataggio)
         self.toolbar = CustomNavigationToolbar(self.canvas, self)
         
-        # Pulsanti di navigazione e nuove funzionalità in un'unica riga
+        # Pulsanti e toolbar
         nav_layout = QHBoxLayout()
         main_layout.addLayout(nav_layout)
 
-        # Allineamento orizzontale: Toolbar + Spacer + Pulsanti
         nav_layout.addWidget(self.toolbar)
-
-        # Spacer tra la toolbar e i pulsanti
         nav_layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
 
-        # Pulsanti di navigazione: Previous e Next
         self.prev_button = QPushButton('Previous')
         self.prev_button.setFixedSize(100, 40)
         self.prev_button.clicked.connect(self.previous_triplet)
@@ -233,62 +511,49 @@ class DEMAnalysisApp(QMainWindow):
         self.next_button.clicked.connect(self.next_triplet)
         nav_layout.addWidget(self.next_button)
 
-        # Pulsante per visualizzare il modello 3D
         self.view3d_button = QPushButton('View 3D Model')
         self.view3d_button.setFixedSize(120, 40)
         self.view3d_button.clicked.connect(self.display_volcano_3d)
         nav_layout.addWidget(self.view3d_button)
 
-        # Spacer tra i pulsanti di navigazione e i controlli di selezione
         nav_layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
 
-        # Label "Select Graph:"
         self.graph_selection_label = QLabel("Select Graph:")
         self.graph_selection_label.setFixedSize(100, 40)
-        self.graph_selection_label.setAlignment(Qt.AlignVCenter | Qt.AlignRight)  # Allineamento verticale
+        self.graph_selection_label.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
         nav_layout.addWidget(self.graph_selection_label)
 
-        # ComboBox per selezionare il grafico
         self.graph_selection_combo = QComboBox()
         self.graph_selection_combo.setFixedSize(200, 40)
         self.graph_selection_combo.currentIndexChanged.connect(self.update_selected_graph)
         nav_layout.addWidget(self.graph_selection_combo)
 
-        # Pulsante "Select Colormap"
         self.select_colormap_button = QPushButton('Select Colormap')
         self.select_colormap_button.setFixedSize(150, 40)
         self.select_colormap_button.clicked.connect(self.select_colormap)
         nav_layout.addWidget(self.select_colormap_button)
 
-        # Spacer tra i controlli di selezione e gli altri pulsanti
         nav_layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
 
-        # Pulsante di Download
         self.download_image_button = QPushButton('Download as PNG or JPG')
         self.download_image_button.setFixedSize(200, 40)
         self.download_image_button.clicked.connect(self.download_graph_image)
         nav_layout.addWidget(self.download_image_button)
 
-        # Pulsante di Esportazione dei Dati
         self.export_data_button = QPushButton('Export Data')
         self.export_data_button.setFixedSize(120, 40)
         self.export_data_button.clicked.connect(self.export_data)
         nav_layout.addWidget(self.export_data_button)
 
-        # Spacer per equidistanza a destra
         nav_layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
 
         # Connessione degli eventi per i tooltips
         self.canvas.mpl_connect("motion_notify_event", self.on_motion)
 
-        # Aggiungi RectangleSelector per ogni grafico dopo la creazione dei plot
-        # Verrà gestito nell'update_display()
-
         # Display iniziale
         self.update_display()
 
     def update_selected_graph(self):
-        # La selezione del grafico è semplicemente l'indice selezionato nel combo box
         self.selected_graph = self.graph_selection_combo.currentIndex()
         print(f"[DEBUG] Selected graph index: {self.selected_graph}")
 
@@ -297,8 +562,11 @@ class DEMAnalysisApp(QMainWindow):
         self.figure.clear()
         fig = self.figure
 
-        # Configurazione di GridSpec
-        gs = gridspec.GridSpec(1, 3, figure=fig)
+        # === Margine esterno per non tagliare la 3ª colorbar ===
+        fig.set_constrained_layout_pads(w_pad=0.60, h_pad=0.02, wspace=0.16, hspace=0.08)
+
+        # Gridspec: spazio tra i pannelli (non i bordi esterni)
+        gs = gridspec.GridSpec(1, 3, figure=fig, wspace=0.16)
 
         # Ottieni il tripletto corrente
         dem_data, data1, data2 = self.analysis_triplets[self.current_index]
@@ -318,15 +586,15 @@ class DEMAnalysisApp(QMainWindow):
         descriptions = self.descriptions[idx:idx + 3]
         cmaps = self.cmaps[idx:idx + 3]
 
-        # Pulisci le liste di immagini, colorbar e assi dei grafici
+        # Reset handle
         self.images = [None, None, None]
         self.colorbars = [None, None, None]
         self.image_axes = [None, None, None]
-        # Disattiva e cancella i RectangleSelector precedenti
+        self.cbar_axes = [None, None, None]
         for selector in self.rectangle_selectors:
             if selector is not None:
                 selector.set_active(False)
-        self.rectangle_selectors = [None, None, None]  # Reset dei RectangleSelector
+        self.rectangle_selectors = [None, None, None]
 
         # Plot dei tre grafici
         for i in range(3):
@@ -336,8 +604,11 @@ class DEMAnalysisApp(QMainWindow):
                 ax.set_title(titles[i], pad=10)
                 ax.set_aspect('equal', adjustable='box')
 
-                # Crea la colorbar e memorizza la referenza
-                cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                # === Colorbar accanto al riquadro dati, stessa altezza dell'immagine ===
+                divider = make_axes_locatable(ax)
+                cax = divider.append_axes("right", size="4.6%", pad=0.10)
+                cax.set_in_layout(True)  # IMPORTANT: la cbar entra nel layout → niente clip
+                cbar = fig.colorbar(im, cax=cax)
                 cbar.set_label(f"{units[i]}", rotation=90)
 
                 # Aggiungi descrizione
@@ -349,22 +620,24 @@ class DEMAnalysisApp(QMainWindow):
                 # Memorizza le referenze
                 self.images[i] = im
                 self.colorbars[i] = cbar
-                self.image_axes[i] = ax  # Memorizza l'asse del grafico principale
+                self.image_axes[i] = ax
+                self.cbar_axes[i] = cax
 
-                # Aggiungi RectangleSelector per la selezione di regioni
+                # Selettore rettangolo
                 self.rectangle_selectors[i] = RectangleSelector(
-                    ax, self.on_select, drawtype='box',
-                    useblit=True, button=[1],  # Solo il tasto sinistro del mouse
+                    ax, self.on_select,
+                    useblit=True, button=[1],
                     minspanx=5, minspany=5, spancoords='pixels',
                     interactive=True
                 )
+
                 print(f"[DEBUG] Plotted graph {i} with title '{titles[i]}'")
             except Exception as e:
                 print(f"[ERROR] Error plotting graph {i}: {e}")
 
         self.canvas.draw()
 
-        # Gestisci la visibilità dei pulsanti
+        # Pulsanti
         if self.current_index == 0:
             self.prev_button.setVisible(False)
             self.next_button.setVisible(True)
@@ -375,15 +648,14 @@ class DEMAnalysisApp(QMainWindow):
             self.prev_button.setVisible(True)
             self.next_button.setVisible(True)
 
-        # Aggiorna il ComboBox per la selezione del grafico
-        self.graph_selection_combo.blockSignals(True)  # Blocca segnali temporaneamente
+        # ComboBox
+        self.graph_selection_combo.blockSignals(True)
         self.graph_selection_combo.clear()
         current_titles = self.titles[idx:idx + 3]
         self.graph_selection_combo.addItems(current_titles)
-        # Reset la selezione al primo grafico
         self.graph_selection_combo.setCurrentIndex(0)
         self.selected_graph = 0
-        self.graph_selection_combo.blockSignals(False)  # Riattiva segnali
+        self.graph_selection_combo.blockSignals(False)
         print("[DEBUG] Display update complete.")
 
     def next_triplet(self):
@@ -401,7 +673,6 @@ class DEMAnalysisApp(QMainWindow):
     def display_volcano_3d(self):
         try:
             print("[DEBUG] Displaying 3D model window.")
-            # Creazione di una nuova finestra per il modello 3D
             self.three_d_window = QtWidgets.QMainWindow()
             self.three_d_window.setWindowTitle('3D Model')
             central_widget = QtWidgets.QWidget()
@@ -418,7 +689,6 @@ class DEMAnalysisApp(QMainWindow):
             y = np.arange(0, self.dem.shape[0])
             x, y = np.meshgrid(x, y)
 
-            # Scala l'asse z se necessario
             z = self.dem
 
             surface = ax.plot_surface(
@@ -444,10 +714,8 @@ class DEMAnalysisApp(QMainWindow):
             )
             print(f"[ERROR] Error in display_volcano_3d: {e}")
 
-    # ### Funzione Aggiunta per Scaricare il Grafico in Formato PNG o JPG ###
     def download_graph_image(self):
         try:
-            # Apri una finestra di dialogo per scegliere la destinazione e il formato
             options = QFileDialog.Options()
             file_path, selected_filter = QFileDialog.getSaveFileName(
                 self,
@@ -457,7 +725,6 @@ class DEMAnalysisApp(QMainWindow):
                 options=options
             )
             if file_path:
-                # Determina il formato basato sul filtro selezionato o sull'estensione del file
                 if selected_filter.startswith("PNG"):
                     format = 'png'
                     if not file_path.lower().endswith('.png'):
@@ -467,13 +734,11 @@ class DEMAnalysisApp(QMainWindow):
                     if not file_path.lower().endswith('.jpg') and not file_path.lower().endswith('.jpeg'):
                         file_path += '.jpg'
                 else:
-                    # Default a PNG se nessun formato specifico è selezionato
                     format = 'png'
                     if not file_path.lower().endswith('.png'):
                         file_path += '.png'
 
                 try:
-                    # Salva la figura corrente nel formato scelto
                     self.figure.savefig(file_path, format=format)
                     QMessageBox.information(
                         self, 
@@ -496,16 +761,13 @@ class DEMAnalysisApp(QMainWindow):
             )
             print(f"[ERROR] Error initiating graph saving: {e}")
 
-    # ### Funzione Aggiunta per Selezionare il Colormap ###
     def select_colormap(self):
         try:
             dialog = ColormapDialog(self)
             if dialog.exec_() == QDialog.Accepted:
                 new_colormap = dialog.get_selected_colormap()
-                # Aggiorna il colormap selezionato
                 self.selected_colormap = new_colormap
                 print(f"[DEBUG] Selected new colormap: {self.selected_colormap}")
-                # Applica il nuovo colormap al grafico selezionato
                 self.apply_colormap_to_selected_graph()
         except Exception as e:
             QMessageBox.critical(
@@ -517,39 +779,48 @@ class DEMAnalysisApp(QMainWindow):
 
     def apply_colormap_to_selected_graph(self):
         try:
-            # Verifica che l'indice del grafico selezionato sia valido
             if self.selected_graph not in [0, 1, 2]:
                 print(f"[DEBUG] Invalid selected_graph index: {self.selected_graph}")
                 return
 
             fig = self.figure
 
-            # Ottieni l'asse corrispondente dal list degli assi dei grafici principali
             ax = self.image_axes[self.selected_graph]
             im = self.images[self.selected_graph]
             cbar = self.colorbars[self.selected_graph]
+            cax_saved = self.cbar_axes[self.selected_graph]
 
-            if im is None:
-                print(f"[DEBUG] No image associated with graph index: {self.selected_graph}")
-                return  # Nessuna immagine associata
+            if im is None or ax is None:
+                print(f"[DEBUG] No image/axis associated with graph {self.selected_graph}")
+                return
 
-            # Aggiorna il colormap dell'immagine
             im.set_cmap(self.selected_colormap)
             print(f"[DEBUG] Updated colormap for graph {self.selected_graph} to {self.selected_colormap}")
 
-            # Rimuovi la vecchia colorbar
+            # rimuovi la vecchia cbar
             if cbar is not None:
-                cbar.remove()
-                print(f"[DEBUG] Removed old colorbar for graph {self.selected_graph}")
+                try:
+                    cbar.remove()
+                except Exception:
+                    pass
 
-            # Crea una nuova colorbar
-            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            # usa lo stesso cax se disponibile; altrimenti creane uno nuovo accanto all'ax
+            if cax_saved is None:
+                divider = make_axes_locatable(ax)
+                cax = divider.append_axes("right", size="4.6%", pad=0.10)
+                cax.set_in_layout(True)  # IMPORTANT: evita il clipping a destra
+                self.cbar_axes[self.selected_graph] = cax
+            else:
+                cax = cax_saved
+                cax.set_in_layout(True)
+                cax.cla()
+
+            # ricrea la colorbar nel cax dedicato → stessa altezza del box immagine
+            cbar = fig.colorbar(im, cax=cax)
             cbar.set_label(f"{self.units[self.current_index * 3 + self.selected_graph]}", rotation=90)
 
-            # Aggiorna le referenze
             self.colorbars[self.selected_graph] = cbar
 
-            # Aggiorna il canvas
             self.canvas.draw()
             print(f"[DEBUG] Applied new colormap and updated colorbar for graph {self.selected_graph}")
         except Exception as e:
@@ -560,10 +831,8 @@ class DEMAnalysisApp(QMainWindow):
             )
             print(f"[ERROR] Error in apply_colormap_to_selected_graph: {e}")
 
-    # ### Funzione Aggiunta per Esportare i Dati Analizzati ###
     def export_data(self):
         try:
-            # Chiedi all'utente di scegliere il formato di esportazione
             format_dialog = QMessageBox(self)
             format_dialog.setWindowTitle("Select Export Format")
             format_dialog.setText("Choose the format to export the data:")
@@ -578,11 +847,9 @@ class DEMAnalysisApp(QMainWindow):
             elif format_dialog.clickedButton() == geotiff_button:
                 export_format = 'GeoTIFF'
             else:
-                # L'utente ha annullato l'operazione
                 print("[DEBUG] Export operation canceled by user.")
                 return
 
-            # Apri una finestra di dialogo per scegliere la destinazione
             options = QFileDialog.Options()
             directory = QFileDialog.getExistingDirectory(
                 self,
@@ -591,36 +858,28 @@ class DEMAnalysisApp(QMainWindow):
                 options=options
             )
             if not directory:
-                # L'utente ha annullato l'operazione
                 print("[DEBUG] Export directory selection canceled by user.")
                 return
 
-            # Inizia l'esportazione dei dati
             try:
                 for i, (dem_data, data1, data2) in enumerate(self.analysis_triplets, start=1):
-                    # Determina le analisi correnti basandoti sui titoli
                     current_titles = self.titles[(i-1)*3:i*3]
-
                     data_arrays = [dem_data, data1, data2]
 
                     for title, data in zip(current_titles, data_arrays):
                         safe_title = title.replace(" ", "_").replace("/", "_")
                         if export_format == 'CSV':
-                            # Esporta in CSV usando Pandas
                             df = pd.DataFrame(data)
                             csv_filename = os.path.join(directory, f"Triplet{i}_{safe_title}.csv")
                             df.to_csv(csv_filename, index=False, header=False, na_rep="NaN")
                             print(f"[DEBUG] Exported {csv_filename}")
                         elif export_format == 'GeoTIFF':
-                            # Esporta in GeoTIFF usando Rasterio
                             geotiff_filename = os.path.join(directory, f"Triplet{i}_{safe_title}.tif")
-                            # Aggiorna il profilo per riflettere i nuovi dati
                             new_profile = self.profile.copy()
                             new_profile.update(dtype=rasterio.float32, count=1, nodata=None)
                             with rasterio.open(geotiff_filename, 'w', **new_profile) as dst:
                                 dst.write(data.astype(rasterio.float32), 1)
                             print(f"[DEBUG] Exported {geotiff_filename}")
-                # Mostra un messaggio di successo
                 QMessageBox.information(
                     self, 
                     "Export Successful", 
@@ -642,7 +901,6 @@ class DEMAnalysisApp(QMainWindow):
             )
             print(f"[ERROR] Error in export_data setup: {e}")
 
-    # ### Funzionalità Aggiunte ###
     # Evento di movimento del mouse per i tooltips
     def on_motion(self, event):
         try:
@@ -664,7 +922,6 @@ class DEMAnalysisApp(QMainWindow):
                     z = self.dem[ydata, xdata]
                     self.tooltip_label.setText(f"X: {xdata}, Y: {ydata}, Elevation: {z:.2f} m")
                     self.tooltip_label.adjustSize()
-                    # Posiziona il tooltip vicino al cursore
                     cursor_pos = QCursor.pos()
                     window_pos = self.mapFromGlobal(cursor_pos)
                     self.tooltip_label.move(window_pos.x() + 10, window_pos.y() + 10)
@@ -680,7 +937,6 @@ class DEMAnalysisApp(QMainWindow):
     # Funzione di callback per la selezione di una regione
     def on_select(self, eclick, erelease):
         try:
-            # Ottieni i limiti della selezione
             x1, y1 = eclick.xdata, eclick.ydata
             x2, y2 = erelease.xdata, erelease.ydata
 
@@ -691,17 +947,14 @@ class DEMAnalysisApp(QMainWindow):
             x1, y1 = int(x1), int(y1)
             x2, y2 = int(x2), int(y2)
 
-            # Assicurati che x1 < x2 e y1 < y2
             x_min, x_max = sorted([x1, x2])
             y_min, y_max = sorted([y1, y2])
 
-            # Controlla i limiti
             x_min = max(x_min, 0)
             y_min = max(y_min, 0)
             x_max = min(x_max, self.dem.shape[1])
             y_max = min(y_max, self.dem.shape[0])
 
-            # Estrai la regione selezionata
             selected_region = self.dem[y_min:y_max, x_min:x_max]
 
             if selected_region.size == 0:
@@ -709,7 +962,6 @@ class DEMAnalysisApp(QMainWindow):
                 print("[DEBUG] Selected region is empty.")
                 return
 
-            # Calcola statistiche locali
             local_stats = {
                 'min': float(np.min(selected_region)),
                 'max': float(np.max(selected_region)),
@@ -718,7 +970,6 @@ class DEMAnalysisApp(QMainWindow):
                 'std': float(np.std(selected_region))
             }
 
-            # Mostra le statistiche in una finestra di dialogo
             stats_text = (
                 f"Selected Region Statistics:\n"
                 f"Min: {local_stats['min']}\n"
@@ -737,8 +988,6 @@ class DEMAnalysisApp(QMainWindow):
             )
             print(f"[ERROR] Error in on_select: {e}")
 
-    # ### Fine Funzionalità Aggiunte ###
-
 # Funzione principale
 def main():
     if len(sys.argv) < 2:
@@ -751,7 +1000,9 @@ def main():
     original_file_name = sys.argv[2] if len(sys.argv) > 2 else "Unknown"
 
     # Ottieni il process_id dagli argomenti della riga di comando
-    process_id = sys.argv[3] if len(sys.argv) > 3 else None
+    cli_process_id = sys.argv[3] if len(sys.argv) > 3 else None
+    # Preferisci l'env var PROCESS_ID se presente
+    process_id = _resolve_process_id(cli_process_id)
     if process_id:
         print(f"[DEBUG] Process ID: {process_id}")
 
@@ -759,123 +1010,174 @@ def main():
     print(f"[DEBUG] Original file name: {original_file_name}")
     print(f"[DEBUG] Number of arguments received: {len(sys.argv)}")
 
+    # ==== Benchmark: start ====
+    _t_all_start = time.time()
+    log_memory("program_start")
+
+    # Caricamento DEM (timed)
     try:
-        dem, profile, transform, res = load_dem(dem_path)
-        print(f"[DEBUG] DEM loaded successfully. Dimensions: {dem.shape}, Resolution: {res}")
+        with phase("load_dem"):
+            dem, profile, transform, res = load_dem(dem_path)
+            print(f"[DEBUG] DEM loaded successfully. Dimensions: {dem.shape}, Resolution: {res}")
+            log_memory("after_load_dem")
     except Exception as e:
         print(f"Error loading DEM: {e}")
         sys.exit(1)
 
     # Esegui le varie analisi
     try:
-        print("[DEBUG] Starting Hillshade calculation.")
-        hillshade = calculate_hillshade(dem)
-        print("[DEBUG] Hillshade calculated successfully.")
+        with phase("derivatives"):
+            with phase("calc: hillshade"):
+                print("[DEBUG] Starting Hillshade calculation.")
+                hillshade = calculate_hillshade(dem)
+                print("[DEBUG] Hillshade calculated successfully.")
 
-        print("[DEBUG] Starting Aspect calculation.")
-        aspect = calculate_aspect(dem)
-        print("[DEBUG] Aspect calculated successfully.")
+            with phase("calc: aspect"):
+                print("[DEBUG] Starting Aspect calculation.")
+                aspect = calculate_aspect(dem)
+                print("[DEBUG] Aspect calculated successfully.")
 
-        print("[DEBUG] Starting Convexity calculation.")
-        convexity = calculate_convexity(dem, amplification_factor=200)
-        print("[DEBUG] Convexity calculated successfully.")
+            with phase("calc: convexity"):
+                print("[DEBUG] Starting Convexity calculation.")
+                convexity = calculate_convexity(dem, amplification_factor=200)
+                print("[DEBUG] Convexity calculated successfully.")
 
-        print("[DEBUG] Starting Shaded Relief calculation.")
-        shaded = shaded_relief(dem, scale=10)
-        print("[DEBUG] Shaded Relief calculated successfully.")
+            with phase("calc: shaded_relief"):
+                print("[DEBUG] Starting Shaded Relief calculation.")
+                shaded = shaded_relief(dem, scale=10)
+                print("[DEBUG] Shaded Relief calculated successfully.")
 
-        print("[DEBUG] Starting Roughness calculation.")
-        roughness = calculate_roughness(dem)
-        print("[DEBUG] Roughness calculated successfully.")
+            with phase("calc: roughness"):
+                print("[DEBUG] Starting Roughness calculation.")
+                roughness = calculate_roughness(dem)
+                print("[DEBUG] Roughness calculated successfully.")
 
-        print("[DEBUG] Starting Slope calculation.")
-        slope2 = calculate_slope_2(dem)
-        print("[DEBUG] Slope calculated successfully.")
+            with phase("calc: slope"):
+                print("[DEBUG] Starting Slope calculation.")
+                slope2 = calculate_slope_2(dem)
+                print("[DEBUG] Slope calculated successfully.")
 
-        print("[DEBUG] Starting Curvature calculation.")
-        curvature = calculate_curvature(dem)
-        print("[DEBUG] Curvature calculated successfully.")
+            with phase("calc: curvature"):
+                print("[DEBUG] Starting Curvature calculation.")
+                curvature = calculate_curvature(dem)
+                print("[DEBUG] Curvature calculated successfully.")
 
-        print("[DEBUG] Starting Gaussian Curvature calculation.")
-        normalized_log_gaussian_curvature, log_gaussian_curvature = calculate_gaussian_curvature(dem, res)
-        print("[DEBUG] Gaussian Curvature calculated successfully.")
+            with phase("calc: gaussian_curvature"):
+                print("[DEBUG] Starting Gaussian Curvature calculation.")
+                normalized_log_gaussian_curvature, log_gaussian_curvature = calculate_gaussian_curvature(dem, res)
+                print("[DEBUG] Gaussian Curvature calculated successfully.")
 
-        # Amplificazione e smoothing della curvatura
-        amplification_factor = 5
-        curvature_amplified = curvature * amplification_factor
-        curvature_smoothed = gaussian_filter(curvature_amplified, sigma=1)
-        curvature_smoothed_normalized = (
-            curvature_smoothed - np.min(curvature_smoothed)
-        ) / (np.max(curvature_smoothed) - np.min(curvature_smoothed))
+            with phase("calc: smooth+normalize"):
+                print("[DEBUG] Starting curvature amplify + smooth + normalize.")
+                amplification_factor = 5
+                curvature_amplified = curvature * amplification_factor
+                curvature_smoothed = gaussian_filter(curvature_amplified, sigma=1)
+                curvature_smoothed_normalized = (
+                    curvature_smoothed - np.min(curvature_smoothed)
+                ) / (np.max(curvature_smoothed) - np.min(curvature_smoothed))
+                print("[DEBUG] Curvature smoothing/normalization completed.")
     except Exception as e:
         print(f"Error during analysis calculations: {e}")
         sys.exit(1)
 
-    # Raccogli statistiche in un dizionario
-    total_statistics, gauss_curv_stats = gather_statistics(
-        log_gaussian_curvature, "Logarithmic Amplified Gaussian Curvature"
-    )
-    _, smooth_curv_stats = gather_statistics(
-        curvature_smoothed, "Amplified and Smoothed Curvature"
-    )
+    # Raccogli statistiche in un dizionario (timed)
+    with phase("statistics_json"):
+        total_statistics, gauss_curv_stats = gather_statistics(
+            log_gaussian_curvature, "Logarithmic Amplified Gaussian Curvature"
+        )
+        _, smooth_curv_stats = gather_statistics(
+            curvature_smoothed, "Amplified and Smoothed Curvature"
+        )
+        write_statistics_to_json(total_statistics, filename="output_statistics.json")
+        print("[DEBUG] Statistics written to output_statistics.json")
+        log_memory("after_statistics_json")
 
-    # Scrivi le statistiche in un file JSON
-    write_statistics_to_json(total_statistics, filename="output_statistics.json")
-    print("[DEBUG] Statistics written to output_statistics.json")
+    # Organizza le analisi in triplette (timed)
+    with phase("prepare_triplets"):
+        print("[DEBUG] Preparing analysis triplets.")
+        analysis_triplets = [
+            (dem, shaded, hillshade),  # Prima finestra
+            (dem, aspect, slope2),     # Seconda finestra
+            (dem, roughness, convexity),  # Terza finestra
+            (dem, curvature_smoothed_normalized, normalized_log_gaussian_curvature)
+        ]
+        print("[DEBUG] Analysis triplets prepared.")
+        titles = [
+            "DEM", "Shaded Relief", "Hillshade",
+            "DEM", "Aspect", "Slope",
+            "DEM", "Roughness", "Convexity",
+            "DEM", "Amplified and Smoothed Curvature", "Logarithmic Amplified Gaussian Curvature"
+        ]
+        cmaps = [
+            "terrain", "gray", "gray",
+            "terrain", "twilight", "plasma",
+            "terrain", "seismic", "twilight",
+            "terrain", "plasma", "plasma"
+        ]
+        units = [
+            "m", "Adimensional", "Adimensional",  # Prima finestra
+            "m", "Degrees", "Degrees",            # Seconda finestra
+            "m", "Adimensional", "Adimensional",  # Terza finestra
+            "m", "Adimensional", "Adimensional"   # Quarta finestra
+        ]
+        descriptions = [
+            "Represents terrain elevation in meters above sea level.",
+            "Simulates light and shadow effects on the terrain.",
+            "Relative terrain illumination (Sun Alt 45°, Az 45°).",
+            "Represents terrain elevation in meters above sea level.",
+            "Direction of slope (°): 0°=N, clockwise to 360°.",
+            "Measures terrain slope in degrees.",
+            "Represents terrain elevation in meters above sea level.",
+            "Measures local variations in elevation.",
+            "Shows whether terrain areas are convex or concave.",
+            "Represents terrain elevation in meters above sea level.",
+            "Smoothed curvature for improved interpretation.",
+            "Gaussian curvature for detailed terrain analysis."
+        ]
+        log_memory("after_prepare_triplets")
 
-    # Organizza le analisi in triplette
-    print("[DEBUG] Preparing analysis triplets.")
-    analysis_triplets = [
-        (dem, shaded, hillshade),  # Prima finestra
-        (dem, aspect, slope2),     # Seconda finestra
-        (dem, roughness, convexity),  # Terza finestra
-        (dem, curvature_smoothed_normalized, normalized_log_gaussian_curvature)
-    ]
-    print("[DEBUG] Analysis triplets prepared.")
-    titles = [
-        "DEM", "Shaded Relief", "Hillshade",
-        "DEM", "Aspect", "Slope",
-        "DEM", "Roughness", "Convexity",
-        "DEM", "Amplified and Smoothed Curvature", "Logarithmic Amplified Gaussian Curvature"
-    ]
-    cmaps = [
-        "terrain", "gray", "gray",
-        "terrain", "twilight", "plasma",
-        "terrain", "seismic", "twilight",
-        "terrain", "plasma", "plasma"
-    ]
-    units = [
-        "m", "Adimensional", "Adimensional",  # Prima finestra
-        "m", "Degrees", "Degrees",            # Seconda finestra
-        "m", "Adimensional", "Adimensional",  # Terza finestra
-        "m", "Adimensional", "Adimensional"   # Quarta finestra
-    ]
-    descriptions = [
-        "Represents terrain elevation in meters above sea level.",
-        "Simulates light and shadow effects on the terrain.",
-        "Represents relative illumination intensity on the terrain.\nSun position Altitude=45° - Azimuth=45°",
-        "Represents terrain elevation in meters above sea level.",
-        "Indicates the direction of the slope in degrees.\nWith 0° representing north, increasing clockwise to 360°",
-        "Measures terrain slope in degrees.",
-        "Represents terrain elevation in meters above sea level.",
-        "Measures local variations in elevation.",
-        "Shows whether terrain areas are convex or concave.",
-        "Represents terrain elevation in meters above sea level.",
-        "Smoothed curvature for improved interpretation.",
-        "Gaussian curvature for detailed terrain analysis."
-    ]
-
-    # Invia notifica di completamento al server Node.js
-    if process_id:
+    # ========== NEW: salvataggio DEM singolo + doppietti e manifest ==========
+    with phase("save_pngs_and_manifest"):
         try:
-            print(f"[DEBUG] Sending completion notification to server for process ID: {process_id}")
-            response = requests.post(f'http://localhost:5000/processComplete/{process_id}')
-            print(f"[DEBUG] Server response status code: {response.status_code}")
-            print(f"[DEBUG] Server response content: {response.content}")
-        except Exception as e:
-            print(f"[ERROR] Error sending completion notification: {e}")
+            out_dir = _ensure_outputs_dir(process_id)
 
-    # Avvia l'applicazione PyQt5 con un piccolo ritardo per assicurare che la richiesta sia completata
+            # 1) DEM una sola volta
+            dem_entry = _save_dem_overview_png(dem, out_dir, original_file_name)
+
+            # 2) Per ogni tripletta, salva SOLO i pannelli 2 e 3 (senza DEM)
+            double_entries = _save_doublets_from_arrays(
+                analysis_triplets, titles, cmaps, units, descriptions, original_file_name, out_dir
+            )
+
+            saved_entries = [dem_entry] + double_entries
+
+            _write_manifest_json(
+                process_id,
+                out_dir,
+                saved_entries,
+                source="complete_dem_analysis",
+                original_file_name=original_file_name
+            )
+        except Exception as e:
+            print(f"[ERROR] Error during PNG/manifest generation: {e}")
+    # ================================================================================
+
+    # Invia notifica (opzionale)
+    if process_id:
+        with phase("notify_server"):
+            try:
+                print(f"[DEBUG] Sending completion notification to server for process ID: {process_id}")
+                response = requests.post(f'http://localhost:5000/processComplete/{process_id}')
+                print(f"[DEBUG] Server response status code: {response.status_code}")
+                print(f"[DEBUG] Server response content: {response.content}")
+            except Exception as e:
+                print(f"[ERROR] Error sending completion notification: {e}")
+
+    print(f"[RESULT] Peak RAM = {_peak_mb:.1f} MB")
+    print(f"[TIMING] total_end_to_end = {time.time() - _t_all_start:.3f} s")
+    log_memory("before_gui_start")
+
+    # Avvia l'applicazione PyQt5
     try:
         app = QApplication(sys.argv)
         ex = DEMAnalysisApp(

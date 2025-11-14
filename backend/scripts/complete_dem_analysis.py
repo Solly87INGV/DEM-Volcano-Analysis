@@ -79,7 +79,7 @@ class CustomNavigationToolbar(NavigationToolbar):
                 self.removeAction(action)
                 break
 
-# Funzioni di analisi (rimangono invariate)
+# Funzioni di analisi (rimangono invariate, tranne aggiunta secondo slope)
 def calculate_hillshade(dem, azimuth=45, altitude=45):
     x, y = np.gradient(dem)
     slope = np.pi / 2 - np.arctan(np.sqrt(x ** 2 + y ** 2))
@@ -116,9 +116,20 @@ def shaded_relief(dem, scale=10):
     return shaded
 
 def calculate_slope_2(dem):
+    """Slope in gradi, metodo 1 (spaziatura implicita = 1)."""
     dz_dx, dz_dy = np.gradient(dem)
     slope = np.arctan(np.sqrt(dz_dx ** 2 + dz_dy ** 2)) * (180 / np.pi)
     return slope
+
+def calculate_slope_res(dem, dx, dy):
+    """
+    Slope in gradi, metodo 2 (come la vecchia calcola_pendenza):
+    usa la risoluzione spaziale esplicita dx, dy.
+    """
+    dzdx, dzdy = np.gradient(dem, dx, dy)
+    slope = np.arctan(np.sqrt(dzdx**2 + dzdy**2))
+    slope_deg = np.degrees(slope)
+    return slope_deg
 
 def calculate_curvature(dem):
     dz_dx = np.gradient(dem, axis=1)
@@ -1052,10 +1063,15 @@ def main():
                 roughness = calculate_roughness(dem)
                 print("[DEBUG] Roughness calculated successfully.")
 
-            with phase("calc: slope"):
-                print("[DEBUG] Starting Slope calculation.")
-                slope2 = calculate_slope_2(dem)
-                print("[DEBUG] Slope calculated successfully.")
+            with phase("calc: slope_method1"):
+                print("[DEBUG] Starting Slope calculation (method 1).")
+                slope_deg_1 = calculate_slope_2(dem)
+                print("[DEBUG] Slope (method 1) calculated successfully.")
+
+            with phase("calc: slope_method2"):
+                print("[DEBUG] Starting Slope calculation (method 2 - dx,dy=res).")
+                slope_deg_2 = calculate_slope_res(dem, res, res)
+                print("[DEBUG] Slope (method 2) calculated successfully.")
 
             with phase("calc: curvature"):
                 print("[DEBUG] Starting Curvature calculation.")
@@ -1096,41 +1112,42 @@ def main():
     with phase("prepare_triplets"):
         print("[DEBUG] Preparing analysis triplets.")
         analysis_triplets = [
-            (dem, shaded, hillshade),  # Prima finestra
-            (dem, aspect, slope2),     # Seconda finestra
-            (dem, roughness, convexity),  # Terza finestra
-            (dem, curvature_smoothed_normalized, normalized_log_gaussian_curvature)
+            (dem, shaded, hillshade),                             # Prima finestra
+            (dem, slope_deg_1, slope_deg_2),                      # Seconda finestra
+            (dem, roughness, convexity),                          # Terza finestra
+            (aspect, curvature_smoothed_normalized,               # Quarta finestra
+             normalized_log_gaussian_curvature)
         ]
         print("[DEBUG] Analysis triplets prepared.")
         titles = [
             "DEM", "Shaded Relief", "Hillshade",
-            "DEM", "Aspect", "Slope",
+            "DEM", "Slope 1", "Slope 2",
             "DEM", "Roughness", "Convexity",
-            "DEM", "Amplified and Smoothed Curvature", "Logarithmic Amplified Gaussian Curvature"
+            "Aspect", "Amplified and Smoothed Curvature", "Logarithmic Amplified Gaussian Curvature"
         ]
         cmaps = [
             "terrain", "gray", "gray",
-            "terrain", "twilight", "plasma",
+            "terrain", "plasma", "plasma",
             "terrain", "seismic", "twilight",
-            "terrain", "plasma", "plasma"
+            "twilight", "plasma", "plasma"
         ]
         units = [
-            "m", "Adimensional", "Adimensional",  # Prima finestra
+            "m", "Adimensional", "Adimensional",   # Prima finestra
             "m", "Degrees", "Degrees",            # Seconda finestra
             "m", "Adimensional", "Adimensional",  # Terza finestra
-            "m", "Adimensional", "Adimensional"   # Quarta finestra
+            "Degrees", "Adimensional", "Adimensional"   # Quarta finestra
         ]
         descriptions = [
             "Represents terrain elevation in meters above sea level.",
             "Simulates light and shadow effects on the terrain.",
             "Relative terrain illumination (Sun Alt 45°, Az 45°).",
             "Represents terrain elevation in meters above sea level.",
-            "Direction of slope (°): 0°=N, clockwise to 360°.",
-            "Measures terrain slope in degrees.",
+            "Slope in degrees (method 1).",
+            "Slope in degrees (method 2, uses DEM resolution).",
             "Represents terrain elevation in meters above sea level.",
             "Measures local variations in elevation.",
             "Shows whether terrain areas are convex or concave.",
-            "Represents terrain elevation in meters above sea level.",
+            "Direction of slope (°): 0°=N, clockwise to 360°.",
             "Smoothed curvature for improved interpretation.",
             "Gaussian curvature for detailed terrain analysis."
         ]
@@ -1144,7 +1161,7 @@ def main():
             # 1) DEM una sola volta
             dem_entry = _save_dem_overview_png(dem, out_dir, original_file_name)
 
-            # 2) Per ogni tripletta, salva SOLO i pannelli 2 e 3 (senza DEM)
+            # 2) Per ogni tripletta, salva SOLO i pannelli 2 e 3 (senza DEM / senza Aspect nel caso 4)
             double_entries = _save_doublets_from_arrays(
                 analysis_triplets, titles, cmaps, units, descriptions, original_file_name, out_dir
             )
