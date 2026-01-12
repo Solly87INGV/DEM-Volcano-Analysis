@@ -9,12 +9,11 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.21.1",
     "multer": "^1.4.5-lts.1",
-    "pandas": "^0.0.3",
     "uuid": "^11.0.3"
   }
 }
