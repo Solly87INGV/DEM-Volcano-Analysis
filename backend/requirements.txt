@@ -1,0 +1,11 @@
+# Core scientific stack (validated in the technical report)
+rasterio>=1.2
+numpy>=1.21
+scikit-image>=0.18
+matplotlib>=3.4
+PyQt5>=5.15
+reportlab>=3.6
+
+# Optional (only if you expose the Python pipeline as a microservice)
+fastapi>=0.110
+uvicorn[standard]>=0.27
