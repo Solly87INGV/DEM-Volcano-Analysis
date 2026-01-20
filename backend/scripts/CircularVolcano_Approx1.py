@@ -11,9 +11,29 @@
 
 import sys
 import os
+
+# ================= PROJ / EPSG FIX (Windows + PostGIS conflicts) =================
+# Se hai PostGIS/PostgreSQL installato, spesso mette in PATH un PROJ diverso.
+# Rasterio/GDAL allora legge un proj.db incompatibile e "EPSG unknown".
+# Qui forziamo PROJ_LIB verso il proj.db di pyproj (quello corretto per l'ambiente Python).
+def _force_proj_lib_to_pyproj():
+    try:
+        from pyproj import datadir
+        proj_dir = datadir.get_data_dir()  # tipicamente .../pyproj/proj_dir/share/proj
+        if proj_dir and os.path.isdir(proj_dir):
+            os.environ["PROJ_LIB"] = proj_dir
+            print(f"[DEBUG] PROJ_LIB forced to pyproj: {proj_dir}")
+    except Exception as e:
+        print(f"[WARN] Could not force PROJ_LIB via pyproj: {e}")
+
+_force_proj_lib_to_pyproj()
+# ================================================================================
+
 import json
 import numpy as np
 import rasterio  # For reading DEM files in .tif format
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+from rasterio.crs import CRS
 from scipy.ndimage import sobel
 from skimage import measure
 
@@ -81,16 +101,111 @@ def find_opposite_slope_points(slope_matrix, contour):
     max_slope_index2 = tuple(contour[opposite_index])
     return max_slope_index1, max_slope_index2
 
-def distance_between_points(x1, y1, x2, y2):
-    return np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+def _pixel_to_map_xy(transform, row, col):
+    # centro pixel
+    x, y = transform * (col + 0.5, row + 0.5)
+    return float(x), float(y)
 
-def calculate_area(contour, pixel_size):
-    x = contour[:, 1]
-    y = contour[:, 0]
-    area_in_pixels = 0.5 * np.abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
-    area_in_meters = area_in_pixels * (pixel_size ** 2)
-    return area_in_meters
+def distance_between_points(r1, c1, r2, c2, transform):
+    """
+    Distanza in metri tra due punti in coordinate pixel (row/col),
+    usando l'Affine transform del raster.
+    """
+    x1, y1 = _pixel_to_map_xy(transform, r1, c1)
+    x2, y2 = _pixel_to_map_xy(transform, r2, c2)
+    return float(np.hypot(x2 - x1, y2 - y1))
 
+def calculate_area(contour, transform):
+    """
+    Area in m² del contorno (Nx2: [row, col]) usando coordinate mappa (metri)
+    via transform + formula di Shoelace.
+    """
+    contour = np.asarray(contour, dtype=float)
+    if contour.shape[0] < 3:
+        return 0.0
+
+    rows = contour[:, 0]
+    cols = contour[:, 1]
+
+    xs = np.empty(len(contour), dtype=float)
+    ys = np.empty(len(contour), dtype=float)
+
+    for i in range(len(contour)):
+        xs[i], ys[i] = _pixel_to_map_xy(transform, rows[i], cols[i])
+
+    # Shoelace (chiusura implicita con roll)
+    area = 0.5 * np.abs(np.dot(xs, np.roll(ys, -1)) - np.dot(ys, np.roll(xs, -1)))
+    return float(area)
+
+def _utm_epsg_from_lonlat(lon: float, lat: float) -> int:
+    # UTM zone
+    zone = int((lon + 180) // 6) + 1
+    if lat >= 0:
+        return 32600 + zone  # WGS84 / UTM North
+    return 32700 + zone      # WGS84 / UTM South
+
+def ensure_metric_dem(dem_path: str) -> str:
+    """
+    Se il DEM è geografico (gradi), lo riproietta in UTM locale e salva un GeoTIFF working.
+    Ritorna sempre il path del DEM da usare per i calcoli (originale o working).
+    """
+    with rasterio.open(dem_path) as src:
+        src_crs = src.crs
+        if src_crs is None:
+            raise RuntimeError("Input DEM has no CRS. Please define CRS before running volume modules.")
+
+        # Se è già metrico (proiettato), ok
+        if not src_crs.is_geographic:
+            return dem_path
+
+        # Se è geografico: calcola centro e scegli UTM
+        b = src.bounds
+        lon_c = (b.left + b.right) / 2.0
+        lat_c = (b.bottom + b.top) / 2.0
+        epsg = _utm_epsg_from_lonlat(lon_c, lat_c)
+        dst_crs = CRS.from_epsg(epsg)
+
+        # Output working in outputs/<PROCESS_ID>/dem_working.tif (stesso naming della pipeline)
+        base_out = os.path.join(_script_dir(), "outputs")
+        pid = os.environ.get("PROCESS_ID") or "local"
+        out_dir = os.path.join(base_out, pid)
+        os.makedirs(out_dir, exist_ok=True)
+        working_path = os.path.join(out_dir, "dem_working.tif")
+
+        # Calcola transform/shape di destinazione
+        dst_transform, dst_width, dst_height = calculate_default_transform(
+            src_crs, dst_crs, src.width, src.height, *src.bounds
+        )
+
+        dst_profile = src.profile.copy()
+        dst_profile.update(
+            crs=dst_crs,
+            transform=dst_transform,
+            width=dst_width,
+            height=dst_height
+        )
+
+        # Resampling: bilinear per float, nearest per int
+        resampling = Resampling.bilinear if str(src.dtypes[0]).startswith("float") else Resampling.nearest
+
+        # Reproject banda 1
+        dst_arr = np.empty((dst_height, dst_width), dtype=src.dtypes[0])
+
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=dst_arr,
+            src_transform=src.transform,
+            src_crs=src_crs,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            resampling=resampling
+        )
+
+        with rasterio.open(working_path, "w", **dst_profile) as dst:
+            dst.write(dst_arr, 1)
+
+        print(f"[DEBUG] Input DEM is geographic ({src_crs}). Reprojected to {dst_crs} -> {working_path}")
+        return working_path
 
 # ———————— Utility path/manifest ——————————
 
@@ -165,14 +280,15 @@ def _remove_triplets(paths):
 
 
 # ———————— App principale ——————————
-
 class VolumeAnalysisApp(QMainWindow):
-    def __init__(self, dem):
+    def __init__(self, dem, transform):
         super().__init__()
         self.setWindowTitle('Volcano Volume Analysis')
         self.dem = dem
+        self.transform = transform  # <-- SALVATO QUI
         self.calculate_results()  # calcoli prima della UI
         self.initUI()
+
         
     def initUI(self):
         central_widget = QWidget()
@@ -204,7 +320,6 @@ class VolumeAnalysisApp(QMainWindow):
     def calculate_results(self):
         try:
             # Calculate results and store for later use
-            pixel_size = 30  # Modify this value if necessary
             self.base_contour = find_lowest_base_contour(self.dem, base_elevation_ratio=0.05)
             self.base_point1, self.base_point2 = find_opposite_base_points(self.base_contour)
 
@@ -212,23 +327,24 @@ class VolumeAnalysisApp(QMainWindow):
             self.caldera_contour = find_caldera_contour(self.dem, level_ratio=0.8)
             self.max_slope_index1, self.max_slope_index2 = find_opposite_slope_points(self.slope, self.caldera_contour)
 
-            # Calculate base distances
-            pA1, pA2 = self.base_point1[0], self.base_point1[1]
-            pB1, pB2 = self.base_point2[0], self.base_point2[1]
-            distance_pixel_base = distance_between_points(pA1, pA2, pB1, pB2)
-            distance_meters_base = distance_pixel_base * pixel_size
+            # Calculate base distances (METRI via transform)
+            pA1, pA2 = self.base_point1[0], self.base_point1[1]  # row, col
+            pB1, pB2 = self.base_point2[0], self.base_point2[1]  # row, col
+            distance_meters_base = distance_between_points(pA1, pA2, pB1, pB2, self.transform)
             distance_base_km = distance_meters_base * 1e-3  # km
 
-            # Calculate caldera distances
-            pA1_slope, pA2_slope = self.max_slope_index1[0], self.max_slope_index1[1]
-            pB1_slope, pB2_slope = self.max_slope_index2[0], self.max_slope_index2[1]
-            distance_pixel_caldera = distance_between_points(pA1_slope, pA2_slope, pB1_slope, pB2_slope)
-            distance_meters_caldera = distance_pixel_caldera * pixel_size
+
+            # Calculate caldera distances (METRI via transform)
+            pA1_slope, pA2_slope = self.max_slope_index1[0], self.max_slope_index1[1]  # row, col
+            pB1_slope, pB2_slope = self.max_slope_index2[0], self.max_slope_index2[1]  # row, col
+            distance_meters_caldera = distance_between_points(pA1_slope, pA2_slope, pB1_slope, pB2_slope, self.transform)
             distance_caldera_km = distance_meters_caldera * 1e-3  # km
 
-            # Calculate areas
-            area_base = calculate_area(self.base_contour, pixel_size) * 1e-6  # m² to km²
-            area_caldera = calculate_area(self.caldera_contour, pixel_size) * 1e-6  # m² to km²
+
+            # Calculate areas (m² via transform -> km²)
+            area_base = calculate_area(self.base_contour, self.transform) * 1e-6
+            area_caldera = calculate_area(self.caldera_contour, self.transform) * 1e-6
+
 
             # Calculate volumes
             h_max = np.max(self.dem)
@@ -574,12 +690,24 @@ class VolumeAnalysisApp(QMainWindow):
 
 # ———————— Main ——————————
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python CircularVolcano_Approx1.py <dem_file_path>")
         sys.exit(1)
 
     dem_file_path = sys.argv[1]
+
+    # 1) Prima scelta: usa il dem_working associato all'ultimo manifest disponibile
+    outputs_dir, manifest_path = _find_manifest()
+    if outputs_dir:
+        candidate = os.path.join(outputs_dir, "dem_working.tif")
+        if os.path.exists(candidate):
+            dem_file_path = candidate
+            print(f"[DEBUG] Using dem_working from outputs dir: {dem_file_path}")
+
+    # 2) Se ancora non è metrico (es. EPSG:4326), riproietta qui (crea outputs/<PID o local>/dem_working.tif)
+    dem_file_path = ensure_metric_dem(dem_file_path)
+
     if not os.path.exists(dem_file_path):
         print(f"Error: File '{dem_file_path}' does not exist.")
         sys.exit(1)
@@ -587,11 +715,20 @@ if __name__ == '__main__':
     try:
         with rasterio.open(dem_file_path) as src:
             dem = src.read(1)
+            transform = src.transform
+            crs = src.crs
+            res = src.res
+            print(f"[DEBUG] DEM opened for volume. Path={dem_file_path}")
+            print(f"[DEBUG] CRS={crs}  RES={res}  Transform={transform}")
     except Exception as e:
         print(f"Error opening DEM file: {e}")
         sys.exit(1)
 
     app = QApplication(sys.argv)
-    ex = VolumeAnalysisApp(dem)
+    ex = VolumeAnalysisApp(dem, transform)
     ex.showMaximized()
     sys.exit(app.exec_())
+
+
+
+
