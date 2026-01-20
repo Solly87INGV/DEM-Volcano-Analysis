@@ -9,6 +9,22 @@
 
 import sys
 import os
+
+# ================= PROJ / EPSG FIX (Windows + PostGIS conflicts) =================
+# Forza PROJ_LIB verso il proj.db di pyproj per evitare "EPSG unknown" su Windows
+def _force_proj_lib_to_pyproj():
+    try:
+        from pyproj import datadir
+        proj_dir = datadir.get_data_dir()  # .../pyproj/proj_dir/share/proj
+        if proj_dir and os.path.isdir(proj_dir):
+            os.environ["PROJ_LIB"] = proj_dir
+            print(f"[DEBUG] PROJ_LIB forced to pyproj: {proj_dir}")
+    except Exception as e:
+        print(f"[WARN] Could not force PROJ_LIB via pyproj: {e}")
+
+_force_proj_lib_to_pyproj()
+# ================================================================================
+
 import json
 import time
 import numpy as np
@@ -35,6 +51,27 @@ import pdf_generator
 
 def _script_dir():
     return os.path.dirname(os.path.abspath(__file__))
+def _find_latest_dem_working() -> str:
+    """
+    Ritorna il path del dem_working.tif più recente in outputs/*/dem_working.tif.
+    Se non esiste, ritorna stringa vuota.
+    """
+    base = os.path.join(_script_dir(), "outputs")
+    if not os.path.isdir(base):
+        return ""
+
+    newest_path = ""
+    newest_mtime = -1.0
+
+    for name in os.listdir(base):
+        cand = os.path.join(base, name, "dem_working.tif")
+        if os.path.exists(cand):
+            mt = os.path.getmtime(cand)
+            if mt > newest_mtime:
+                newest_mtime = mt
+                newest_path = cand
+
+    return newest_path
 
 def _resolve_process_id() -> str:
     return os.environ.get("PROCESS_ID") or f"local_{int(time.time())}"
@@ -128,14 +165,40 @@ def find_opposite_base_points(contour):
     base_index2 = tuple(contour[opposite_index])
     return base_index1, base_index2
 
-def distance_between_points(x1, y1, x2, y2):
-    return np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+def _pixel_to_map_xy(transform, row, col):
+    # centro pixel
+    x, y = transform * (col + 0.5, row + 0.5)
+    return float(x), float(y)
 
-def calculate_area(contour, pixel_size):
-    x = contour[:, 1]
-    y = contour[:, 0]
-    area_in_pixels = 0.5 * np.abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
-    return area_in_pixels * (pixel_size ** 2)
+def distance_between_points(r1, c1, r2, c2, transform):
+    """
+    Distanza in metri tra due punti in coordinate pixel (row/col),
+    usando l'Affine transform del raster.
+    """
+    x1, y1 = _pixel_to_map_xy(transform, r1, c1)
+    x2, y2 = _pixel_to_map_xy(transform, r2, c2)
+    return float(np.hypot(x2 - x1, y2 - y1))
+
+def calculate_area(contour, transform):
+    """
+    Area in m² del contorno (Nx2: [row, col]) usando coordinate mappa (metri)
+    via transform + formula di Shoelace.
+    """
+    contour = np.asarray(contour, dtype=float)
+    if contour.shape[0] < 3:
+        return 0.0
+
+    rows = contour[:, 0]
+    cols = contour[:, 1]
+
+    xs = np.empty(len(contour), dtype=float)
+    ys = np.empty(len(contour), dtype=float)
+
+    for i in range(len(contour)):
+        xs[i], ys[i] = _pixel_to_map_xy(transform, rows[i], cols[i])
+
+    area = 0.5 * np.abs(np.dot(xs, np.roll(ys, -1)) - np.dot(ys, np.roll(xs, -1)))
+    return float(area)
 
 def calculate_slope(matrix):
     dx = sobel(matrix, axis=1)
@@ -168,10 +231,11 @@ def find_opposite_slope_points(slope_matrix, contour):
 # ========== Main App ==========
 
 class VolumeAnalysisApp(QMainWindow):
-    def __init__(self, dem, original_file_name="Unknown"):
+    def __init__(self, dem, transform, original_file_name="Unknown"):
         super().__init__()
         self.setWindowTitle('Volcano Volume Analysis')
         self.dem = dem
+        self.transform = transform  # <-- SALVATO QUI (metrica raster)
         self.original_file_name = original_file_name
 
         # outputs context
@@ -216,15 +280,15 @@ class VolumeAnalysisApp(QMainWindow):
 
     def calculate_results(self):
         try:
-            pixel_size = 30
             self.base_contour = find_lowest_base_contour(self.dem, base_elevation_ratio=0.05)
             self.base_point1, self.base_point2 = find_opposite_base_points(self.base_contour)
 
             # Distanze base
-            self.distance_pixel_base = distance_between_points(
-                self.base_point1[0], self.base_point1[1], self.base_point2[0], self.base_point2[1]
+            self.distance_meters_base = distance_between_points(
+                self.base_point1[0], self.base_point1[1],
+                self.base_point2[0], self.base_point2[1],
+                self.transform
             )
-            self.distance_meters_base = self.distance_pixel_base * pixel_size
             self.distance_base_km = self.distance_meters_base * 1e-3
 
             # Caldera
@@ -233,16 +297,16 @@ class VolumeAnalysisApp(QMainWindow):
             self.max_slope_index1, self.max_slope_index2 = find_opposite_slope_points(self.slope, self.caldera_contour)
 
             # Distanze caldera
-            self.distance_pixel_caldera = distance_between_points(
+            self.distance_meters_caldera = distance_between_points(
                 self.max_slope_index1[0], self.max_slope_index1[1],
-                self.max_slope_index2[0], self.max_slope_index2[1]
+                self.max_slope_index2[0], self.max_slope_index2[1],
+                self.transform
             )
-            self.distance_meters_caldera = self.distance_pixel_caldera * pixel_size
             self.distance_caldera_km = self.distance_meters_caldera * 1e-3
 
             # Aree
-            self.area_base = calculate_area(self.base_contour, pixel_size) * 1e-6
-            self.area_caldera = calculate_area(self.caldera_contour, pixel_size) * 1e-6
+            self.area_base = calculate_area(self.base_contour, self.transform) * 1e-6
+            self.area_caldera = calculate_area(self.caldera_contour, self.transform) * 1e-6
 
             # Volumi (Approx2: caldera cilindro h=r)
             self.h_max = np.max(self.dem)
@@ -613,20 +677,42 @@ if __name__ == '__main__':
         sys.exit(1)
 
     dem_file_path = sys.argv[1]
+    original_file_name = sys.argv[2] if len(sys.argv) > 2 else "Unknown"
+
+    # Preferisci sempre il DEM standardizzato se esiste: outputs/<PROCESS_ID>/dem_working.tif
+        # Preferisci sempre dem_working.tif:
+    # 1) se PROCESS_ID è disponibile -> outputs/<PROCESS_ID>/dem_working.tif
+    # 2) altrimenti -> outputs/*/dem_working.tif più recente
+    pid = os.environ.get("PROCESS_ID")
+    if pid:
+        candidate = os.path.join(_script_dir(), "outputs", pid, "dem_working.tif")
+        if os.path.exists(candidate):
+            dem_file_path = candidate
+            print(f"[DEBUG] Using dem_working from PROCESS_ID: {dem_file_path}")
+        else:
+            latest = _find_latest_dem_working()
+            if latest:
+                dem_file_path = latest
+                print(f"[DEBUG] Using latest dem_working (PROCESS_ID missing file): {dem_file_path}")
+    else:
+        latest = _find_latest_dem_working()
+        if latest:
+            dem_file_path = latest
+            print(f"[DEBUG] Using latest dem_working (no PROCESS_ID): {dem_file_path}")
+
     if not os.path.exists(dem_file_path):
         print(f"Error: File '{dem_file_path}' does not exist.")
         sys.exit(1)
 
-    original_file_name = sys.argv[2] if len(sys.argv) > 2 else "Unknown"
-
     try:
         with rasterio.open(dem_file_path) as src:
             dem = src.read(1)
+            transform = src.transform
     except Exception as e:
         print(f"Error opening DEM file: {e}")
         sys.exit(1)
 
     app = QApplication(sys.argv)
-    ex = VolumeAnalysisApp(dem, original_file_name=original_file_name)
+    ex = VolumeAnalysisApp(dem, transform, original_file_name=original_file_name)
     ex.showMaximized()
     sys.exit(app.exec_())
