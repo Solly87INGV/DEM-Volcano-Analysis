@@ -34,6 +34,27 @@ import pdf_generator
 
 def _script_dir():
     return os.path.dirname(os.path.abspath(__file__))
+def _find_latest_dem_working() -> str:
+    """
+    Ritorna il path del dem_working.tif più recente in outputs/*/dem_working.tif.
+    Se non esiste, ritorna stringa vuota.
+    """
+    base = os.path.join(_script_dir(), "outputs")
+    if not os.path.isdir(base):
+        return ""
+
+    newest_path = ""
+    newest_mtime = -1.0
+
+    for name in os.listdir(base):
+        cand = os.path.join(base, name, "dem_working.tif")
+        if os.path.exists(cand):
+            mt = os.path.getmtime(cand)
+            if mt > newest_mtime:
+                newest_mtime = mt
+                newest_path = cand
+
+    return newest_path
 
 def _resolve_process_id() -> str:
     env_id = os.environ.get("PROCESS_ID")
@@ -130,15 +151,40 @@ def find_opposite_base_points(contour):
     base_index2 = tuple(contour[opposite_index])
     return base_index1, base_index2
 
-def distance_between_points(x1, y1, x2, y2):
-    return np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+def _pixel_to_map_xy(transform, row, col):
+    # centro pixel
+    x, y = transform * (col + 0.5, row + 0.5)
+    return float(x), float(y)
 
-def calculate_area(contour, pixel_size):
-    x = contour[:, 1]
-    y = contour[:, 0]
-    area_in_pixels = 0.5 * np.abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
-    area_in_meters = area_in_pixels * (pixel_size ** 2)
-    return area_in_meters
+def distance_between_points(r1, c1, r2, c2, transform):
+    """
+    Distanza in metri tra due punti in coordinate pixel (row/col),
+    usando l'Affine transform del raster.
+    """
+    x1, y1 = _pixel_to_map_xy(transform, r1, c1)
+    x2, y2 = _pixel_to_map_xy(transform, r2, c2)
+    return float(np.hypot(x2 - x1, y2 - y1))
+
+def calculate_area(contour, transform):
+    """
+    Area in m² del contorno (Nx2: [row, col]) usando coordinate mappa (metri)
+    via transform + formula di Shoelace.
+    """
+    contour = np.asarray(contour, dtype=float)
+    if contour.shape[0] < 3:
+        return 0.0
+
+    rows = contour[:, 0]
+    cols = contour[:, 1]
+
+    xs = np.empty(len(contour), dtype=float)
+    ys = np.empty(len(contour), dtype=float)
+
+    for i in range(len(contour)):
+        xs[i], ys[i] = _pixel_to_map_xy(transform, rows[i], cols[i])
+
+    area = 0.5 * np.abs(np.dot(xs, np.roll(ys, -1)) - np.dot(ys, np.roll(xs, -1)))
+    return float(area)
 
 def calculate_slope(matrix):
     dx = sobel(matrix, axis=1)
@@ -171,10 +217,11 @@ def find_opposite_slope_points(slope_matrix, contour):
 # ========== Main App ==========
 
 class VolumeAnalysisApp(QMainWindow):
-    def __init__(self, dem, original_file_name="Unknown"):
+    def __init__(self, dem, transform, original_file_name="Unknown"):
         super().__init__()
         self.setWindowTitle('Elliptical Volcano Volume Analysis')
         self.dem = dem
+        self.transform = transform
 
         # outputs context
         self.process_id = _resolve_process_id()
@@ -306,13 +353,15 @@ class VolumeAnalysisApp(QMainWindow):
 
     def calculate_results(self):
         try:
-            pixel_size = 30  # modificabile
             self.base_contour = find_lowest_base_contour(self.dem, base_elevation_ratio=0.05)
             self.base_point1, self.base_point2 = find_opposite_base_points(self.base_contour)
 
             # Base distances
-            self.distance_pixel_base = distance_between_points(self.base_point1[0], self.base_point1[1], self.base_point2[0], self.base_point2[1])
-            self.distance_meters_base = self.distance_pixel_base * pixel_size
+            self.distance_meters_base = distance_between_points(
+                self.base_point1[0], self.base_point1[1],
+                self.base_point2[0], self.base_point2[1],
+                self.transform
+            )
             self.distance_base_km = self.distance_meters_base * 1e-3
 
             # Caldera
@@ -321,13 +370,16 @@ class VolumeAnalysisApp(QMainWindow):
             self.max_slope_index1, self.max_slope_index2 = find_opposite_slope_points(self.slope, self.caldera_contour)
 
             # Caldera distances
-            self.distance_pixel_caldera = distance_between_points(self.max_slope_index1[0], self.max_slope_index1[1], self.max_slope_index2[0], self.max_slope_index2[1])
-            self.distance_meters_caldera = self.distance_pixel_caldera * pixel_size
+            self.distance_meters_caldera = distance_between_points(
+                self.max_slope_index1[0], self.max_slope_index1[1],
+                self.max_slope_index2[0], self.max_slope_index2[1],
+                self.transform
+            )
             self.distance_caldera_km = self.distance_meters_caldera * 1e-3
 
             # Aree
-            self.area_base = calculate_area(self.base_contour, pixel_size) * 1e-6
-            self.area_caldera = calculate_area(self.caldera_contour, pixel_size) * 1e-6
+            self.area_base = calculate_area(self.base_contour, self.transform) * 1e-6
+            self.area_caldera = calculate_area(self.caldera_contour, self.transform) * 1e-6
 
             # Volumi (ellittico – mantengo il tuo schema originale)
             self.h_max = np.max(self.dem)
@@ -603,27 +655,68 @@ class VolumeAnalysisApp(QMainWindow):
 
 
 # ### Entry Point ###
-
 if __name__ == '__main__':
     if len(sys.argv) < 2:
         print("Usage: python EllipticalVolcano_Approx1.py <dem_file_path> [original_file_name]")
         sys.exit(1)
 
     dem_file_path = sys.argv[1]
+    original_file_name = sys.argv[2] if len(sys.argv) > 2 else "Unknown"
+
+    # ------------------------------------------------------------
+    # FORZA dem_working.tif (metrico) se disponibile
+    # 1) priorità: outputs/<PROCESS_ID>/dem_working.tif
+    # 2) fallback: dem_working.tif più recente in outputs/*
+    # ------------------------------------------------------------
+    base_outputs = os.path.join(_script_dir(), "outputs")
+
+    chosen = None
+
+    pid = os.environ.get("PROCESS_ID")
+    if pid:
+        candidate = os.path.join(base_outputs, pid, "dem_working.tif")
+        if os.path.exists(candidate):
+            chosen = candidate
+            print(f"[DEBUG] Using dem_working from PROCESS_ID: {chosen}")
+
+    if chosen is None and os.path.isdir(base_outputs):
+        candidates = []
+        for name in os.listdir(base_outputs):
+            p = os.path.join(base_outputs, name, "dem_working.tif")
+            if os.path.exists(p):
+                candidates.append(p)
+        if candidates:
+            candidates.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+            chosen = candidates[0]
+            print(f"[DEBUG] Using most recent dem_working: {chosen}")
+
+    if chosen is not None:
+        dem_file_path = chosen
+    else:
+        print("[ERROR] dem_working.tif not found in outputs/. "
+              "This module would run on the original DEM (often geographic) and produce 0.00 values. "
+              "Run standardization first or pass dem_working.tif explicitly.")
+        sys.exit(1)
+
     if not os.path.exists(dem_file_path):
         print(f"Error: File '{dem_file_path}' does not exist.")
         sys.exit(1)
 
-    original_file_name = sys.argv[2] if len(sys.argv) > 2 else "Unknown"
-
     try:
         with rasterio.open(dem_file_path) as src:
             dem = src.read(1)
+            transform = src.transform
+            crs = src.crs
+            if (crs is None) or crs.is_geographic:
+                print(f"[ERROR] DEM CRS is not metric (CRS={crs}). "
+                      f"Refusing to compute because results would collapse to ~0.")
+                sys.exit(1)
     except Exception as e:
         print(f"Error opening DEM file: {e}")
         sys.exit(1)
 
     app = QApplication(sys.argv)
-    ex = VolumeAnalysisApp(dem, original_file_name=original_file_name)
+    ex = VolumeAnalysisApp(dem, transform, original_file_name=original_file_name)
     ex.showMaximized()
     sys.exit(app.exec_())
+
