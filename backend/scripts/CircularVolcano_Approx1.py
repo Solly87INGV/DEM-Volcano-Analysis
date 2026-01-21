@@ -11,6 +11,9 @@
 
 import sys
 import os
+import csv
+import datetime
+import math
 
 # ================= PROJ / EPSG FIX (Windows + PostGIS conflicts) =================
 # Se hai PostGIS/PostgreSQL installato, spesso mette in PATH un PROJ diverso.
@@ -211,6 +214,84 @@ def ensure_metric_dem(dem_path: str) -> str:
 
 def _script_dir():
     return os.path.dirname(os.path.abspath(__file__))
+def _resolve_process_id() -> str:
+    pid = os.environ.get("PROCESS_ID")
+    return pid if pid else f"local_{int(datetime.datetime.utcnow().timestamp())}"
+
+def _ensure_outputs_dir(process_id: str) -> str:
+    out_dir = os.path.join(_script_dir(), "outputs", process_id)
+    os.makedirs(out_dir, exist_ok=True)
+    return out_dir
+
+def _as_serializable(v):
+    # per json (numpy -> python)
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (np.floating,)):
+        return float(v)
+    if isinstance(v, (np.ndarray,)):
+        return v.tolist()
+    if isinstance(v, (tuple, list)):
+        return [ _as_serializable(x) for x in v ]
+    if isinstance(v, dict):
+        return {k: _as_serializable(val) for k, val in v.items()}
+    return v
+
+def flatten_to_kv(metrics: dict, parent_key: str = "") -> list:
+    """
+    Converte un dict annidato in lista di tuple (key_path, value) per CSV verticale.
+    Esempio chiave: "morphometrics.A_base_km2"
+    """
+    rows = []
+
+    def _walk(obj, prefix=""):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                _walk(v, f"{prefix}.{k}" if prefix else str(k))
+        elif isinstance(obj, list):
+            # liste: serializza come JSON string per compatibilità Excel
+            rows.append((prefix, json.dumps(obj, ensure_ascii=False)))
+        else:
+            rows.append((prefix, obj))
+
+    _walk(metrics, parent_key)
+    return rows
+
+def contour_perimeter_m(contour, transform) -> float:
+    """
+    Perimetro in metri del contorno (Nx2 row/col) proiettandolo in coordinate mappa via transform.
+    """
+    c = np.asarray(contour, dtype=float)
+    if c.shape[0] < 2:
+        return 0.0
+
+    # converti tutti i punti in XY (centro pixel)
+    rows = c[:, 0]
+    cols = c[:, 1]
+    xs = np.empty(len(c), dtype=float)
+    ys = np.empty(len(c), dtype=float)
+    for i in range(len(c)):
+        xs[i], ys[i] = _pixel_to_map_xy(transform, rows[i], cols[i])
+
+    # chiudi il poligono
+    dx = np.diff(np.r_[xs, xs[0]])
+    dy = np.diff(np.r_[ys, ys[0]])
+    return float(np.sum(np.hypot(dx, dy)))
+
+def dem_nodata_stats(dem, nodata=None):
+    arr = dem.astype(float)
+    finite = np.isfinite(arr)
+    if nodata is not None:
+        finite = finite & (arr != float(nodata))
+    valid = arr[finite]
+    return {
+        "valid_count": int(valid.size),
+        "total_count": int(arr.size),
+        "valid_min": float(np.min(valid)) if valid.size else None,
+        "valid_max": float(np.max(valid)) if valid.size else None,
+        "valid_p02": float(np.percentile(valid, 2)) if valid.size else None,
+        "valid_p98": float(np.percentile(valid, 98)) if valid.size else None,
+    }
 
 def _find_manifest():
     """
@@ -278,18 +359,73 @@ def _remove_triplets(paths):
     """Rimuove ogni triplet_*.png dalla lista."""
     return [p for p in paths if "triplet_" not in os.path.basename(p).lower()]
 
+HUMAN_FIELDS = [
+    ("meta.timestamp_utc", "Run timestamp (UTC)"),
+    ("meta.process_id", "Run ID (process_id)"),
+    ("meta.input_dem_path", "Input DEM path"),
+    ("meta.working_dem_path", "Working DEM path"),
+    ("meta.crs", "Working DEM CRS (EPSG)"),
+    ("meta.res", "Pixel resolution (m) [x,y]"),
+    ("morphometrics.A_base_m2", "Base area (m²)"),
+    ("morphometrics.A_base_km2", "Base area (km²)"),
+    ("morphometrics.P_base_m", "Base perimeter (m)"),
+    ("morphometrics.D_base_m", "Base diameter (m)"),
+    ("morphometrics.D_base_km", "Base diameter (km)"),
+    ("morphometrics.R_eq_base_m", "Equivalent base radius (m)"),
+    ("morphometrics.A_caldera_m2", "Caldera area (m²)"),
+    ("morphometrics.A_caldera_km2", "Caldera area (km²)"),
+    ("morphometrics.P_caldera_m", "Caldera perimeter (m)"),
+    ("morphometrics.D_caldera_m", "Caldera diameter (m)"),
+    ("morphometrics.D_caldera_km", "Caldera diameter (km)"),
+    ("morphometrics.R_eq_caldera_m", "Equivalent caldera radius (m)"),
+    ("morphometrics.h_max_m", "Maximum elevation in DEM (m)"),
+    ("volumes.V_total_km3", "Total edifice volume (km³)"),
+    ("volumes.V_caldera_km3", "Caldera volume (km³)"),
+    ("volumes.V_effective_km3", "Effective edifice volume (km³)"),
+    ("volumes.V_total_m3", "Total edifice volume (m³)"),
+    ("volumes.V_caldera_m3", "Caldera volume (m³)"),
+    ("volumes.V_effective_m3", "Effective edifice volume (m³)"),
+]
+
+def _get_by_path(d: dict, path: str):
+    cur = d
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+def metrics_to_human_rows(metrics: dict):
+    rows = []
+    for path, label in HUMAN_FIELDS:
+        v = _get_by_path(metrics, path)
+        if isinstance(v, (list, dict)):
+            v = json.dumps(v, ensure_ascii=False)
+        rows.append((label, v))
+    return rows
 
 # ———————— App principale ——————————
 class VolumeAnalysisApp(QMainWindow):
-    def __init__(self, dem, transform):
+    def __init__(self, dem, transform, meta=None):
         super().__init__()
         self.setWindowTitle('Volcano Volume Analysis')
         self.dem = dem
-        self.transform = transform  # <-- SALVATO QUI
-        self.calculate_results()  # calcoli prima della UI
+        self.transform = transform
+        self.meta = meta or {}
+
+        # output dir “per-run”
+        self.process_id = self.meta.get("process_id") or _resolve_process_id()
+        self.out_dir = _ensure_outputs_dir(self.process_id)
+
+        self.calculate_results()
         self.initUI()
 
-        
+        # salva SEMPRE (silenzioso) json+csv per QA/ML
+        try:
+            self._write_metrics_files()
+        except Exception as e:
+            print(f"[WARN] metrics export failed: {e}")
+
     def initUI(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -314,9 +450,14 @@ class VolumeAnalysisApp(QMainWindow):
         self.download_image_button.setFixedSize(200, 50)
         self.download_image_button.clicked.connect(self.download_graph_image)
         button_layout.addWidget(self.download_image_button)
-        
+
+        self.export_metrics_button = QPushButton('Export Metrics (JSON + CSV)')
+        self.export_metrics_button.setFixedSize(220, 50)
+        self.export_metrics_button.clicked.connect(self.export_metrics)
+        button_layout.addWidget(self.export_metrics_button)
+
         self.update_display()
-        
+
     def calculate_results(self):
         try:
             # Calculate results and store for later use
@@ -327,38 +468,67 @@ class VolumeAnalysisApp(QMainWindow):
             self.caldera_contour = find_caldera_contour(self.dem, level_ratio=0.8)
             self.max_slope_index1, self.max_slope_index2 = find_opposite_slope_points(self.slope, self.caldera_contour)
 
-            # Calculate base distances (METRI via transform)
+            # -------------------------
+            # Distances (METERS via transform)
+            # -------------------------
             pA1, pA2 = self.base_point1[0], self.base_point1[1]  # row, col
             pB1, pB2 = self.base_point2[0], self.base_point2[1]  # row, col
             distance_meters_base = distance_between_points(pA1, pA2, pB1, pB2, self.transform)
             distance_base_km = distance_meters_base * 1e-3  # km
 
-
-            # Calculate caldera distances (METRI via transform)
             pA1_slope, pA2_slope = self.max_slope_index1[0], self.max_slope_index1[1]  # row, col
             pB1_slope, pB2_slope = self.max_slope_index2[0], self.max_slope_index2[1]  # row, col
-            distance_meters_caldera = distance_between_points(pA1_slope, pA2_slope, pB1_slope, pB2_slope, self.transform)
+            distance_meters_caldera = distance_between_points(
+                pA1_slope, pA2_slope,
+                pB1_slope, pB2_slope,
+                self.transform
+            )
             distance_caldera_km = distance_meters_caldera * 1e-3  # km
 
+            # Salva come attributi (servono per metrics export)
+            self.distance_meters_base = float(distance_meters_base)
+            self.distance_base_km = float(distance_base_km)
+            self.distance_meters_caldera = float(distance_meters_caldera)
+            self.distance_caldera_km = float(distance_caldera_km)
 
-            # Calculate areas (m² via transform -> km²)
+            # -------------------------
+            # Areas (m² via transform -> km²)
+            # -------------------------
             area_base = calculate_area(self.base_contour, self.transform) * 1e-6
             area_caldera = calculate_area(self.caldera_contour, self.transform) * 1e-6
 
+            self.area_base_km2 = float(area_base)
+            self.area_caldera_km2 = float(area_caldera)
 
-            # Calculate volumes
+            # Perimetri (m) (servono per circularity ecc.)
+            self.perimeter_base_m = float(contour_perimeter_m(self.base_contour, self.transform))
+            self.perimeter_caldera_m = float(contour_perimeter_m(self.caldera_contour, self.transform))
+
+            # -------------------------
+            # Volumes
+            # -------------------------
             h_max = np.max(self.dem)
-            R1 = distance_meters_base / 2
-            R2 = distance_meters_caldera / 2
-            v = (1/3) * np.pi * h_max * (R1**2 + R2**2 + R1 * R2)
+            R1 = distance_meters_base / 2.0
+            R2 = distance_meters_caldera / 2.0
+
+            v = (1.0 / 3.0) * np.pi * h_max * (R1**2 + R2**2 + R1 * R2)
             v_km3 = v * 1e-9  # m³ to km³
 
-            r2 = R2 * 1e-3
-            v_caldera = (2/3) * np.pi * (r2**3)
+            r2_km = R2 * 1e-3
+            v_caldera = (2.0 / 3.0) * np.pi * (r2_km**3)
 
-            self.v_volcano = v_km3 - v_caldera
+            self.v_volcano = float(v_km3 - v_caldera)
 
-            # Store results text
+            # Salva attributi per metrics export
+            self.h_max = float(h_max)
+            self.R1 = float(R1)
+            self.R2 = float(R2)
+            self.v_km3 = float(v_km3)
+            self.v_caldera_km3 = float(v_caldera)
+
+            # -------------------------
+            # Results text (immutato: NON aggiungiamo metrics qui)
+            # -------------------------
             self.results_text = (
                 f"Base area of the volcano: {area_base:.2f} km²\n"
                 f"Base width (Distance between opposite points of the base): {distance_base_km:.2f} km\n"
@@ -369,7 +539,6 @@ class VolumeAnalysisApp(QMainWindow):
                 f"Effective volume of the volcanic edifice: {self.v_volcano:.2f} km³"
             )
 
-            # Create a list of results for download
             self.results_list = [
                 f"Base area of the volcano: {area_base:.2f} km²",
                 f"Base width (Distance between opposite points of the base): {distance_base_km:.2f} km",
@@ -380,10 +549,9 @@ class VolumeAnalysisApp(QMainWindow):
                 f"Effective volume of the volcanic edifice: {self.v_volcano:.2f} km³"
             ]
 
-            # Store descriptions in English for the GUI
             self.description_base = (
                 "Base 1: Represents one of the two opposite points along\n"
-                "the base contour of the volcano. It is selected as part of\n" 
+                "the base contour of the volcano. It is selected as part of\n"
                 "the base delimitation process, relying on a specific\n"
                 "elevation threshold calculated from the DEM.\n\n"
                 "Base 2: Represents the point opposite to Base 1 along\n"
@@ -397,13 +565,12 @@ class VolumeAnalysisApp(QMainWindow):
                 "contour with the highest slope, calculated using a\n"
                 "slope map derived from the DEM.\n\n"
                 "Max Slope 2: This is the point on the caldera contour\n"
-                "opposite to Max Slope 1, positioned approximately\n" 
+                "opposite to Max Slope 1, positioned approximately\n"
                 "halfway around the contour."
             )
+
         except Exception as e:
             QMessageBox.critical(self, "Calculation Error", f"An error occurred during calculation: {e}")
-            # Optionally log the error or handle it as needed
-            # print(f"Error during calculation: {e}")
             
     def update_display(self):
         self.figure.clear()
@@ -687,6 +854,199 @@ class VolumeAnalysisApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"An error occurred while saving the graph: {e}")
 
+    def _build_metrics_dict(self) -> dict:
+        # Primitive / metadata
+        crs = self.meta.get("crs")
+        res = self.meta.get("res")
+        nodata = self.meta.get("nodata")
+
+        # aree in m² (ti servono per derivate robuste)
+        A_base_m2 = float(self.area_base_km2) * 1e6
+        A_caldera_m2 = float(self.area_caldera_km2) * 1e6
+
+        P_base = float(getattr(self, "perimeter_base_m", 0.0))
+        P_caldera = float(getattr(self, "perimeter_caldera_m", 0.0))
+
+        D_base = float(self.distance_meters_base)
+        D_caldera = float(self.distance_meters_caldera)
+
+        R_eq_base = math.sqrt(A_base_m2 / math.pi) if A_base_m2 > 0 else 0.0
+        R_eq_caldera = math.sqrt(A_caldera_m2 / math.pi) if A_caldera_m2 > 0 else 0.0
+
+        # volumi in m³
+        V_total_m3 = float(self.v_km3) * 1e9
+        V_caldera_m3 = float(self.v_caldera_km3) * 1e9
+        V_eff_m3 = float(self.v_volcano) * 1e9
+
+        # derivate (rapporti)
+        circularity_base = (4 * math.pi * A_base_m2 / (P_base ** 2)) if (A_base_m2 > 0 and P_base > 0) else None
+        circularity_caldera = (4 * math.pi * A_caldera_m2 / (P_caldera ** 2)) if (A_caldera_m2 > 0 and P_caldera > 0) else None
+
+        slenderness = (float(self.h_max) / D_base) if D_base > 0 else None
+        sanity_A_over_D2 = (A_base_m2 / (D_base ** 2)) if D_base > 0 else None
+
+        eq_height_V_over_A = (V_total_m3 / A_base_m2) if A_base_m2 > 0 else None
+        cone_ratio = (V_total_m3 / ((1.0/3.0) * A_base_m2 * float(self.h_max))) if (A_base_m2 > 0 and self.h_max > 0) else None
+
+        metrics = {
+            "meta": {
+                "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
+                "process_id": self.process_id,
+                "input_dem_path": self.meta.get("input_dem_path"),
+                "working_dem_path": self.meta.get("working_dem_path"),
+                "crs": str(crs) if crs is not None else None,
+                "res": list(res) if res is not None else None,
+                "nodata": nodata,
+                "params": {
+                    "base_elevation_ratio": 0.05,
+                    "caldera_level_ratio": 0.8
+                }
+            },
+            "nodata_stats": dem_nodata_stats(self.dem, nodata=nodata),
+            "morphometrics": {
+                "A_base_m2": A_base_m2,
+                "A_base_km2": float(self.area_base_km2),
+                "P_base_m": P_base,
+                "D_base_m": D_base,
+                "D_base_km": float(self.distance_base_km),
+                "R_eq_base_m": R_eq_base,
+
+                "A_caldera_m2": A_caldera_m2,
+                "A_caldera_km2": float(self.area_caldera_km2),
+                "P_caldera_m": P_caldera,
+                "D_caldera_m": D_caldera,
+                "D_caldera_km": float(self.distance_caldera_km),
+                "R_eq_caldera_m": R_eq_caldera,
+
+                "h_max_m": float(self.h_max),
+            },
+            "volumes": {
+                "V_total_km3": float(self.v_km3),
+                "V_caldera_km3": float(self.v_caldera_km3),
+                "V_effective_km3": float(self.v_volcano),
+                "V_total_m3": V_total_m3,
+                "V_caldera_m3": V_caldera_m3,
+                "V_effective_m3": V_eff_m3,
+            },
+            "derived": {
+                "slenderness_H_over_Dbase": slenderness,
+                "sanity_Abase_over_Dbase2": sanity_A_over_D2,
+                "circularity_base": circularity_base,
+                "circularity_caldera": circularity_caldera,
+                "eq_height_V_over_Abase_m": eq_height_V_over_A,
+                "ratio_vs_cone": cone_ratio,
+            }
+        }
+        return metrics
+
+    def _flatten_for_csv(self, metrics: dict) -> dict:
+        # una riga piatta; chiavi stabili
+        m = metrics
+        row = {}
+        meta = m.get("meta", {})
+        params = meta.get("params", {})
+        nd = m.get("nodata_stats", {})
+        mm = m.get("morphometrics", {})
+        vv = m.get("volumes", {})
+        dd = m.get("derived", {})
+
+        row.update({
+            "timestamp_utc": meta.get("timestamp_utc"),
+            "process_id": meta.get("process_id"),
+            "input_dem_path": meta.get("input_dem_path"),
+            "working_dem_path": meta.get("working_dem_path"),
+            "crs": meta.get("crs"),
+            "res_x": (meta.get("res")[0] if meta.get("res") else None),
+            "res_y": (meta.get("res")[1] if meta.get("res") else None),
+            "nodata": meta.get("nodata"),
+            "base_elevation_ratio": params.get("base_elevation_ratio"),
+            "caldera_level_ratio": params.get("caldera_level_ratio"),
+
+            "valid_count": nd.get("valid_count"),
+            "total_count": nd.get("total_count"),
+            "valid_min": nd.get("valid_min"),
+            "valid_max": nd.get("valid_max"),
+            "valid_p02": nd.get("valid_p02"),
+            "valid_p98": nd.get("valid_p98"),
+
+            "A_base_km2": mm.get("A_base_km2"),
+            "P_base_m": mm.get("P_base_m"),
+            "D_base_km": mm.get("D_base_km"),
+            "R_eq_base_m": mm.get("R_eq_base_m"),
+
+            "A_caldera_km2": mm.get("A_caldera_km2"),
+            "P_caldera_m": mm.get("P_caldera_m"),
+            "D_caldera_km": mm.get("D_caldera_km"),
+            "R_eq_caldera_m": mm.get("R_eq_caldera_m"),
+
+            "h_max_m": mm.get("h_max_m"),
+
+            "V_total_km3": vv.get("V_total_km3"),
+            "V_caldera_km3": vv.get("V_caldera_km3"),
+            "V_effective_km3": vv.get("V_effective_km3"),
+
+            "slenderness": dd.get("slenderness_H_over_Dbase"),
+            "sanity_A_over_D2": dd.get("sanity_Abase_over_Dbase2"),
+            "circularity_base": dd.get("circularity_base"),
+            "circularity_caldera": dd.get("circularity_caldera"),
+            "eq_height_m": dd.get("eq_height_V_over_Abase_m"),
+            "ratio_vs_cone": dd.get("ratio_vs_cone"),
+        })
+        return row
+
+    def _write_metrics_files(self, out_dir=None):
+        """
+        Scrive SEMPRE:
+        - metrics.json (completo, strutturato)
+        - metrics.csv  (umano, verticale, subset)
+        """
+        out_dir = out_dir or self.out_dir
+        os.makedirs(out_dir, exist_ok=True)
+
+        metrics = self._build_metrics_dict()
+
+        # -----------------
+        # JSON completo
+        # -----------------
+        json_path = os.path.join(out_dir, "metrics.json")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(_as_serializable(metrics), f, indent=2, ensure_ascii=False)
+
+        # -----------------
+        # CSV umano (verticale, subset)
+        # -----------------
+        csv_path = os.path.join(out_dir, "metrics.csv")
+        human_rows = metrics_to_human_rows(metrics)  # usa HUMAN_FIELDS + _get_by_path
+
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["metric", "value"])
+            for label, value in human_rows:
+                w.writerow([label, value])
+
+        print(f"[INFO] metrics written: {json_path}")
+        print(f"[INFO] metrics written: {csv_path}")
+    
+    def export_metrics(self):
+        """
+        Pulsante GUI: esporta nella cartella scelta dall'utente
+        SIA metrics.json (completo) SIA metrics.csv (umano verticale).
+        """
+        out_dir = QFileDialog.getExistingDirectory(self, "Select folder to export metrics")
+        if not out_dir:
+            return
+
+        try:
+            # usa LA STESSA funzione del salvataggio automatico
+            self._write_metrics_files(out_dir=out_dir)
+
+            QMessageBox.information(
+                self,
+                "Success",
+                f"metrics.json + metrics.csv exported to:\n{out_dir}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"An error occurred while exporting metrics: {e}")
 
 # ———————— Main ——————————
 
@@ -695,7 +1055,8 @@ if __name__ == "__main__":
         print("Usage: python CircularVolcano_Approx1.py <dem_file_path>")
         sys.exit(1)
 
-    dem_file_path = sys.argv[1]
+    input_dem_path = sys.argv[1]
+    dem_file_path = input_dem_path
 
     # 1) Prima scelta: usa il dem_working associato all'ultimo manifest disponibile
     outputs_dir, manifest_path = _find_manifest()
@@ -718,17 +1079,25 @@ if __name__ == "__main__":
             transform = src.transform
             crs = src.crs
             res = src.res
+            nodata = src.nodata
+
             print(f"[DEBUG] DEM opened for volume. Path={dem_file_path}")
-            print(f"[DEBUG] CRS={crs}  RES={res}  Transform={transform}")
+            print(f"[DEBUG] CRS={crs}  RES={res}  Transform={transform}  NODATA={nodata}")
     except Exception as e:
         print(f"Error opening DEM file: {e}")
         sys.exit(1)
 
+    # meta per export metrics (NON entra in PDF né in View Results)
+    meta = {
+        "process_id": os.environ.get("PROCESS_ID"),
+        "input_dem_path": input_dem_path,
+        "working_dem_path": dem_file_path,
+        "crs": crs,
+        "res": res,
+        "nodata": nodata
+    }
+
     app = QApplication(sys.argv)
-    ex = VolumeAnalysisApp(dem, transform)
+    ex = VolumeAnalysisApp(dem, transform, meta=meta)
     ex.showMaximized()
     sys.exit(app.exec_())
-
-
-
-

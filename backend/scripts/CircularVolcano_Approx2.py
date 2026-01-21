@@ -309,7 +309,9 @@ class VolumeAnalysisApp(QMainWindow):
             self.area_caldera = calculate_area(self.caldera_contour, self.transform) * 1e-6
 
             # Volumi (Approx2: caldera cilindro h=r)
-            self.h_max = np.max(self.dem)
+            # evita outlier: P99 - P05
+            z = self.dem[np.isfinite(self.dem)]
+            self.h_max = float(np.percentile(z, 99) - np.percentile(z, 5))
             self.R1 = self.distance_meters_base / 2
             self.R2 = self.distance_meters_caldera / 2
             self.v = (1/3) * np.pi * self.h_max * (self.R1**2 + self.R2**2 + self.R1 * self.R2)
