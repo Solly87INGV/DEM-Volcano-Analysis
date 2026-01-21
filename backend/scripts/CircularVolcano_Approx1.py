@@ -59,12 +59,16 @@ import pdf_generator
 # ———————— Funzioni di analisi di base ——————————
 
 def find_lowest_base_contour(matrix, base_elevation_ratio=0.05):
-    base_level = matrix.min() + (matrix.max() - matrix.min()) * base_elevation_ratio
+    """
+    Ritorna: (base_contour, base_level_m)
+    base_level_m è la quota usata per estrarre il contorno base.
+    """
+    base_level = float(matrix.min() + (matrix.max() - matrix.min()) * base_elevation_ratio)
     contours = measure.find_contours(matrix, base_level)
     if len(contours) == 0:
         raise ValueError("No contours found for the given base elevation ratio.")
     base_contour = max(contours, key=len)
-    return base_contour
+    return base_contour, base_level
 
 def find_opposite_base_points(contour):
     contour = np.round(contour).astype(int)
@@ -81,12 +85,16 @@ def calculate_slope(matrix):
     return slope
 
 def find_caldera_contour(matrix, level_ratio=0.8):
-    contour_level = matrix.max() * level_ratio
+    """
+    Ritorna: (caldera_contour, caldera_level_m)
+    caldera_level_m è la quota usata per estrarre il contorno caldera.
+    """
+    contour_level = float(matrix.max() * level_ratio)
     contours = measure.find_contours(matrix, contour_level)
     if len(contours) == 0:
         raise ValueError("No contours found for the given level ratio.")
     main_contour = max(contours, key=len)
-    return main_contour
+    return main_contour, contour_level
 
 def find_opposite_slope_points(slope_matrix, contour):
     contour = np.round(contour).astype(int)
@@ -214,6 +222,7 @@ def ensure_metric_dem(dem_path: str) -> str:
 
 def _script_dir():
     return os.path.dirname(os.path.abspath(__file__))
+
 def _resolve_process_id() -> str:
     pid = os.environ.get("PROCESS_ID")
     return pid if pid else f"local_{int(datetime.datetime.utcnow().timestamp())}"
@@ -240,7 +249,7 @@ def _as_serializable(v):
 def flatten_to_kv(metrics: dict, parent_key: str = "") -> list:
     """
     Converte un dict annidato in lista di tuple (key_path, value) per CSV verticale.
-    Esempio chiave: "morphometrics.A_base_km2"
+    Esempio chiave: "morphometrics.A_base_m2"
     """
     rows = []
 
@@ -359,32 +368,58 @@ def _remove_triplets(paths):
     """Rimuove ogni triplet_*.png dalla lista."""
     return [p for p in paths if "triplet_" not in os.path.basename(p).lower()]
 
+# =========================
+# CSV "umano" (verticale)
+# - NO duplicati km/km²/km³
+# - include parametri geometrici usati nei volumi
+# =========================
 HUMAN_FIELDS = [
     ("meta.timestamp_utc", "Run timestamp (UTC)"),
     ("meta.process_id", "Run ID (process_id)"),
     ("meta.input_dem_path", "Input DEM path"),
     ("meta.working_dem_path", "Working DEM path"),
-    ("meta.crs", "Working DEM CRS (EPSG)"),
+    ("meta.crs", "Working DEM CRS (EPSG/WKT)"),
     ("meta.res", "Pixel resolution (m) [x,y]"),
+    ("meta.nodata", "NoData value"),
+
+    # --- Morphometrics (Base) ---
     ("morphometrics.A_base_m2", "Base area (m²)"),
-    ("morphometrics.A_base_km2", "Base area (km²)"),
     ("morphometrics.P_base_m", "Base perimeter (m)"),
-    ("morphometrics.D_base_m", "Base diameter (m)"),
-    ("morphometrics.D_base_km", "Base diameter (km)"),
-    ("morphometrics.R_eq_base_m", "Equivalent base radius (m)"),
+    ("morphometrics.D_base_m", "Base diameter (m) [opposite points]"),
+    ("morphometrics.R_base_m", "Base radius used in volume (m)"),
+    ("morphometrics.R_eq_base_m", "Equivalent base radius from area (m)"),
+
+    # --- Morphometrics (Caldera) ---
     ("morphometrics.A_caldera_m2", "Caldera area (m²)"),
-    ("morphometrics.A_caldera_km2", "Caldera area (km²)"),
     ("morphometrics.P_caldera_m", "Caldera perimeter (m)"),
-    ("morphometrics.D_caldera_m", "Caldera diameter (m)"),
-    ("morphometrics.D_caldera_km", "Caldera diameter (km)"),
-    ("morphometrics.R_eq_caldera_m", "Equivalent caldera radius (m)"),
-    ("morphometrics.h_max_m", "Maximum elevation in DEM (m)"),
-    ("volumes.V_total_km3", "Total edifice volume (km³)"),
-    ("volumes.V_caldera_km3", "Caldera volume (km³)"),
-    ("volumes.V_effective_km3", "Effective edifice volume (km³)"),
+    ("morphometrics.D_caldera_m", "Caldera diameter (m) [opposite points]"),
+    ("morphometrics.R_caldera_m", "Caldera radius used in volume (m)"),
+    ("morphometrics.R_eq_caldera_m", "Equivalent caldera radius from area (m)"),
+
+    # --- Height used by the model ---
+    ("morphometrics.h_max_m", "Height used by model (m)"),
+
+    # --- Geometry thresholds (if present in metrics) ---
+    ("geometry.base_level_m", "Base contour level used (m)"),
+    ("geometry.caldera_level_m", "Caldera contour level used (m)"),
+
+    # --- Model descriptors (if present in metrics) ---
+    ("volume_model.edifice_model", "Edifice volume model"),
+    ("volume_model.caldera_model", "Caldera volume model"),
+    ("volume_model.intermediate.V_frustum_m3", "Intermediate frustum-like volume (m³)"),
+
+    # --- Volumes ---
     ("volumes.V_total_m3", "Total edifice volume (m³)"),
     ("volumes.V_caldera_m3", "Caldera volume (m³)"),
     ("volumes.V_effective_m3", "Effective edifice volume (m³)"),
+
+    # --- Derived ---
+    ("derived.slenderness_H_over_Dbase", "Slenderness H/Dbase (unitless)"),
+    ("derived.sanity_Abase_over_Dbase2", "Sanity Abase/Dbase² (unitless)"),
+    ("derived.circularity_base", "Circularity base (unitless)"),
+    ("derived.circularity_caldera", "Circularity caldera (unitless)"),
+    ("derived.eq_height_V_over_Abase_m", "Equivalent height V/Abase (m)"),
+    ("derived.ratio_vs_cone", "Ratio vs perfect cone (unitless)"),
 ]
 
 def _get_by_path(d: dict, path: str):
@@ -403,6 +438,7 @@ def metrics_to_human_rows(metrics: dict):
             v = json.dumps(v, ensure_ascii=False)
         rows.append((label, v))
     return rows
+
 
 # ———————— App principale ——————————
 class VolumeAnalysisApp(QMainWindow):
@@ -461,11 +497,11 @@ class VolumeAnalysisApp(QMainWindow):
     def calculate_results(self):
         try:
             # Calculate results and store for later use
-            self.base_contour = find_lowest_base_contour(self.dem, base_elevation_ratio=0.05)
+            self.base_contour, self.base_level_m = find_lowest_base_contour(self.dem, base_elevation_ratio=0.05)
             self.base_point1, self.base_point2 = find_opposite_base_points(self.base_contour)
 
             self.slope = calculate_slope(self.dem)
-            self.caldera_contour = find_caldera_contour(self.dem, level_ratio=0.8)
+            self.caldera_contour, self.caldera_level_m = find_caldera_contour(self.dem, level_ratio=0.8)
             self.max_slope_index1, self.max_slope_index2 = find_opposite_slope_points(self.slope, self.caldera_contour)
 
             # -------------------------
@@ -474,7 +510,6 @@ class VolumeAnalysisApp(QMainWindow):
             pA1, pA2 = self.base_point1[0], self.base_point1[1]  # row, col
             pB1, pB2 = self.base_point2[0], self.base_point2[1]  # row, col
             distance_meters_base = distance_between_points(pA1, pA2, pB1, pB2, self.transform)
-            distance_base_km = distance_meters_base * 1e-3  # km
 
             pA1_slope, pA2_slope = self.max_slope_index1[0], self.max_slope_index1[1]  # row, col
             pB1_slope, pB2_slope = self.max_slope_index2[0], self.max_slope_index2[1]  # row, col
@@ -483,70 +518,88 @@ class VolumeAnalysisApp(QMainWindow):
                 pB1_slope, pB2_slope,
                 self.transform
             )
-            distance_caldera_km = distance_meters_caldera * 1e-3  # km
 
             # Salva come attributi (servono per metrics export)
             self.distance_meters_base = float(distance_meters_base)
-            self.distance_base_km = float(distance_base_km)
             self.distance_meters_caldera = float(distance_meters_caldera)
+
+            # Per GUI (km)
+            distance_base_km = distance_meters_base * 1e-3
+            distance_caldera_km = distance_meters_caldera * 1e-3
+            self.distance_base_km = float(distance_base_km)
             self.distance_caldera_km = float(distance_caldera_km)
 
             # -------------------------
-            # Areas (m² via transform -> km²)
+            # Areas (m² via transform)
             # -------------------------
-            area_base = calculate_area(self.base_contour, self.transform) * 1e-6
-            area_caldera = calculate_area(self.caldera_contour, self.transform) * 1e-6
+            A_base_m2 = calculate_area(self.base_contour, self.transform)
+            A_caldera_m2 = calculate_area(self.caldera_contour, self.transform)
 
-            self.area_base_km2 = float(area_base)
-            self.area_caldera_km2 = float(area_caldera)
+            self.area_base_m2 = float(A_base_m2)
+            self.area_caldera_m2 = float(A_caldera_m2)
+
+            # Per GUI (km²)
+            area_base_km2 = A_base_m2 * 1e-6
+            area_caldera_km2 = A_caldera_m2 * 1e-6
 
             # Perimetri (m) (servono per circularity ecc.)
             self.perimeter_base_m = float(contour_perimeter_m(self.base_contour, self.transform))
             self.perimeter_caldera_m = float(contour_perimeter_m(self.caldera_contour, self.transform))
 
             # -------------------------
-            # Volumes
+            # Volumes (SI: m³) + conversione per GUI
             # -------------------------
-            h_max = np.max(self.dem)
-            R1 = distance_meters_base / 2.0
-            R2 = distance_meters_caldera / 2.0
+            h_max = float(np.max(self.dem))
+            R1 = float(distance_meters_base / 2.0)      # base radius used
+            R2 = float(distance_meters_caldera / 2.0)   # caldera radius used
 
-            v = (1.0 / 3.0) * np.pi * h_max * (R1**2 + R2**2 + R1 * R2)
-            v_km3 = v * 1e-9  # m³ to km³
+            # Edifice model (your current "frustum-like" formulation)
+            V_frustum_m3 = (1.0 / 3.0) * np.pi * h_max * (R1**2 + R2**2 + R1 * R2)
 
-            r2_km = R2 * 1e-3
-            v_caldera = (2.0 / 3.0) * np.pi * (r2_km**3)
+            # Caldera model (your current code): hemisphere
+            V_caldera_m3 = (2.0 / 3.0) * np.pi * (R2**3)
 
-            self.v_volcano = float(v_km3 - v_caldera)
+            V_effective_m3 = V_frustum_m3 - V_caldera_m3
 
-            # Salva attributi per metrics export
+            # Salva attributi SI per metrics export
             self.h_max = float(h_max)
             self.R1 = float(R1)
             self.R2 = float(R2)
+            self.V_frustum_m3 = float(V_frustum_m3)
+            self.V_caldera_m3 = float(V_caldera_m3)
+            self.V_effective_m3 = float(V_effective_m3)
+
+            # Conversione per GUI (km³)
+            v_km3 = V_frustum_m3 * 1e-9
+            v_caldera_km3 = V_caldera_m3 * 1e-9
+            v_eff_km3 = V_effective_m3 * 1e-9
+
+            # Mantieni i nomi storici usati nella GUI
             self.v_km3 = float(v_km3)
-            self.v_caldera_km3 = float(v_caldera)
+            self.v_caldera_km3 = float(v_caldera_km3)
+            self.v_volcano = float(v_eff_km3)
 
             # -------------------------
-            # Results text (immutato: NON aggiungiamo metrics qui)
+            # Results text (immutato come output: km, km², km³)
             # -------------------------
             self.results_text = (
-                f"Base area of the volcano: {area_base:.2f} km²\n"
+                f"Base area of the volcano: {area_base_km2:.2f} km²\n"
                 f"Base width (Distance between opposite points of the base): {distance_base_km:.2f} km\n"
-                f"Caldera area of the volcano: {area_caldera:.2f} km²\n"
+                f"Caldera area of the volcano: {area_caldera_km2:.2f} km²\n"
                 f"Caldera width (Distance between opposite points of the caldera): {distance_caldera_km:.2f} km\n"
                 f"Total volume of the volcanic edifice: {v_km3:.2f} km³\n"
-                f"Caldera volume: {v_caldera:.2f} km³\n"
-                f"Effective volume of the volcanic edifice: {self.v_volcano:.2f} km³"
+                f"Caldera volume: {v_caldera_km3:.2f} km³\n"
+                f"Effective volume of the volcanic edifice: {v_eff_km3:.2f} km³"
             )
 
             self.results_list = [
-                f"Base area of the volcano: {area_base:.2f} km²",
+                f"Base area of the volcano: {area_base_km2:.2f} km²",
                 f"Base width (Distance between opposite points of the base): {distance_base_km:.2f} km",
-                f"Caldera area of the volcano: {area_caldera:.2f} km²",
+                f"Caldera area of the volcano: {area_caldera_km2:.2f} km²",
                 f"Caldera width (Distance between opposite points of the caldera): {distance_caldera_km:.2f} km",
                 f"Total volume of the volcanic edifice: {v_km3:.2f} km³",
-                f"Caldera volume: {v_caldera:.2f} km³",
-                f"Effective volume of the volcanic edifice: {self.v_volcano:.2f} km³"
+                f"Caldera volume: {v_caldera_km3:.2f} km³",
+                f"Effective volume of the volcanic edifice: {v_eff_km3:.2f} km³"
             ]
 
             self.description_base = (
@@ -571,7 +624,7 @@ class VolumeAnalysisApp(QMainWindow):
 
         except Exception as e:
             QMessageBox.critical(self, "Calculation Error", f"An error occurred during calculation: {e}")
-            
+
     def update_display(self):
         self.figure.clear()
         fig = self.figure
@@ -748,7 +801,6 @@ class VolumeAnalysisApp(QMainWindow):
         if not os.path.exists(out_path):
             raise RuntimeError(f"Doublet not saved: {out_path}")
 
-
     def show_results(self):
         msg_box = QMessageBox()
         msg_box.setWindowTitle("Summary Results")
@@ -847,7 +899,7 @@ class VolumeAnalysisApp(QMainWindow):
             fmt = 'png'
             if not file_path.lower().endswith('.png'):
                 file_path += '.png'
-        
+
         try:
             self.figure.savefig(file_path, format=fmt)
             QMessageBox.information(self, "Success", f"Graph successfully saved as {fmt.upper()} to {file_path}")
@@ -860,33 +912,63 @@ class VolumeAnalysisApp(QMainWindow):
         res = self.meta.get("res")
         nodata = self.meta.get("nodata")
 
-        # aree in m² (ti servono per derivate robuste)
-        A_base_m2 = float(self.area_base_km2) * 1e6
-        A_caldera_m2 = float(self.area_caldera_km2) * 1e6
+        # --- SI-only morphometrics ---
+        A_base_m2 = float(getattr(self, "area_base_m2", 0.0))
+        A_caldera_m2 = float(getattr(self, "area_caldera_m2", 0.0))
 
         P_base = float(getattr(self, "perimeter_base_m", 0.0))
         P_caldera = float(getattr(self, "perimeter_caldera_m", 0.0))
 
-        D_base = float(self.distance_meters_base)
-        D_caldera = float(self.distance_meters_caldera)
+        D_base = float(getattr(self, "distance_meters_base", 0.0))
+        D_caldera = float(getattr(self, "distance_meters_caldera", 0.0))
 
+        # R used in volume
+        R_base = float(getattr(self, "R1", 0.0))
+        R_caldera = float(getattr(self, "R2", 0.0))
+
+        # Equivalent radii from area (not duplicates: they are derived from area)
         R_eq_base = math.sqrt(A_base_m2 / math.pi) if A_base_m2 > 0 else 0.0
         R_eq_caldera = math.sqrt(A_caldera_m2 / math.pi) if A_caldera_m2 > 0 else 0.0
 
-        # volumi in m³
-        V_total_m3 = float(self.v_km3) * 1e9
-        V_caldera_m3 = float(self.v_caldera_km3) * 1e9
-        V_eff_m3 = float(self.v_volcano) * 1e9
+        # Volumes (m³) and model inputs
+        h_max = float(getattr(self, "h_max", 0.0))
+        V_frustum_m3 = float(getattr(self, "V_frustum_m3", 0.0))
+        V_caldera_m3 = float(getattr(self, "V_caldera_m3", 0.0))
+        V_eff_m3 = float(getattr(self, "V_effective_m3", 0.0))
 
-        # derivate (rapporti)
+        # Derivate (rapporti)
         circularity_base = (4 * math.pi * A_base_m2 / (P_base ** 2)) if (A_base_m2 > 0 and P_base > 0) else None
         circularity_caldera = (4 * math.pi * A_caldera_m2 / (P_caldera ** 2)) if (A_caldera_m2 > 0 and P_caldera > 0) else None
 
-        slenderness = (float(self.h_max) / D_base) if D_base > 0 else None
+        slenderness = (h_max / D_base) if D_base > 0 else None
         sanity_A_over_D2 = (A_base_m2 / (D_base ** 2)) if D_base > 0 else None
 
-        eq_height_V_over_A = (V_total_m3 / A_base_m2) if A_base_m2 > 0 else None
-        cone_ratio = (V_total_m3 / ((1.0/3.0) * A_base_m2 * float(self.h_max))) if (A_base_m2 > 0 and self.h_max > 0) else None
+        eq_height_V_over_A = (V_frustum_m3 / A_base_m2) if A_base_m2 > 0 else None
+
+        # Ratio vs perfect cone volume using Abase and h (cone would be (1/3)*Abase*h)
+        denom_cone = (1.0/3.0) * A_base_m2 * h_max
+        cone_ratio = (V_frustum_m3 / denom_cone) if (denom_cone and denom_cone > 0) else None
+
+        # Geometry levels + points (replicability)
+        base_level_m = getattr(self, "base_level_m", None)
+        caldera_level_m = getattr(self, "caldera_level_m", None)
+
+        # points in rc and xy
+        try:
+            base_p1_rc = [int(self.base_point1[0]), int(self.base_point1[1])]
+            base_p2_rc = [int(self.base_point2[0]), int(self.base_point2[1])]
+            base_p1_xy = list(_pixel_to_map_xy(self.transform, self.base_point1[0], self.base_point1[1]))
+            base_p2_xy = list(_pixel_to_map_xy(self.transform, self.base_point2[0], self.base_point2[1]))
+        except Exception:
+            base_p1_rc, base_p2_rc, base_p1_xy, base_p2_xy = None, None, None, None
+
+        try:
+            cal_p1_rc = [int(self.max_slope_index1[0]), int(self.max_slope_index1[1])]
+            cal_p2_rc = [int(self.max_slope_index2[0]), int(self.max_slope_index2[1])]
+            cal_p1_xy = list(_pixel_to_map_xy(self.transform, self.max_slope_index1[0], self.max_slope_index1[1]))
+            cal_p2_xy = list(_pixel_to_map_xy(self.transform, self.max_slope_index2[0], self.max_slope_index2[1]))
+        except Exception:
+            cal_p1_rc, cal_p2_rc, cal_p1_xy, cal_p2_xy = None, None, None, None
 
         metrics = {
             "meta": {
@@ -903,31 +985,58 @@ class VolumeAnalysisApp(QMainWindow):
                 }
             },
             "nodata_stats": dem_nodata_stats(self.dem, nodata=nodata),
+
             "morphometrics": {
                 "A_base_m2": A_base_m2,
-                "A_base_km2": float(self.area_base_km2),
                 "P_base_m": P_base,
                 "D_base_m": D_base,
-                "D_base_km": float(self.distance_base_km),
+                "R_base_m": R_base,
                 "R_eq_base_m": R_eq_base,
 
                 "A_caldera_m2": A_caldera_m2,
-                "A_caldera_km2": float(self.area_caldera_km2),
                 "P_caldera_m": P_caldera,
                 "D_caldera_m": D_caldera,
-                "D_caldera_km": float(self.distance_caldera_km),
+                "R_caldera_m": R_caldera,
                 "R_eq_caldera_m": R_eq_caldera,
 
-                "h_max_m": float(self.h_max),
+                "h_max_m": h_max,
             },
+
+            "volume_model": {
+                "edifice_model": "frustum_like",
+                "caldera_model": "hemisphere",
+                "inputs_used": {
+                    "h_max_m": h_max,
+                    "R_base_m": R_base,
+                    "R_caldera_m": R_caldera,
+                },
+                "intermediate": {
+                    "V_frustum_m3": V_frustum_m3
+                }
+            },
+
             "volumes": {
-                "V_total_km3": float(self.v_km3),
-                "V_caldera_km3": float(self.v_caldera_km3),
-                "V_effective_km3": float(self.v_volcano),
-                "V_total_m3": V_total_m3,
                 "V_caldera_m3": V_caldera_m3,
                 "V_effective_m3": V_eff_m3,
             },
+
+            "geometry": {
+                "base_level_m": float(base_level_m) if base_level_m is not None else None,
+                "caldera_level_m": float(caldera_level_m) if caldera_level_m is not None else None,
+                "base_points": {
+                    "p1_rc": base_p1_rc,
+                    "p2_rc": base_p2_rc,
+                    "p1_xy": base_p1_xy,
+                    "p2_xy": base_p2_xy,
+                },
+                "caldera_points": {
+                    "p1_rc": cal_p1_rc,
+                    "p2_rc": cal_p2_rc,
+                    "p1_xy": cal_p1_xy,
+                    "p2_xy": cal_p2_xy,
+                }
+            },
+
             "derived": {
                 "slenderness_H_over_Dbase": slenderness,
                 "sanity_Abase_over_Dbase2": sanity_A_over_D2,
@@ -940,15 +1049,17 @@ class VolumeAnalysisApp(QMainWindow):
         return metrics
 
     def _flatten_for_csv(self, metrics: dict) -> dict:
-        # una riga piatta; chiavi stabili
+        # una riga piatta; chiavi stabili (non usata nel flusso attuale, ma lasciata per compatibilità)
         m = metrics
         row = {}
         meta = m.get("meta", {})
         params = meta.get("params", {})
         nd = m.get("nodata_stats", {})
         mm = m.get("morphometrics", {})
+        vm = m.get("volume_model", {})
         vv = m.get("volumes", {})
         dd = m.get("derived", {})
+        gg = m.get("geometry", {})
 
         row.update({
             "timestamp_utc": meta.get("timestamp_utc"),
@@ -969,21 +1080,28 @@ class VolumeAnalysisApp(QMainWindow):
             "valid_p02": nd.get("valid_p02"),
             "valid_p98": nd.get("valid_p98"),
 
-            "A_base_km2": mm.get("A_base_km2"),
+            "A_base_m2": mm.get("A_base_m2"),
             "P_base_m": mm.get("P_base_m"),
-            "D_base_km": mm.get("D_base_km"),
+            "D_base_m": mm.get("D_base_m"),
+            "R_base_m": mm.get("R_base_m"),
             "R_eq_base_m": mm.get("R_eq_base_m"),
 
-            "A_caldera_km2": mm.get("A_caldera_km2"),
+            "A_caldera_m2": mm.get("A_caldera_m2"),
             "P_caldera_m": mm.get("P_caldera_m"),
-            "D_caldera_km": mm.get("D_caldera_km"),
+            "D_caldera_m": mm.get("D_caldera_m"),
+            "R_caldera_m": mm.get("R_caldera_m"),
             "R_eq_caldera_m": mm.get("R_eq_caldera_m"),
 
             "h_max_m": mm.get("h_max_m"),
 
-            "V_total_km3": vv.get("V_total_km3"),
-            "V_caldera_km3": vv.get("V_caldera_km3"),
-            "V_effective_km3": vv.get("V_effective_km3"),
+            "base_level_m": gg.get("base_level_m"),
+            "caldera_level_m": gg.get("caldera_level_m"),
+
+            "edifice_model": vm.get("edifice_model"),
+            "caldera_model": vm.get("caldera_model"),
+            "V_frustum_m3": (vm.get("intermediate", {}) or {}).get("V_frustum_m3"),
+            "V_caldera_m3": vv.get("V_caldera_m3"),
+            "V_effective_m3": vv.get("V_effective_m3"),
 
             "slenderness": dd.get("slenderness_H_over_Dbase"),
             "sanity_A_over_D2": dd.get("sanity_Abase_over_Dbase2"),
@@ -996,7 +1114,7 @@ class VolumeAnalysisApp(QMainWindow):
 
     def _write_metrics_files(self, out_dir=None):
         """
-        Scrive SEMPRE:
+        Scrive:
         - metrics.json (completo, strutturato)
         - metrics.csv  (umano, verticale, subset)
         """
@@ -1005,20 +1123,15 @@ class VolumeAnalysisApp(QMainWindow):
 
         metrics = self._build_metrics_dict()
 
-        # -----------------
-        # JSON completo
-        # -----------------
         json_path = os.path.join(out_dir, "metrics.json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(_as_serializable(metrics), f, indent=2, ensure_ascii=False)
 
-        # -----------------
-        # CSV umano (verticale, subset)
-        # -----------------
         csv_path = os.path.join(out_dir, "metrics.csv")
-        human_rows = metrics_to_human_rows(metrics)  # usa HUMAN_FIELDS + _get_by_path
+        human_rows = metrics_to_human_rows(metrics)
 
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        # ✅ Excel fix: UTF-8 with BOM
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow(["metric", "value"])
             for label, value in human_rows:
@@ -1026,7 +1139,7 @@ class VolumeAnalysisApp(QMainWindow):
 
         print(f"[INFO] metrics written: {json_path}")
         print(f"[INFO] metrics written: {csv_path}")
-    
+
     def export_metrics(self):
         """
         Pulsante GUI: esporta nella cartella scelta dall'utente
@@ -1047,6 +1160,7 @@ class VolumeAnalysisApp(QMainWindow):
             )
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"An error occurred while exporting metrics: {e}")
+
 
 # ———————— Main ——————————
 
