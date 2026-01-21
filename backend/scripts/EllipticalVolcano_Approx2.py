@@ -209,6 +209,7 @@ class VolumeAnalysisApp(QMainWindow):
         self.original_file_name = original_file_name
 
         self.calculate_results()
+        # 2) UI
         self.initUI()
 
         try:
