@@ -280,6 +280,8 @@ def _get_by_path(d: dict, path: str):
 HUMAN_FIELDS = [
     ("meta.timestamp_utc", "Run timestamp (UTC)"),
     ("meta.process_id", "Run ID (process_id)"),
+    ("meta.original_file_name", "Original input filename"),
+    ("meta.original_file_stem", "Original input filename (stem)"),
     ("meta.input_dem_path", "Input DEM path"),
     ("meta.working_dem_path", "Working DEM path"),
     ("meta.crs", "Working DEM CRS (EPSG/WKT)"),
@@ -717,7 +719,8 @@ class VolumeAnalysisApp(QMainWindow):
             file_path += '.pdf'
 
         try:
-            title = "Calculation Results - Elliptical Base, Approximation Type 1"
+            orig_name = os.environ.get("ORIGINAL_FILE_NAME") or self.meta.get("original_file_name") or os.path.basename(self.meta.get("input_dem_path") or "")
+            title = f"Calculation Results - Elliptical Base, Approximation Type 1\nInput DEM: {orig_name}"
 
             # 1) salva SEMPRE la doppietta accanto al PDF
             out_dir_for_doublet = os.path.dirname(file_path) if os.path.dirname(file_path) else os.getcwd()
@@ -848,6 +851,8 @@ class VolumeAnalysisApp(QMainWindow):
             "meta": {
                 "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
                 "process_id": self.process_id,
+                "original_file_name": os.environ.get("ORIGINAL_FILE_NAME") or self.meta.get("original_file_name"),
+                "original_file_stem": os.environ.get("ORIGINAL_FILE_STEM") or self.meta.get("original_file_stem"),
                 "input_dem_path": self.meta.get("input_dem_path"),
                 "working_dem_path": self.meta.get("working_dem_path"),
                 "crs": str(crs) if crs is not None else None,
@@ -957,6 +962,7 @@ if __name__ == '__main__':
         sys.exit(1)
 
     dem_file_path = sys.argv[1]
+    input_dem_path = sys.argv[1]
     original_file_name = sys.argv[2] if len(sys.argv) > 2 else "Unknown"
 
     # ------------------------------------------------------------
@@ -1019,7 +1025,9 @@ if __name__ == '__main__':
         "working_dem_path": dem_file_path,
         "crs": crs,
         "res": res,
-        "nodata": nodata
+        "nodata": nodata,
+        "original_file_name": os.environ.get("ORIGINAL_FILE_NAME") or os.path.basename(input_dem_path),
+        "original_file_stem": os.environ.get("ORIGINAL_FILE_STEM") or os.path.splitext(os.path.basename(input_dem_path))[0],
     }
 
     app = QApplication(sys.argv)

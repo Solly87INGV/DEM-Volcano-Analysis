@@ -51,9 +51,19 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
   const handleSubmitVolumeCalculation = async () => {
     setIsLoading(true);
     const formData = new FormData();
+
+    // --- files & params ---
     formData.append('demFile', demFile);
     formData.append('volumeType', volumeType);
     formData.append('approximationType', approximationType);
+
+    // ✅ NEW: passa SEMPRE il nome originale del file di input (serve per report+metrics)
+    // fallback: localStorage (se lo hai salvato in UploadForm) -> Unknown
+    const originalFileName =
+      (demFile && demFile.name) ||
+      localStorage.getItem('lastOriginalFileName') ||
+      'Unknown';
+    formData.append('originalFileName', originalFileName);
 
     // 👉 passa il processId della fase /process (prop o fallback da localStorage)
     const effectiveProcessId = processId || localStorage.getItem('lastProcessId');
