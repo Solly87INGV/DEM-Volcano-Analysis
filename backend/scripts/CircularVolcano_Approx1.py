@@ -37,8 +37,9 @@ import numpy as np
 import rasterio  # For reading DEM files in .tif format
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from rasterio.crs import CRS
-from scipy.ndimage import sobel
+from scipy.ndimage import sobel, binary_dilation
 from skimage import measure
+from skimage.draw import polygon
 
 from PyQt5 import QtWidgets, QtGui, QtCore
 from PyQt5.QtWidgets import (
@@ -302,6 +303,133 @@ def dem_nodata_stats(dem, nodata=None):
         "valid_p98": float(np.percentile(valid, 98)) if valid.size else None,
     }
 
+def pixel_area_m2_from_transform(transform) -> float:
+    """
+    Area pixel in m² anche se il raster è ruotato/shear.
+    Affine: |a b c|
+            |d e f|
+    """
+    return float(abs(transform.a * transform.e - transform.b * transform.d))
+
+def contour_to_mask(contour, shape):
+    """
+    Converte un contorno (row,col) in maschera booleana piena (interno poligono).
+    """
+    c = np.asarray(contour, dtype=float)
+    rr, cc = polygon(c[:, 0], c[:, 1], shape)
+    m = np.zeros(shape, dtype=bool)
+    m[rr, cc] = True
+    return m
+
+def outside_ring_mask(mask: np.ndarray, offset_px: int = 1, width_px: int = 3) -> np.ndarray:
+    """
+    Crea un anello esterno alla maschera:
+      ring = dilate(mask, offset+width) - dilate(mask, offset)
+    offset_px: quanto stare FUORI dal bordo prima di iniziare a campionare
+    width_px: spessore dell'anello (in pixel)
+    """
+    offset_px = int(max(0, offset_px))
+    width_px = int(max(1, width_px))
+
+    inner = binary_dilation(mask, iterations=offset_px) if offset_px > 0 else mask
+    outer = binary_dilation(mask, iterations=offset_px + width_px)
+
+    ring = outer & (~inner)
+    return ring
+
+def caldera_volume_depth_integrated(
+    dem: np.ndarray,
+    caldera_contour: np.ndarray,
+    transform,
+    nodata=None,
+    rim_percentile: float = 90.0,
+    floor_percentile: float = 5.0,
+    rim_ring_offset_px: int = 1,
+    rim_ring_width_px: int = 3
+) -> dict:
+    """
+    Calcola il volume reale della depressione della caldera:
+      V = sum(max(0, z_rim - z) * A_pixel) sui pixel dentro la caldera.
+    z_rim: percentile robusto delle quote sul contorno (rim)
+    z_floor: percentile basso delle quote interne (floor)
+    """
+    demf = dem.astype(float)
+
+    # maschera interno caldera
+    caldera_mask = contour_to_mask(caldera_contour, demf.shape)
+
+    # maschera validi (finite + nodata)
+    valid = np.isfinite(demf)
+    if nodata is not None:
+        valid = valid & (demf != float(nodata))
+
+    # -------------------------
+    # RIM: anello esterno (ring) alla maschera della caldera
+    # -------------------------
+    ring = outside_ring_mask(caldera_mask, offset_px=rim_ring_offset_px, width_px=rim_ring_width_px)
+
+    rim_vals = demf[ring & valid]
+
+    if rim_vals.size == 0:
+        # fallback duro: se ring vuoto (bordi raster / maschera strana), usa contorno
+        cont = np.round(caldera_contour).astype(int)
+        cont = cont[
+            (cont[:, 0] >= 0) & (cont[:, 0] < demf.shape[0]) &
+            (cont[:, 1] >= 0) & (cont[:, 1] < demf.shape[1])
+        ]
+        if cont.size == 0:
+            raise ValueError("Caldera contour is empty after bounds filtering (ring fallback also failed).")
+
+        rim_vals = demf[cont[:, 0], cont[:, 1]]
+        rim_vals = rim_vals[np.isfinite(rim_vals)]
+        if nodata is not None:
+            rim_vals = rim_vals[rim_vals != float(nodata)]
+        if rim_vals.size == 0:
+            raise ValueError("No valid rim elevation values (ring empty and contour all NaN/NoData).")
+
+        rim_method = "percentile_on_contour_fallback"
+    else:
+        rim_method = "percentile_on_outside_ring"
+
+    z_rim = float(np.percentile(rim_vals, rim_percentile))
+
+
+    # quote interne (floor)
+    inside_vals = demf[caldera_mask & valid]
+    if inside_vals.size == 0:
+        raise ValueError("No valid DEM values inside caldera mask.")
+    z_floor = float(np.percentile(inside_vals, floor_percentile))
+
+    depth_ref_raw = float(z_rim - z_floor)
+    depth_ref_clamped = float(max(0.0, depth_ref_raw))
+
+    # profondità per pixel (solo dove DEM è sotto rim)
+    depth = np.maximum(0.0, z_rim - demf)
+    depth[~caldera_mask] = 0.0
+    depth[~valid] = 0.0
+
+    Apx = pixel_area_m2_from_transform(transform)
+    V = float(np.sum(depth) * Apx)
+
+    return {
+        "V_caldera_m3": V,
+        "z_rim_ref_m": z_rim,
+        "z_floor_ref_m": z_floor,
+        "depth_ref_m": depth_ref_raw,
+        "depth_ref_m_clamped": depth_ref_clamped,
+
+        # ---- aggiunte ring/rim ----
+        "rim_method": rim_method,
+        "rim_ring_offset_px": int(rim_ring_offset_px),
+        "rim_ring_width_px": int(rim_ring_width_px),
+        "rim_sample_count": int(rim_vals.size),
+
+        "rim_percentile": float(rim_percentile),
+        "floor_percentile": float(floor_percentile),
+        "pixel_area_m2": float(Apx),
+        "caldera_mask_area_m2": float(np.sum(caldera_mask & valid) * Apx),
+    }
+
 def _find_manifest():
     """
     Restituisce (outputs_dir, manifest_path) se trovati.
@@ -400,6 +528,12 @@ HUMAN_FIELDS = [
 
     # --- Height used by the model ---
     ("morphometrics.h_max_m", "Height used by model (m)"),
+    ("volume_model.inputs_used.caldera_depth.depth_ref_m", "Caldera reference depth (rim p90 - floor p05) (m)"),
+    ("volume_model.inputs_used.caldera_depth.rim_reference.z_rim_ref_m", "Caldera rim reference elevation (m)"),
+    ("volume_model.inputs_used.caldera_depth.floor_reference.z_floor_ref_m", "Caldera floor reference elevation (m)"),
+    ("volume_model.inputs_used.caldera_depth.mask_area_m2", "Caldera mask area used for integration (m²)"),
+    ("volume_model.inputs_used.caldera_depth.depth_ref_m_clamped", "Caldera reference depth CLAMPED (m)"),
+    ("volume_model.inputs_used.caldera_depth.fallback_used", "Caldera fallback percentiles used (bool)"),
 
     # --- Geometry thresholds (if present in metrics) ---
     ("geometry.base_level_m", "Base contour level used (m)"),
@@ -557,11 +691,77 @@ class VolumeAnalysisApp(QMainWindow):
 
             # Edifice model (your current "frustum-like" formulation)
             V_frustum_m3 = (1.0 / 3.0) * np.pi * h_max * (R1**2 + R2**2 + R1 * R2)
+            # --- Caldera volume REAL (depth-integrated rim->DEM) ---
+            nodata = self.meta.get("nodata", None)
 
-            # Caldera model (your current code): hemisphere
-            V_caldera_m3 = (2.0 / 3.0) * np.pi * (R2**3)
+            # 1) tentativo standard
+            caldera_depth = caldera_volume_depth_integrated(
+                    dem=self.dem,
+                    caldera_contour=self.caldera_contour,
+                    transform=self.transform,
+                    nodata=nodata,
+                    rim_percentile=90.0,
+                    floor_percentile=5.0,
+                    rim_ring_offset_px=1,
+                    rim_ring_width_px=3
+                )
 
-            V_effective_m3 = V_frustum_m3 - V_caldera_m3
+            depth_raw = float(caldera_depth.get("depth_ref_m", 0.0))
+            V0 = float(caldera_depth.get("V_caldera_m3", 0.0))
+
+            # 2) fallback se la depth viene <= 0 (rim sotto floor)
+            self.caldera_fallback_used = False
+            if depth_raw <= 0.0:
+                print(
+                    f"[WARN] Caldera depth_ref_m <= 0 (rim={caldera_depth.get('z_rim_ref_m')}, "
+                    f"floor={caldera_depth.get('z_floor_ref_m')}, depth={depth_raw}). "
+                    "Trying fallback percentiles (rim=98, floor=2)."
+                )
+
+                caldera_depth_fb = caldera_volume_depth_integrated(
+                    dem=self.dem,
+                    caldera_contour=self.caldera_contour,
+                    transform=self.transform,
+                    nodata=nodata,
+                    rim_percentile=98.0,
+                    floor_percentile=2.0,
+                    rim_ring_offset_px=1,
+                    rim_ring_width_px=3
+                )
+
+                depth_fb = float(caldera_depth_fb.get("depth_ref_m", 0.0))
+                Vfb = float(caldera_depth_fb.get("V_caldera_m3", 0.0))
+
+                # accetta fallback se migliora: depth positiva e/o volume maggiore
+                if (depth_fb > 0.0 and Vfb >= V0) or (depth_fb > depth_raw and Vfb > 0.0):
+                    caldera_depth = caldera_depth_fb
+                    self.caldera_fallback_used = True
+                    print(f"[INFO] Fallback accepted. depth_ref_m={depth_fb}, V_caldera_m3={Vfb}")
+                else:
+                    print(f"[INFO] Fallback rejected. Keeping original. depth_ref_m={depth_raw}, V_caldera_m3={V0}")
+
+            # usa il risultato (standard o fallback)
+            V_caldera_m3 = float(caldera_depth["V_caldera_m3"])
+            V_effective_m3 = float(V_frustum_m3 - V_caldera_m3)
+            
+            # salva anche i riferimenti (serviranno in metrics)
+            self.caldera_z_rim_ref_m = float(caldera_depth["z_rim_ref_m"])
+            self.caldera_z_floor_ref_m = float(caldera_depth["z_floor_ref_m"])
+            self.caldera_depth_ref_m = float(caldera_depth.get("depth_ref_m", 0.0))
+            self.caldera_depth_ref_m_clamped = float(
+                caldera_depth.get("depth_ref_m_clamped", max(0.0, self.caldera_depth_ref_m))
+            )
+            self.caldera_rim_method = str(caldera_depth.get("rim_method", "unknown"))
+            self.caldera_rim_ring_offset_px = int(caldera_depth.get("rim_ring_offset_px", 1))
+            self.caldera_rim_ring_width_px = int(caldera_depth.get("rim_ring_width_px", 3))
+            self.caldera_rim_sample_count = int(caldera_depth.get("rim_sample_count", 0))
+
+            self.caldera_depth_ref_m_clamped = float(caldera_depth.get("depth_ref_m_clamped", max(0.0, self.caldera_depth_ref_m)))
+            self.caldera_rim_percentile = float(caldera_depth["rim_percentile"])
+            self.caldera_floor_percentile = float(caldera_depth["floor_percentile"])
+            self.caldera_pixel_area_m2 = float(caldera_depth.get("pixel_area_m2", 0.0))
+            self.caldera_mask_area_m2 = float(caldera_depth.get("caldera_mask_area_m2", 0.0))
+
 
             # Salva attributi SI per metrics export
             self.h_max = float(h_max)
@@ -590,7 +790,7 @@ class VolumeAnalysisApp(QMainWindow):
                 f"Caldera area of the volcano: {area_caldera_km2:.2f} km²\n"
                 f"Caldera width (Distance between opposite points of the caldera): {distance_caldera_km:.2f} km\n"
                 f"Total volume of the volcanic edifice: {v_km3:.2f} km³\n"
-                f"Caldera volume: {v_caldera_km3:.2f} km³\n"
+                f"Caldera volume: {v_caldera_km3:.3e} km³\n"
                 f"Effective volume of the volcanic edifice: {v_eff_km3:.2f} km³"
             )
 
@@ -600,7 +800,7 @@ class VolumeAnalysisApp(QMainWindow):
                 f"Caldera area of the volcano: {area_caldera_km2:.2f} km²",
                 f"Caldera width (Distance between opposite points of the caldera): {distance_caldera_km:.2f} km",
                 f"Total volume of the volcanic edifice: {v_km3:.2f} km³",
-                f"Caldera volume: {v_caldera_km3:.2f} km³",
+                f"Caldera volume: {v_caldera_km3:.3e} km³",
                 f"Effective volume of the volcanic edifice: {v_eff_km3:.2f} km³"
             ]
 
@@ -1003,24 +1203,47 @@ class VolumeAnalysisApp(QMainWindow):
                 "D_caldera_m": D_caldera,
                 "R_caldera_m": R_caldera,
                 "R_eq_caldera_m": R_eq_caldera,
-
                 "h_max_m": h_max,
             },
 
             "volume_model": {
                 "edifice_model": "frustum_like",
-                "caldera_model": "hemisphere",
-                "inputs_used": {
-                    "h_max_m": h_max,
-                    "R_base_m": R_base,
-                    "R_caldera_m": R_caldera,
+                "caldera_model": "depth_integrated_rim_to_dem",
+            "inputs_used": {
+                "h_max_m": h_max,
+                "R_base_m": R_base,
+                "R_caldera_m": R_caldera,
+
+                # --- Caldera depth references (for reproducibility / QA) ---
+                "caldera_depth": {
+                    "rim_reference": {
+                        "percentile": getattr(self, "caldera_rim_percentile", 90.0),
+                        "z_rim_ref_m": getattr(self, "caldera_z_rim_ref_m", None),
+                        "method": getattr(self, "caldera_rim_method", "percentile_on_outside_ring"),
+                    },
+                    "floor_reference": {
+                        "method": "percentile_inside_mask",
+                        "percentile": getattr(self, "caldera_floor_percentile", 5.0),
+                        "z_floor_ref_m": getattr(self, "caldera_z_floor_ref_m", None),
+                    },
+                    "depth_ref_m": getattr(self, "caldera_depth_ref_m", None),
+                    "depth_ref_m_clamped": getattr(self, "caldera_depth_ref_m_clamped", None),
+                    "mask_area_m2": getattr(self, "caldera_mask_area_m2", None),
+                    "pixel_area_m2": getattr(self, "caldera_pixel_area_m2", None),
+                    "fallback_used": bool(getattr(self, "caldera_fallback_used", False)),
+                    "rim_method": getattr(self, "caldera_rim_method", None),
+                    "rim_ring_offset_px": getattr(self, "caldera_rim_ring_offset_px", None),
+                    "rim_ring_width_px": getattr(self, "caldera_rim_ring_width_px", None),
+                    "rim_sample_count": getattr(self, "caldera_rim_sample_count", None),
                 },
+            },
                 "intermediate": {
                     "V_frustum_m3": V_frustum_m3
                 }
             },
 
             "volumes": {
+                "V_total_m3": V_frustum_m3,
                 "V_caldera_m3": V_caldera_m3,
                 "V_effective_m3": V_eff_m3,
             },
