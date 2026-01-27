@@ -174,13 +174,13 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
         <Box className="card-container">
           <CardSelection
             title="Circular Volcano"
-            description="A volcanic edifice with a base and caldera both of approximately circular shape is approximated to a truncated cone."
+            description="Volcanic edifice with an approximately circular base and caldera, modeled from DEM-derived contours to estimate edifice and caldera volumes."
             onClick={() => handleVolumeSelect('circular')}
             imageSrc="/images/Circular.png"
           />
           <CardSelection
             title="Elliptical Volcano"
-            description="A volcanic edifice with a base and caldera both of approximately elliptical shape is approximated to a truncated cone with elliptical bases."
+            description="Volcanic edifice with an elongated (elliptical) base and caldera, modeled from DEM-derived contours to estimate edifice and caldera volumes."
             onClick={() => handleVolumeSelect('elliptical')}
             imageSrc="/images/Elliptical.png"
           />
