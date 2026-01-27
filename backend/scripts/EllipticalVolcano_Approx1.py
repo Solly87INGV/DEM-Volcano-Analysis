@@ -56,7 +56,7 @@ from matplotlib import gridspec
 from mpl_toolkits.axes_grid1 import make_axes_locatable  # colorbar co-alte affiancate
 
 import pdf_generator
-
+METRICS_BASENAME = "metrics_ellip_a1"
 
 # ========== helpers: outputs & manifest ==========
 
@@ -545,6 +545,7 @@ class VolumeAnalysisApp(QMainWindow):
         self.process_id = self.meta.get("process_id") or _resolve_process_id()
         self.out_dir = _ensure_outputs_dir(self.process_id)
         self.original_file_name = original_file_name
+        self.metrics_basename = METRICS_BASENAME
 
         self.calculate_results()  # before widgets
         self.initUI()
@@ -1205,11 +1206,12 @@ class VolumeAnalysisApp(QMainWindow):
 
         metrics = self._build_metrics_dict()
 
-        json_path = os.path.join(out_dir, "metrics.json")
+        base = getattr(self, "metrics_basename", "metrics")
+        json_path = os.path.join(out_dir, f"{base}.json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(_as_serializable(metrics), f, indent=2, ensure_ascii=False)
 
-        csv_path = os.path.join(out_dir, "metrics.csv")
+        csv_path = os.path.join(out_dir, f"{base}.csv")
         human_rows = metrics_to_human_rows(metrics)
 
         # Excel fix: UTF-8 with BOM
@@ -1224,18 +1226,25 @@ class VolumeAnalysisApp(QMainWindow):
 
     def export_metrics(self):
         """
-        GUI button: export to user-selected folder
-        both metrics.json and metrics.csv.
+        Pulsante GUI: esporta nella cartella scelta dall'utente
+        SIA <basename>.json (completo) SIA <basename>.csv (umano verticale).
         """
         out_dir = QFileDialog.getExistingDirectory(self, "Select folder to export metrics")
         if not out_dir:
             return
+
         try:
+            # usa LA STESSA funzione del salvataggio automatico
             self._write_metrics_files(out_dir=out_dir)
-            QMessageBox.information(self, "Success", f"metrics.json + metrics.csv exported to:\n{out_dir}")
+
+            base = getattr(self, "metrics_basename", "metrics")
+            QMessageBox.information(
+                self,
+                "Success",
+                f"{base}.json + {base}.csv exported to:\n{out_dir}"
+            )
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"An error occurred while exporting metrics: {e}")
-
 
 # ========== Entry Point ==========
 

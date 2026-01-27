@@ -211,67 +211,100 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
         # Recupera spazio per far stare 1+2 nella prima pagina
         elements.append(Spacer(1, 12))  # (era 36)
 
-        # ====== DESCRIZIONI DETTAGLIATE ======
+        # ====== DESCRIZIONI DETTAGLIATE (UPDATED, COERENTI CON I NUOVI SVILUPPI) ======
         descriptions = [
             {
                 'title': '1. Base Area of the Volcano',
-                'description': 'The base area of the volcano represents the total surface area bounded by the contour of the volcano\'s base. It is an essential measure for understanding the size and extent of the volcanic structure.',
+                'description': (
+                    "The base area represents the planimetric surface enclosed by the volcano base contour, "
+                    "and provides a primary measure of the edifice footprint."
+                ),
                 'method': [
-                    'Identification of the Base Contour: The base contour of the volcano is defined by identifying areas at a specific elevation, calculated as a fraction (e.g., 5%) between the minimum and maximum elevations of the Digital Elevation Model (DEM).',
-                    'Area Calculation: Using Gauss\'s formula, the area of the polygon defined by the base contour is calculated without approximations. The obtained value in pixels is then converted to square kilometers (km²) considering the pixel size in the DEM.'
+                    "Identification of the Base Contour: the base contour is extracted at a threshold elevation "
+                    "defined as a fixed ratio (e.g., 5%) between the minimum and maximum DEM elevations.",
+                    "Area Calculation: the contour polygon is converted to map coordinates using the raster affine transform; "
+                    "the area is computed with the shoelace formula (m²) and then reported in km²."
                 ]
             },
             {
                 'title': '2. Base Width (Distance between Opposite Points of the Base)',
-                'description': 'The base width is the distance measured between two opposite points along the contour of the volcano\'s base. This measure provides an indication of the volcano\'s extended size in a specific direction.',
+                'description': (
+                    "The base width is measured as the distance between two opposite points on the base contour, "
+                    "providing a representative span of the edifice footprint."
+                ),
                 'method': [
-                    'Identification of Opposite Points: After defining the base contour, two opposite points on the contour are automatically identified. These points are selected considering the contour\'s geometry to ensure an accurate representation of the width.',
-                    'Distance Calculation: The Euclidean distance between these two opposite points is calculated and converted from pixels to kilometers using the DEM scale.'
+                    "Identification of Opposite Points: after defining the base contour, two opposite points are selected "
+                    "automatically along the contour geometry.",
+                    "Distance Calculation: pixel coordinates are converted to map coordinates via the affine transform and "
+                    "the Euclidean distance is computed in meters, then reported in kilometers (km)."
                 ]
             },
             {
                 'title': '3. Caldera Area of the Volcano',
-                'description': 'The caldera area represents the surface bounded by the caldera contour, which is a typical depression present in the structure of many volcanoes.',
+                'description': (
+                    "The caldera area represents the planimetric surface enclosed by the caldera contour, intended to describe "
+                    "the extent of the summit depression/feature."
+                ),
                 'method': [
-                    'Identification of the Caldera Contour: The caldera contour is determined based on slope variation. A specific elevation level (e.g., 80% of the DEM\'s maximum elevation) is identified to trace the caldera\'s contour.',
-                    'Area Calculation: Similar to the base area calculation, Gauss\'s formula is applied to determine the area of the polygon defined by the caldera contour, converting the final result to square kilometers (km²).'
+                    "Identification of the Caldera Contour: the caldera contour is extracted at a high-elevation level "
+                    "(e.g., 80% of the DEM maximum elevation).",
+                    "Area Calculation: as for the base, the contour is converted to map coordinates and its area is computed "
+                    "with the shoelace formula (m²), then reported in km²."
                 ]
             },
             {
                 'title': '4. Caldera Width (Distance between Opposite Points of the Caldera)',
-                'description': 'The caldera width is the distance measured between two opposite points along the caldera\'s contour. This measure provides information about the central depression\'s dimensions of the volcano.',
+                'description': (
+                    "The caldera width is the distance between two opposite points along the caldera contour, providing a "
+                    "representative span of the summit feature."
+                ),
                 'method': [
-                    'Identification of Opposite Points on the Caldera: Using the slope map derived from the DEM, points with the highest slopes on the caldera are identified. Subsequently, points opposite to these maximum slope points along the caldera contour are selected.',
-                    'Distance Calculation: The Euclidean distance between these two opposite points is calculated and converted from pixels to kilometers based on the DEM scale.'
+                    "Identification of Opposite Points on the Caldera: a slope map derived from the DEM is used to identify a "
+                    "maximum-slope point along the caldera contour; the opposite point is then selected approximately halfway "
+                    "around the contour.",
+                    "Distance Calculation: the span is computed in map units using the affine transform (meters) and reported in km."
                 ]
             },
             {
                 'title': '5. Total Volume of the Volcanic Edifice',
-                'description': 'The total volume of the volcanic edifice represents the overall amount of material that constitutes the entire volcano structure, excluding the caldera. It is a crucial measure for assessing the volcano\'s immense mass.',
+                'description': (
+                    "The total edifice volume is estimated using a frustum-like model based on base and caldera spans "
+                    "and a robust DEM-derived height."
+                ),
                 'method': [
-                    'Approximation Models: Two models have been developed to calculate the volume:',
-                    '1. Circular Truncated Cone: It is assumed that the volcano has a base and caldera of approximately circular shape. A truncated cone is used to approximate the volcano\'s shape, calculating the base radius (r2) and caldera radius (r1) from the distance between opposite points.',
-                    '2. Elliptical Truncated Cone: If the base and caldera have elongated (elliptical) shapes, the volcano is approximated with a truncated cone with elliptical bases, directly using the areas of the bases without calculating the semi-axes.',
-                    'Volume Conversion: The obtained volume is converted to cubic kilometers (km³).'
+                    "Height Estimation: the edifice height is estimated robustly as P99–P05 of DEM elevations (typically within the "
+                    "base mask; fallback to valid DEM values if needed).",
+                    "Approximation Model (frustum-like): base and caldera radii are defined as R_base = D_base/2 and R_caldera = D_caldera/2; "
+                    "volume is computed as V = (π·h/3)·(R_base² + R_caldera² + R_base·R_caldera).",
+                    "Volume Conversion: the resulting volume is computed in m³ and reported in cubic kilometers (km³)."
                 ]
             },
             {
                 'title': '6. Caldera Volume',
-                'description': 'The caldera volume represents the space occupied by the volcano\'s central depression. This volume is considered as a "mass-less" portion in the total volcanic edifice.',
+                'description': (
+                    "The caldera volume represents the void associated with the summit depression and is treated as a mass-less "
+                    "portion when computing the effective edifice volume."
+                ),
                 'method': [
-                    'Caldera Approximation Models: Two approaches are used to approximate the caldera volume:',
-                    '1. Semi-sphere or Cylinder: The caldera can be approximated as a semi-sphere or a cylinder, with the height (depth) set equal to the radius.',
-                    '2. Semi-ellipsoid of Rotation or Cylinder with Elliptical Bases: For calderas with more elongated shapes, an ellipsoidal or cylindrical model with elliptical bases is used. In this case, the semi-axes are not calculated, but the areas are directly used.',
-                    'Volume Conversion: The calculated volume is converted to cubic kilometers (km³).'
+                    "Rim→DEM depth integration (DEM-based): a reference rim elevation is estimated from robust percentiles sampled around "
+                    "the caldera boundary (outer ring, with contour fallback if needed). The void volume is then computed by integrating "
+                    "over caldera pixels the positive depth (z_rim − z) multiplied by the pixel area.",
+                    "Quality control: if the caldera is classified as complex/non-depressive (e.g., rim below floor), the caldera volume "
+                    "may be reported as N/A according to the module output.",
+                    "Volume Conversion: the computed volume is in m³ and reported in km³."
                 ]
             },
             {
                 'title': '7. Effective Volume of the Volcanic Edifice',
-                'description': 'The effective volume represents the actual amount of material that constitutes the volcanic edifice, obtained by subtracting the caldera volume from the total volcanic edifice volume. This value provides a more accurate estimate of the volcano\'s actual mass.',
+                'description': (
+                    "The effective volume represents the amount of volcanic material after removing the caldera void, computed as the "
+                    "difference between total edifice volume and caldera volume."
+                ),
                 'method': [
-                    'Where:',
-                    '- V_total is the total volume calculated using the truncated cone model.',
-                    '- V_caldera is the caldera volume calculated using one of the aforementioned approximation models.'
+                    "Where:",
+                    "- V_total is the total edifice volume estimated with the frustum-like model.",
+                    "- V_caldera is the caldera void volume estimated by the selected caldera method.",
+                    "Effective volume is computed as V_effective = V_total − V_caldera (consistent metric units)."
                 ]
             }
         ]
