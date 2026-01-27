@@ -95,7 +95,7 @@
 }
 
 .info-image-container img {
-  width: 600px; /* Larghezza fissa maggiore */
+  width: 695px; /* Larghezza fissa maggiore */
   height: auto; /* Mantiene le proporzioni */
   max-height: 500px; /* Altezza massima ancora più grande */
   border-radius: 8px; /* Arrotondamento degli angoli */
