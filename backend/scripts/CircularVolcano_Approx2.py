@@ -237,6 +237,150 @@ def find_opposite_slope_points(slope_matrix, contour):
     return max_slope_index1, max_slope_index2
 
 
+# ========== Caldera depth-integrated helpers (identici a Approx1) ==========
+
+def pixel_area_m2_from_transform(transform):
+    try:
+        return float(abs(transform.a * transform.e - transform.b * transform.d))
+    except Exception:
+        try:
+            return float(abs(transform.a * transform.e))
+        except Exception:
+            return 0.0
+
+def contour_to_mask(contour, shape):
+    from skimage.draw import polygon
+    mask = np.zeros(shape, dtype=bool)
+    if contour is None:
+        return mask
+    c = np.asarray(contour, dtype=float)
+    if c.size == 0:
+        return mask
+    rr = c[:, 0]
+    cc = c[:, 1]
+    pr, pc = polygon(rr, cc, shape)
+    mask[pr, pc] = True
+    return mask
+
+def outside_ring_mask(mask: np.ndarray, offset_px: int = 1, width_px: int = 3) -> np.ndarray:
+    from scipy.ndimage import binary_dilation
+    if mask is None or mask.size == 0:
+        return np.zeros_like(mask, dtype=bool)
+    if offset_px < 0:
+        offset_px = 0
+    if width_px < 1:
+        width_px = 1
+
+    inner = binary_dilation(mask, iterations=offset_px)
+    outer = binary_dilation(mask, iterations=offset_px + width_px)
+    ring = outer & (~inner)
+    return ring
+
+def caldera_volume_depth_integrated(
+    dem: np.ndarray,
+    caldera_contour: np.ndarray,
+    transform,
+    nodata=None,
+    rim_percentile: float = 90.0,
+    floor_percentile: float = 5.0,
+    rim_ring_offset_px: int = 1,
+    rim_ring_width_px: int = 3
+) -> dict:
+    dem = np.asarray(dem)
+    caldera_mask = contour_to_mask(caldera_contour, dem.shape)
+
+    valid = np.isfinite(dem)
+    if nodata is not None:
+        try:
+            valid = valid & (dem != float(nodata))
+        except Exception:
+            pass
+
+    px_area = pixel_area_m2_from_transform(transform)
+    caldera_mask_area_m2 = float(np.sum(caldera_mask)) * float(px_area)
+
+    ring = outside_ring_mask(caldera_mask, offset_px=rim_ring_offset_px, width_px=rim_ring_width_px)
+    rim_samples = dem[ring & valid]
+    rim_method = "outside_ring_percentile"
+
+    if rim_samples.size == 0:
+        rim_method = "contour_percentile"
+        c = np.round(np.asarray(caldera_contour)).astype(int) if caldera_contour is not None else np.zeros((0, 2), dtype=int)
+        if c.size > 0:
+            rr = c[:, 0]
+            cc = c[:, 1]
+            ok = (rr >= 0) & (rr < dem.shape[0]) & (cc >= 0) & (cc < dem.shape[1])
+            rr = rr[ok]
+            cc = cc[ok]
+            if rr.size > 0:
+                rim_samples = dem[rr, cc]
+                rim_samples = rim_samples[np.isfinite(rim_samples)]
+                if nodata is not None:
+                    try:
+                        rim_samples = rim_samples[rim_samples != float(nodata)]
+                    except Exception:
+                        pass
+
+    rim_sample_count = int(rim_samples.size) if rim_samples is not None else 0
+    z_rim_ref_m = float(np.percentile(rim_samples, rim_percentile)) if rim_sample_count > 0 else None
+
+    inside = caldera_mask & valid
+    floor_samples = dem[inside]
+    z_floor_ref_m = float(np.percentile(floor_samples, floor_percentile)) if floor_samples.size > 0 else None
+
+    depth_ref_m = float((z_rim_ref_m - z_floor_ref_m)) if (z_rim_ref_m is not None and z_floor_ref_m is not None) else 0.0
+    depth_ref_m_clamped = float(max(0.0, depth_ref_m))
+
+    V_caldera_m3 = 0.0
+    if z_rim_ref_m is not None and px_area > 0 and np.any(inside):
+        dz = (float(z_rim_ref_m) - dem.astype(float))
+        dz = np.where(inside, dz, 0.0)
+        dz = np.maximum(dz, 0.0)
+        dz = np.where(np.isfinite(dz), dz, 0.0)
+        V_caldera_m3 = float(np.sum(dz)) * float(px_area)
+
+    return {
+        "V_caldera_m3": float(V_caldera_m3),
+        "z_rim_ref_m": z_rim_ref_m,
+        "z_floor_ref_m": z_floor_ref_m,
+        "depth_ref_m": float(depth_ref_m),
+        "depth_ref_m_clamped": float(depth_ref_m_clamped),
+        "rim_method": rim_method,
+        "rim_ring_offset_px": int(rim_ring_offset_px),
+        "rim_ring_width_px": int(rim_ring_width_px),
+        "rim_sample_count": int(rim_sample_count),
+        "rim_percentile": float(rim_percentile),
+        "floor_percentile": float(floor_percentile),
+        "pixel_area_m2": float(px_area),
+        "caldera_mask_area_m2": float(caldera_mask_area_m2),
+    }
+
+
+
+def robust_height_p99_minus_p05(dem: np.ndarray, base_contour: np.ndarray, nodata=None) -> float:
+    """
+    Altezza robusta del vulcano (m): P99 - P05 calcolata *dentro la base*.
+    Fallback: se la maschera base è vuota, usa tutti i pixel validi.
+    """
+    dem = np.asarray(dem).astype(float)
+
+    valid = np.isfinite(dem)
+    if nodata is not None:
+        try:
+            valid = valid & (dem != float(nodata))
+        except Exception:
+            pass
+
+    base_mask = contour_to_mask(base_contour, dem.shape) if base_contour is not None else np.zeros(dem.shape, dtype=bool)
+    z = dem[base_mask & valid]
+    if z.size == 0:
+        z = dem[valid]
+    if z.size == 0:
+        return 0.0
+
+    return float(np.percentile(z, 99) - np.percentile(z, 5))
+
+
 # ========== Metrics helpers (NUOVO: come Approx1, ma adattato a Approx2) ==========
 
 def _as_serializable(v):
@@ -296,64 +440,100 @@ def _get_by_path(d: dict, path: str):
     return cur
 
 # CSV "umano" verticale: SOLO SI (m, m², m³) e parametri del modello Approx2
+
 HUMAN_FIELDS = [
-    ("meta.timestamp_utc", "Run timestamp (UTC)"),
-    ("meta.process_id", "Run ID (process_id)"),
-    ("meta.original_file_name", "Original input filename"),
-    ("meta.original_file_stem", "Original input filename (stem)"),
-    ("meta.input_dem_path", "Input DEM path"),
-    ("meta.working_dem_path", "Working DEM path"),
-    ("meta.crs", "Working DEM CRS (EPSG/WKT)"),
-    ("meta.res", "Pixel resolution (m) [x,y]"),
-    ("meta.nodata", "NoData value"),
+    # =========================
+    # META
+    # =========================
+    ("Meta", "Run timestamp (UTC)", "meta.timestamp_utc", ""),
+    ("Meta", "Run ID (process_id)", "meta.process_id", ""),
+    ("Meta", "Original input filename", "meta.original_file_name", ""),
+    ("Meta", "Original input filename (stem)", "meta.original_file_stem", ""),
+    ("Meta", "Input DEM path", "meta.input_dem_path", ""),
+    ("Meta", "Working DEM path", "meta.working_dem_path", ""),
+    ("Meta", "Working DEM CRS (EPSG/WKT)", "meta.crs", ""),
+    ("Meta", "Pixel resolution", "meta.res", "m"),
+    ("Meta", "NoData value", "meta.nodata", ""),
 
-    # --- Morphometrics (Base) ---
-    ("morphometrics.A_base_m2", "Base area (m²)"),
-    ("morphometrics.P_base_m", "Base perimeter (m)"),
-    ("morphometrics.D_base_m", "Base diameter (m) [opposite points]"),
-    ("morphometrics.R_base_m", "Base radius used in volume (m)"),
-    ("morphometrics.R_eq_base_m", "Equivalent base radius from area (m)"),
+    # =========================
+    # MORPHOMETRICS — BASE
+    # =========================
+    ("Base morphometrics", "Base area", "morphometrics.A_base_m2", "m²"),
+    ("Base morphometrics", "Base perimeter", "morphometrics.P_base_m", "m"),
+    ("Base morphometrics", "Base diameter (opposite points)", "morphometrics.D_base_m", "m"),
+    ("Base morphometrics", "Base radius used in volume", "morphometrics.R_base_m", "m"),
+    ("Base morphometrics", "Equivalent base radius from area", "morphometrics.R_eq_base_m", "m"),
 
-    # --- Morphometrics (Caldera) ---
-    ("morphometrics.A_caldera_m2", "Caldera area (m²)"),
-    ("morphometrics.P_caldera_m", "Caldera perimeter (m)"),
-    ("morphometrics.D_caldera_m", "Caldera diameter (m) [opposite points]"),
-    ("morphometrics.R_caldera_m", "Caldera radius used in volume (m)"),
-    ("morphometrics.R_eq_caldera_m", "Equivalent caldera radius from area (m)"),
+    # =========================
+    # MORPHOMETRICS — CALDERA
+    # =========================
+    ("Caldera morphometrics", "Caldera area", "morphometrics.A_caldera_m2", "m²"),
+    ("Caldera morphometrics", "Caldera perimeter", "morphometrics.P_caldera_m", "m"),
+    ("Caldera morphometrics", "Caldera diameter (opposite points)", "morphometrics.D_caldera_m", "m"),
+    ("Caldera morphometrics", "Caldera radius used in volume", "morphometrics.R_caldera_m", "m"),
+    ("Caldera morphometrics", "Equivalent caldera radius from area", "morphometrics.R_eq_caldera_m", "m"),
 
-    # --- Height used by the model ---
-    ("morphometrics.h_max_m", "Height used by model (m)"),
+    # =========================
+    # HEIGHT MODEL (Approx2)
+    # =========================
+    ("Height model (Approx2)", "Height method", "height_model.method", ""),
+    ("Height model (Approx2)", "Height (P99 - P05) inside base", "height_model.p99_minus_p05_m", "m"),
 
-    # --- Geometry thresholds (if present in metrics) ---
-    ("geometry.base_level_m", "Base contour level used (m)"),
-    ("geometry.caldera_level_m", "Caldera contour level used (m)"),
+    # =========================
+    # CALDERA DEPTH (QA)
+    # =========================
+    ("Caldera depth (QA)", "Caldera reference depth (rim p90 - floor p05)", "volume_model.inputs_used.caldera_depth.depth_ref_m", "m"),
+    ("Caldera depth (QA)", "Caldera rim reference elevation", "volume_model.inputs_used.caldera_depth.rim_reference.z_rim_ref_m", "m"),
+    ("Caldera depth (QA)", "Caldera floor reference elevation", "volume_model.inputs_used.caldera_depth.floor_reference.z_floor_ref_m", "m"),
+    ("Caldera depth (QA)", "Caldera mask area used for integration", "volume_model.inputs_used.caldera_depth.mask_area_m2", "m²"),
+    ("Caldera depth (QA)", "Caldera reference depth CLAMPED", "volume_model.inputs_used.caldera_depth.depth_ref_m_clamped", "m"),
+    ("Caldera depth (QA)", "Caldera fallback percentiles used", "volume_model.inputs_used.caldera_depth.fallback_used", ""),
+    ("Caldera depth (QA)", "Caldera status", "volume_model.inputs_used.caldera_depth.status", ""),
+    ("Caldera depth (QA)", "Caldera status reason", "volume_model.inputs_used.caldera_depth.reason", ""),
+    ("Caldera depth (QA)", "Caldera action", "volume_model.inputs_used.caldera_depth.action", ""),
 
-    # --- Model descriptors (if present in metrics) ---
-    ("volume_model.edifice_model", "Edifice volume model"),
-    ("volume_model.caldera_model", "Caldera volume model"),
-    ("volume_model.intermediate.V_frustum_m3", "Intermediate frustum-like volume (m³)"),
+    # =========================
+    # MODEL DESCRIPTORS
+    # =========================
+    ("Model descriptors", "Edifice volume model", "volume_model.edifice_model", ""),
+    ("Model descriptors", "Caldera volume model", "volume_model.caldera_model", ""),
+    ("Model descriptors", "Intermediate frustum-like volume", "volume_model.intermediate.V_frustum_m3", "m³"),
 
-    # --- Volumes ---
-    ("volumes.V_total_m3", "Total edifice volume (m³)"),
-    ("volumes.V_caldera_m3", "Caldera volume (m³)"),
-    ("volumes.V_effective_m3", "Effective edifice volume (m³)"),
+    # =========================
+    # VOLUMES
+    # =========================
+    ("Volumes", "Total edifice volume", "volumes.V_total_m3", "m³"),
+    ("Volumes", "Caldera volume", "volumes.V_caldera_m3", "m³"),
+    ("Volumes", "Effective edifice volume", "volumes.V_effective_m3", "m³"),
 
-    # --- Derived ---
-    ("derived.slenderness_H_over_Dbase", "Slenderness H/Dbase (unitless)"),
-    ("derived.sanity_Abase_over_Dbase2", "Sanity Abase/Dbase² (unitless)"),
-    ("derived.circularity_base", "Circularity base (unitless)"),
-    ("derived.circularity_caldera", "Circularity caldera (unitless)"),
-    ("derived.eq_height_V_over_Abase_m", "Equivalent height V/Abase (m)"),
-    ("derived.ratio_vs_cone", "Ratio vs perfect cone (unitless)"),
+    # =========================
+    # DERIVED
+    # =========================
+    ("Derived", "Slenderness H/Dbase", "derived.slenderness_H_over_Dbase", ""),
+    ("Derived", "Sanity Abase/Dbase²", "derived.sanity_Abase_over_Dbase2", ""),
+    ("Derived", "Circularity base", "derived.circularity_base", ""),
+    ("Derived", "Circularity caldera", "derived.circularity_caldera", ""),
+    ("Derived", "Equivalent height V/Abase", "derived.eq_height_V_over_Abase_m", "m"),
+    ("Derived", "Ratio vs perfect cone", "derived.ratio_vs_cone", ""),
 ]
+
 
 def metrics_to_human_rows(metrics: dict):
     rows = []
-    for path, label in HUMAN_FIELDS:
+    for item in HUMAN_FIELDS:
+        if len(item) == 4:
+            section, label, path, unit = item
+        elif len(item) == 2:
+            path, label = item
+            section = ""
+            unit = ""
+        else:
+            continue
+
         v = _get_by_path(metrics, path)
         if isinstance(v, (list, dict)):
             v = json.dumps(v, ensure_ascii=False)
-        rows.append((label, v))
+        rows.append((section, label, v, unit))
     return rows
 
 
@@ -448,22 +628,91 @@ class VolumeAnalysisApp(QMainWindow):
             )
             self.distance_caldera_km = self.distance_meters_caldera * 1e-3
 
-            # Aree (km² per GUI) - ma conserveremo anche m² via export
-            self.area_base = calculate_area(self.base_contour, self.transform) * 1e-6
-            self.area_caldera = calculate_area(self.caldera_contour, self.transform) * 1e-6
+            # Aree (m² + km² per GUI)
+            self.area_base_m2 = float(calculate_area(self.base_contour, self.transform))
+            self.area_caldera_m2 = float(calculate_area(self.caldera_contour, self.transform))
+            self.area_base = self.area_base_m2 * 1e-6
+            self.area_caldera = self.area_caldera_m2 * 1e-6
 
-            # Volumi (Approx2: caldera cilindro h=r)
-            # evita outlier: P99 - P05
-            z = self.dem[np.isfinite(self.dem)]
-            self.h_max = float(np.percentile(z, 99) - np.percentile(z, 5))
+            # Volumi (Approx2: caldera depth-integrated rim→DEM + fallback percentili)
+            # evita outlier e NoData: P99 - P05 *dentro la base*
+            nodata = self.meta.get("nodata", None)
+            self.h_max = robust_height_p99_minus_p05(self.dem, self.base_contour, nodata=nodata)
             self.R1 = self.distance_meters_base / 2
             self.R2 = self.distance_meters_caldera / 2
             self.v = (1/3) * np.pi * self.h_max * (self.R1**2 + self.R2**2 + self.R1 * self.R2)
             self.v_km3 = self.v * 1e-9
+            caldera_depth = caldera_volume_depth_integrated(
+                dem=self.dem,
+                caldera_contour=self.caldera_contour,
+                transform=self.transform,
+                nodata=nodata,
+                rim_percentile=90.0,
+                floor_percentile=5.0,
+                rim_ring_offset_px=1,
+                rim_ring_width_px=3
+            )
+
+            depth_raw = float(caldera_depth.get("depth_ref_m", 0.0))
+            V0 = float(caldera_depth.get("V_caldera_m3", 0.0))
+
+            self.caldera_fallback_used = False
+            if depth_raw <= 0:
+                caldera_depth_fb = caldera_volume_depth_integrated(
+                    dem=self.dem,
+                    caldera_contour=self.caldera_contour,
+                    transform=self.transform,
+                    nodata=nodata,
+                    rim_percentile=98.0,
+                    floor_percentile=2.0,
+                    rim_ring_offset_px=1,
+                    rim_ring_width_px=3
+                )
+
+                depth_fb = float(caldera_depth_fb.get("depth_ref_m", 0.0))
+                V_fb = float(caldera_depth_fb.get("V_caldera_m3", 0.0))
+
+                if (depth_fb > depth_raw) and (V_fb > V0):
+                    caldera_depth = caldera_depth_fb
+                    self.caldera_fallback_used = True
+
+            V_caldera_m3 = float(caldera_depth.get("V_caldera_m3", 0.0))
+            V_effective_m3 = float(self.v - V_caldera_m3)
+
+            # Classificazione caldera (come Approx1)
+            if float(caldera_depth.get("depth_ref_m", 0.0)) <= 0:
+                self.caldera_status = "non_depressive_or_complex"
+                self.caldera_reason = "rim_below_floor"
+                self.caldera_action = "not_computed"
+            elif V_caldera_m3 <= 0:
+                self.caldera_status = "non_depressive_or_complex"
+                self.caldera_reason = "no_depression_pixels"
+                self.caldera_action = "not_computed"
+            else:
+                self.caldera_status = "depressive"
+                self.caldera_reason = None
+                self.caldera_action = "computed"
+
+            # Attributi QA per JSON/CSV (preparati come Approx1)
+            self.caldera_z_rim_ref_m = caldera_depth.get("z_rim_ref_m", None)
+            self.caldera_z_floor_ref_m = caldera_depth.get("z_floor_ref_m", None)
+            self.caldera_depth_ref_m = caldera_depth.get("depth_ref_m", None)
+            self.caldera_depth_ref_m_clamped = caldera_depth.get("depth_ref_m_clamped", None)
+            self.caldera_rim_method = caldera_depth.get("rim_method", None)
+            self.caldera_rim_ring_offset_px = caldera_depth.get("rim_ring_offset_px", None)
+            self.caldera_rim_ring_width_px = caldera_depth.get("rim_ring_width_px", None)
+            self.caldera_rim_sample_count = caldera_depth.get("rim_sample_count", None)
+            self.caldera_rim_percentile = caldera_depth.get("rim_percentile", None)
+            self.caldera_floor_percentile = caldera_depth.get("floor_percentile", None)
+            self.caldera_pixel_area_m2 = caldera_depth.get("pixel_area_m2", None)
+            self.caldera_mask_area_m2 = caldera_depth.get("caldera_mask_area_m2", None)
+
+            # Mantieni variabili/attributi esistenti (senza cambiare logica edifice)
             self.r2 = self.R2 * 1e-3
             self.p = self.r2
-            self.v_caldera = np.pi * (self.r2**2) * self.p
-            self.v_volcano = self.v_km3 - self.v_caldera
+
+            self.v_caldera = V_caldera_m3 * 1e-9
+            self.v_volcano = V_effective_m3 * 1e-9
 
             # Descrizioni
             self.description_base = (
@@ -485,6 +734,15 @@ class VolumeAnalysisApp(QMainWindow):
                 "halfway around the contour."
             )
 
+            # Output risultati: riga caldera con N/A (GUI lunga, PDF corta)
+            if getattr(self, "caldera_status", None) == "depressive":
+                caldera_line_gui = f"Caldera volume: {self.v_caldera:.3e} km³"
+                caldera_line_pdf = caldera_line_gui
+            else:
+                reason = getattr(self, "caldera_reason", "complex")
+                caldera_line_gui = f"Caldera volume: N/A (complex/non-depressive: {reason})"
+                caldera_line_pdf = f"Caldera volume: N/A ({reason})"
+
             # Testo risultati (GUI)
             self.results_text = (
                 f"Base area of the volcano: {self.area_base:.2f} km²\n"
@@ -492,7 +750,7 @@ class VolumeAnalysisApp(QMainWindow):
                 f"Caldera area of the volcano: {self.area_caldera:.2f} km²\n"
                 f"Caldera width (Distance between opposite points of the caldera): {self.distance_caldera_km:.2f} km\n"
                 f"Total volume of the volcanic edifice: {self.v_km3:.2f} km³\n"
-                f"Caldera volume: {self.v_caldera:.2f} km³\n"
+                f"{caldera_line_gui}\n"
                 f"Effective volume of the volcanic edifice: {self.v_volcano:.2f} km³"
             )
 
@@ -502,7 +760,7 @@ class VolumeAnalysisApp(QMainWindow):
                 f"Caldera area of the volcano: {self.area_caldera:.2f} km²",
                 f"Caldera width (Distance between opposite points of the caldera): {self.distance_caldera_km:.2f} km",
                 f"Total volume of the volcanic edifice: {self.v_km3:.2f} km³",
-                f"Caldera volume: {self.v_caldera:.2f} km³",
+                f"{caldera_line_pdf}",
                 f"Effective volume of the volcanic edifice: {self.v_volcano:.2f} km³"
             ]
         except Exception as e:
@@ -818,14 +1076,15 @@ class VolumeAnalysisApp(QMainWindow):
     # =========================
     # ✅ METRICS (NUOVO)
     # =========================
+    
     def _build_metrics_dict(self) -> dict:
         crs = self.meta.get("crs")
         res = self.meta.get("res")
         nodata = self.meta.get("nodata")
 
-        # Aree in m² (convertendo dai valori GUI km²)
-        A_base_m2 = float(self.area_base) * 1e6
-        A_caldera_m2 = float(self.area_caldera) * 1e6
+        # Aree in m²
+        A_base_m2 = float(getattr(self, "area_base_m2", float(self.area_base) * 1e6))
+        A_caldera_m2 = float(getattr(self, "area_caldera_m2", float(self.area_caldera) * 1e6))
 
         # Perimetri (m)
         P_base = float(contour_perimeter_m(self.base_contour, self.transform))
@@ -835,7 +1094,7 @@ class VolumeAnalysisApp(QMainWindow):
         D_base = float(self.distance_meters_base)
         D_caldera = float(self.distance_meters_caldera)
 
-        # Raggi
+        # Raggi (m)
         R_base = float(self.R1)
         R_caldera = float(self.R2)
 
@@ -847,13 +1106,9 @@ class VolumeAnalysisApp(QMainWindow):
         h_used = float(self.h_max)
 
         # Volumi SI (m³)
-        V_frustum_m3 = float(self.v)  # già in m³
-        # caldera cilindro: nel codice attuale è in km³ (v_caldera) -> riportiamo anche m³ coerente
-        V_caldera_m3 = float(self.v_caldera) * 1e9
-        V_eff_m3 = float(self.v_volcano) * 1e9
-
-        # Caldera "p" nel tuo modello: p = r2_km, quindi in metri è R2
-        p_caldera_m = float(self.R2)
+        V_frustum_m3 = float(self.v)  # già in m³ (edifice totale)
+        V_caldera_m3 = float(self.v_caldera) * 1e9  # km³ -> m³
+        V_eff_m3 = float(self.v_volcano) * 1e9      # km³ -> m³
 
         # Derivate
         circularity_base = (4 * math.pi * A_base_m2 / (P_base ** 2)) if (A_base_m2 > 0 and P_base > 0) else None
@@ -874,7 +1129,7 @@ class VolumeAnalysisApp(QMainWindow):
 
         metrics = {
             "meta": {
-                "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
+                "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z"),
                 "process_id": self.process_id,
                 "original_file_name": os.environ.get("ORIGINAL_FILE_NAME") or self.meta.get("original_file_name"),
                 "original_file_stem": os.environ.get("ORIGINAL_FILE_STEM") or self.meta.get("original_file_stem"),
@@ -888,6 +1143,7 @@ class VolumeAnalysisApp(QMainWindow):
                     "caldera_level_ratio": 0.8
                 }
             },
+
             "nodata_stats": dem_nodata_stats(self.dem, nodata=nodata),
 
             "morphometrics": {
@@ -905,18 +1161,40 @@ class VolumeAnalysisApp(QMainWindow):
             },
 
             "height_model": {
-                "method": "p99_minus_p05",
+                "method": "p99_minus_p05_inside_base",
                 "p99_minus_p05_m": h_used
             },
 
             "volume_model": {
                 "edifice_model": "frustum_like",
-                "caldera_model": "cylinder_h_equals_r",
+                "caldera_model": "depth_integrated_rim_to_dem",
                 "inputs_used": {
                     "h_max_m": h_used,
                     "R_base_m": R_base,
                     "R_caldera_m": R_caldera,
-                    "p_caldera_m": p_caldera_m
+                    "caldera_depth": {
+                        "rim_reference": {
+                            "percentile": float(getattr(self, "caldera_rim_percentile", 90.0) or 90.0),
+                            "z_rim_ref_m": getattr(self, "caldera_z_rim_ref_m", None),
+                            "method": getattr(self, "caldera_rim_method", None),
+                            "ring_offset_px": getattr(self, "caldera_rim_ring_offset_px", None),
+                            "ring_width_px": getattr(self, "caldera_rim_ring_width_px", None),
+                            "sample_count": getattr(self, "caldera_rim_sample_count", None),
+                        },
+                        "floor_reference": {
+                            "percentile": float(getattr(self, "caldera_floor_percentile", 5.0) or 5.0),
+                            "z_floor_ref_m": getattr(self, "caldera_z_floor_ref_m", None),
+                            "method": "percentile_inside_mask",
+                        },
+                        "status": getattr(self, "caldera_status", None),
+                        "reason": getattr(self, "caldera_reason", None),
+                        "action": getattr(self, "caldera_action", None),
+                        "depth_ref_m": getattr(self, "caldera_depth_ref_m", None),
+                        "depth_ref_m_clamped": getattr(self, "caldera_depth_ref_m_clamped", None),
+                        "mask_area_m2": getattr(self, "caldera_mask_area_m2", None),
+                        "pixel_area_m2": getattr(self, "caldera_pixel_area_m2", None),
+                        "fallback_used": bool(getattr(self, "caldera_fallback_used", False)),
+                    }
                 },
                 "intermediate": {
                     "V_frustum_m3": V_frustum_m3
@@ -924,6 +1202,7 @@ class VolumeAnalysisApp(QMainWindow):
             },
 
             "volumes": {
+                "V_total_m3": V_frustum_m3,
                 "V_caldera_m3": V_caldera_m3,
                 "V_effective_m3": V_eff_m3,
             },
@@ -943,6 +1222,7 @@ class VolumeAnalysisApp(QMainWindow):
             }
         }
         return metrics
+
 
     def _write_metrics_files(self, out_dir=None):
         """
@@ -965,9 +1245,9 @@ class VolumeAnalysisApp(QMainWindow):
         # ✅ Excel fix: UTF-8 with BOM
         with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
-            w.writerow(["metric", "value"])
-            for label, value in human_rows:
-                w.writerow([label, value])
+            w.writerow(["section", "metric", "value", "unit"])
+            for section, label, value, unit in human_rows:
+                w.writerow([section, label, value, unit])
 
         print(f"[INFO] metrics written: {json_path}")
         print(f"[INFO] metrics written: {csv_path}")
