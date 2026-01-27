@@ -430,6 +430,63 @@ def caldera_volume_depth_integrated(
         "caldera_mask_area_m2": float(np.sum(caldera_mask & valid) * Apx),
     }
 
+
+
+def edifice_height_p99_minus_p05(
+    dem: np.ndarray,
+    base_contour: np.ndarray,
+    transform=None,
+    nodata=None,
+    p_high: float = 99.0,
+    p_low: float = 5.0,
+) -> dict:
+    """
+    Altezza dell'edificio (m) stimata in modo robusto:
+      h = P{p_high} - P{p_low}
+
+    Scope:
+      - di default usa SOLO i pixel validi all'interno della base (mask del contorno base)
+      - fallback: se la mask è troppo piccola o vuota, usa tutti i pixel validi del DEM
+
+    Ritorna dict:
+      { "h_max_m": ..., "method": ..., "scope": ..., "p_high": ..., "p_low": ..., "n": ... }
+    """
+    demf = dem.astype(float)
+
+    valid = np.isfinite(demf)
+    if nodata is not None:
+        try:
+            valid = valid & (demf != float(nodata))
+        except Exception:
+            pass
+
+    scope = "base_mask"
+    try:
+        base_mask = contour_to_mask(base_contour, demf.shape)
+        vals = demf[base_mask & valid]
+    except Exception:
+        vals = demf[valid]
+        scope = "full_valid_fallback"
+
+    # fallback se troppo pochi valori (mask troppo piccola / geometria strana)
+    if vals.size < 50:
+        vals = demf[valid]
+        scope = "full_valid_fallback"
+
+    if vals.size == 0:
+        h = 0.0
+    else:
+        h = float(np.percentile(vals, p_high) - np.percentile(vals, p_low))
+
+    return {
+        "h_max_m": h,
+        "method": "p99_minus_p05",
+        "scope": scope,
+        "p_high": float(p_high),
+        "p_low": float(p_low),
+        "n": int(vals.size),
+    }
+
 def _find_manifest():
     """
     Restituisce (outputs_dir, manifest_path) se trovati.
@@ -726,14 +783,25 @@ class VolumeAnalysisApp(QMainWindow):
             # -------------------------
             # Volumes (SI: m³) + conversione per GUI
             # -------------------------
-            h_max = float(np.max(self.dem))
+            nodata = self.meta.get("nodata", None)
+
+            # Altezza robusta dell'edificio (come negli altri moduli): P99 - P05
+            height_info = edifice_height_p99_minus_p05(
+                dem=self.dem,
+                base_contour=self.base_contour,
+                transform=self.transform,
+                nodata=nodata,
+                p_high=99.0,
+                p_low=5.0
+            )
+            self.height_model = height_info  # per metrics.json
+            h_max = float(height_info.get("h_max_m", 0.0))
             R1 = float(distance_meters_base / 2.0)      # base radius used
             R2 = float(distance_meters_caldera / 2.0)   # caldera radius used
 
             # Edifice model (your current "frustum-like" formulation)
             V_frustum_m3 = (1.0 / 3.0) * np.pi * h_max * (R1**2 + R2**2 + R1 * R2)
             # --- Caldera volume REAL (depth-integrated rim->DEM) ---
-            nodata = self.meta.get("nodata", None)
 
             # 1) tentativo standard
             caldera_depth = caldera_volume_depth_integrated(
@@ -1271,6 +1339,8 @@ class VolumeAnalysisApp(QMainWindow):
                 }
             },
             "nodata_stats": dem_nodata_stats(self.dem, nodata=nodata),
+
+            "height_model": getattr(self, "height_model", None),
 
             "morphometrics": {
                 "A_base_m2": A_base_m2,

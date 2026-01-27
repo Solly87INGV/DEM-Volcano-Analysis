@@ -131,14 +131,14 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
                 <>
                   <CardSelection
                     title="Circular Approximation 1"
-                    description="semi-sphere"
+                    description="Rim→DEM depth integration"
                     onClick={() => handleApproximationSelect('approximation1')}
                     imageSrc="/images/Approx1Circ.png"
                     isSelected={selectedApproximation === 'approximation1'}
                   />
                   <CardSelection
                     title="Circular Approximation 2"
-                    description="cylinder"
+                    description="Frustum"
                     onClick={() => handleApproximationSelect('approximation2')}
                     imageSrc="/images/Approx2Circ.png"
                     isSelected={selectedApproximation === 'approximation2'}
@@ -148,14 +148,14 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
                 <>
                   <CardSelection
                     title="Elliptical Approximation 1"
-                    description="semi-ellipsoid of rotation"
+                    description="Elliptical frustum + DEM semi-ellipsoid"
                     onClick={() => handleApproximationSelect('approximation1')}
                     imageSrc="/images/Ellipt1Approx.png"
                     isSelected={selectedApproximation === 'approximation1'}
                   />
                   <CardSelection
                     title="Elliptical Approximation 2"
-                    description="cylinder with elliptical bases"
+                    description="Elliptical frustum + DEM cylindrical caldera"
                     onClick={() => handleApproximationSelect('approximation2')}
                     imageSrc="/images/Ellipt2Approx.png"
                     isSelected={selectedApproximation === 'approximation2'}
