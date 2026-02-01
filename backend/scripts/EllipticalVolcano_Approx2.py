@@ -9,6 +9,7 @@
 #
 # ✅ Integrazioni:
 #   - PROJ/EPSG fix (Windows): forza PROJ_LIB verso pyproj/proj_dir
+#   - Caldera contour: NEW slope-guided rim (come Approx1) + fallback controllato
 #   - Caldera depth: dal DEM (rim–floor) + fallback percentili + classificazione (N/A se non depressiva/complessa)
 #   - Caldera volume (Approx2): CILINDRO a base ellittica => V = A_caldera * depth_DEM
 #   - genera metrics.json + metrics.csv in outputs/<process_id>/ (silenzioso in __init__)
@@ -54,6 +55,17 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable  # ← per cbar co-alte 
 
 import pdf_generator
 METRICS_BASENAME = "metrics_ellip_a2"
+
+# ==========================
+# Caldera contour parameters (slope-guided) — SAME AS Approx1
+# ==========================
+CALDERA_RIM_SLOPE_TOP_PERCENT = 2.0     # top % slope pixels inside base -> rim candidates
+CALDERA_RIM_ELEV_PERCENTILE = 60.0      # percentile of DEM elevations on rim candidates -> iso-level
+CALDERA_MIN_AREA_RATIO = 0.005          # caldera area must be >= 0.5% base area
+CALDERA_MAX_AREA_RATIO = 0.25           # caldera area must be <= 25% base area
+CALDERA_INSIDE_FRAC_MIN = 0.90          # at least 90% contour pixels inside base
+CALDERA_MIN_CONTOUR_POINTS = 50         # ignore tiny noisy contours
+
 
 # ========== helpers: outputs & manifest (come negli altri OK) ==========
 
@@ -350,6 +362,141 @@ def caldera_volume_depth_integrated(
     }
 
 
+# ========== NEW: Slope-guided caldera contour extraction (as in Approx1) ==========
+
+def find_caldera_contour_slope_guided(
+    dem: np.ndarray,
+    slope: np.ndarray,
+    base_contour: np.ndarray,
+    transform,
+    nodata=None,
+    rim_slope_top_percent: float = CALDERA_RIM_SLOPE_TOP_PERCENT,
+    rim_elev_percentile: float = CALDERA_RIM_ELEV_PERCENTILE,
+    min_area_ratio: float = CALDERA_MIN_AREA_RATIO,
+    max_area_ratio: float = CALDERA_MAX_AREA_RATIO,
+    inside_frac_min: float = CALDERA_INSIDE_FRAC_MIN,
+    min_contour_points: int = CALDERA_MIN_CONTOUR_POINTS,
+) -> np.ndarray:
+    """
+    Estrae il caldera contour stimando una quota 'rim' dai pixel a slope più alto
+    dentro la base, poi seleziona l'isoline DEM a quella quota.
+
+    Filtri:
+      - contorno quasi tutto dentro base (inside_frac_min)
+      - area ratio in [min_area_ratio, max_area_ratio] rispetto alla base
+    Scoring:
+      - massimizza slope medio campionato lungo il contorno
+    """
+    dem = np.asarray(dem).astype(float)
+    slope = np.asarray(slope).astype(float)
+
+    valid = np.isfinite(dem)
+    if nodata is not None:
+        try:
+            valid &= (dem != float(nodata))
+        except Exception:
+            pass
+
+    base_mask = contour_to_mask(base_contour, dem.shape)
+    in_base = base_mask & valid
+    if int(np.sum(in_base)) == 0:
+        raise ValueError("Base mask empty/invalid; cannot guide caldera search.")
+
+    slope_vals = slope[in_base]
+    if slope_vals.size < 50:
+        raise ValueError("Too few slope samples inside base for slope-guided caldera.")
+
+    # rim candidates = top X% slope inside base
+    thr = np.percentile(slope_vals, 100.0 - float(rim_slope_top_percent))
+    rim_pix = in_base & (slope >= thr)
+
+    # widen fallback if too few
+    if int(np.sum(rim_pix)) < 30:
+        thr = np.percentile(slope_vals, 95.0)
+        rim_pix = in_base & (slope >= thr)
+
+    if int(np.sum(rim_pix)) < 10:
+        raise ValueError("Unable to extract rim candidates from slope (too few pixels).")
+
+    rim_elev = dem[rim_pix]
+    rim_elev = rim_elev[np.isfinite(rim_elev)]
+    if rim_elev.size == 0:
+        raise ValueError("No valid elevations for rim candidates.")
+
+    z_rim_guess = float(np.percentile(rim_elev, float(rim_elev_percentile)))
+
+    contours = measure.find_contours(dem, z_rim_guess)
+    if not contours:
+        raise ValueError("No contours found at slope-guided rim elevation.")
+
+    A_base = float(calculate_area(base_contour, transform))
+    if A_base <= 0:
+        raise ValueError("Base area invalid (<=0).")
+
+    def _inside_fraction(cont):
+        cc = np.round(np.asarray(cont)).astype(int)
+        rr = cc[:, 0]
+        cc2 = cc[:, 1]
+        ok = (rr >= 0) & (rr < dem.shape[0]) & (cc2 >= 0) & (cc2 < dem.shape[1])
+        rr = rr[ok]
+        cc2 = cc2[ok]
+        if rr.size == 0:
+            return 0.0
+        return float(np.mean(base_mask[rr, cc2]))
+
+    def _mean_slope_on_contour(cont):
+        cc = np.round(np.asarray(cont)).astype(int)
+        rr = cc[:, 0]
+        cc2 = cc[:, 1]
+        ok = (rr >= 0) & (rr < dem.shape[0]) & (cc2 >= 0) & (cc2 < dem.shape[1])
+        rr = rr[ok]
+        cc2 = cc2[ok]
+        if rr.size == 0:
+            return 0.0
+        return float(np.mean(slope[rr, cc2]))
+
+    best = None
+    best_score = -1e18
+
+    for c in contours:
+        if c is None or c.shape[0] < int(min_contour_points):
+            continue
+
+        inside_frac = _inside_fraction(c)
+        if inside_frac < float(inside_frac_min):
+            continue
+
+        A_c = float(calculate_area(c, transform))
+        if A_c <= 0:
+            continue
+
+        ratio = A_c / A_base
+        if ratio < float(min_area_ratio) or ratio > float(max_area_ratio):
+            continue
+
+        score = _mean_slope_on_contour(c)
+        score2 = score + 1e-6 * float(c.shape[0])  # tie-break
+        if score2 > best_score:
+            best_score = score2
+            best = c
+
+    # fallback: if none pass filters, pick max mean slope
+    if best is None:
+        for c in contours:
+            if c is None or c.shape[0] < int(min_contour_points):
+                continue
+            score = _mean_slope_on_contour(c)
+            score2 = score + 1e-6 * float(c.shape[0])
+            if score2 > best_score:
+                best_score = score2
+                best = c
+
+    if best is None:
+        raise ValueError("No suitable caldera contour found (slope-guided).")
+
+    return best
+
+
 # ========== Metrics helpers ==========
 
 def _as_serializable(v):
@@ -417,6 +564,7 @@ HUMAN_FIELDS = [
     ("meta.crs", "Working DEM CRS (EPSG/WKT)"),
     ("meta.res", "Pixel resolution (m) [x,y]"),
     ("meta.nodata", "NoData value"),
+    ("meta.params.caldera_contour_method", "Caldera contour method"),
 
     # --- Morphometrics (Base) ---
     ("morphometrics.A_base_m2", "Base area (m²)"),
@@ -616,9 +764,32 @@ class VolumeAnalysisApp(QMainWindow):
             )
             self.distance_base_km = self.distance_meters_base * 1e-3
 
+            nodata = self.meta.get("nodata", None)
+
             # Caldera
             self.slope = calculate_slope(self.dem)
-            self.caldera_contour = find_caldera_contour(self.dem, level_ratio=0.8)
+
+            # ✅ NEW: slope-guided caldera contour + fallback controllato
+            self.caldera_contour_method = "slope_guided_rim"
+            try:
+                self.caldera_contour = find_caldera_contour_slope_guided(
+                    dem=self.dem,
+                    slope=self.slope,
+                    base_contour=self.base_contour,
+                    transform=self.transform,
+                    nodata=nodata,
+                    rim_slope_top_percent=CALDERA_RIM_SLOPE_TOP_PERCENT,
+                    rim_elev_percentile=CALDERA_RIM_ELEV_PERCENTILE,
+                    min_area_ratio=CALDERA_MIN_AREA_RATIO,
+                    max_area_ratio=CALDERA_MAX_AREA_RATIO,
+                    inside_frac_min=CALDERA_INSIDE_FRAC_MIN,
+                    min_contour_points=CALDERA_MIN_CONTOUR_POINTS,
+                )
+            except Exception as e:
+                self.caldera_contour_method = "fallback_level_ratio_0p8"
+                print(f"[WARN] slope-guided caldera contour failed ({e}). Falling back to level_ratio=0.8.")
+                self.caldera_contour = find_caldera_contour(self.dem, level_ratio=0.8)
+
             self.max_slope_index1, self.max_slope_index2 = find_opposite_slope_points(self.slope, self.caldera_contour)
 
             # Caldera distances (span)
@@ -634,7 +805,7 @@ class VolumeAnalysisApp(QMainWindow):
             self.area_caldera = calculate_area(self.caldera_contour, self.transform) * 1e-6
 
             # ----------------------------
-            # Volumi EDIFICIO (invariati)
+            # Volumi EDIFICIO (INVARIATI)
             # ----------------------------
             z = self.dem[np.isfinite(self.dem)]
             self.h_max = float(np.percentile(z, 99) - np.percentile(z, 5))
@@ -647,8 +818,6 @@ class VolumeAnalysisApp(QMainWindow):
             # ----------------------------
             # Caldera depth: DEM rim–floor (con fallback)
             # ----------------------------
-            nodata = self.meta.get("nodata", None)
-
             caldera_depth = caldera_volume_depth_integrated(
                 dem=self.dem,
                 caldera_contour=self.caldera_contour,
@@ -1049,7 +1218,12 @@ class VolumeAnalysisApp(QMainWindow):
                 "nodata": nodata,
                 "params": {
                     "base_elevation_ratio": 0.05,
-                    "caldera_level_ratio": 0.8
+                    "caldera_contour_method": getattr(self, "caldera_contour_method", "unknown"),
+                    "caldera_rim_slope_top_percent": float(CALDERA_RIM_SLOPE_TOP_PERCENT),
+                    "caldera_rim_elev_percentile": float(CALDERA_RIM_ELEV_PERCENTILE),
+                    "caldera_min_area_ratio": float(CALDERA_MIN_AREA_RATIO),
+                    "caldera_max_area_ratio": float(CALDERA_MAX_AREA_RATIO),
+                    "caldera_inside_frac_min": float(CALDERA_INSIDE_FRAC_MIN),
                 }
             },
             "nodata_stats": dem_nodata_stats(self.dem, nodata=nodata),
@@ -1154,7 +1328,6 @@ class VolumeAnalysisApp(QMainWindow):
             return
 
         try:
-            # usa LA STESSA funzione del salvataggio automatico
             self._write_metrics_files(out_dir=out_dir)
 
             base = getattr(self, "metrics_basename", "metrics")

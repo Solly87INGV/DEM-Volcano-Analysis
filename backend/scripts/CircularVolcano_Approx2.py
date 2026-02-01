@@ -10,7 +10,15 @@
 # ✅ Integrazione richiesta:
 #  - generazione metrics.json + metrics.csv (umano verticale) in outputs/<process_id>/
 #  - export automatico silenzioso in __init__ (come Approx1 funzionante)
-#  - opzionale: pulsante GUI "Export Metrics (JSON + CSV)" (non rompe nulla)
+#  - pulsante GUI "Export Metrics (JSON + CSV)"
+#
+# ✅ INTEGRAZIONE (questa risposta):
+#  - caldera contour NON più da iso-quota globale (sovrastima),
+#    ma da "break-of-morphology" (rim/crest interno) via:
+#      1) coarse ROI = iso-contour alto (tratteggiato)
+#      2) centro robusto dal "floor" dentro ROI
+#      3) profili radiali: max slope (parete) + ricerca crest/rim subito fuori
+#    Fallback robusto: se fallisce, torna al coarse contour.
 
 import sys
 import os
@@ -20,11 +28,10 @@ import datetime
 import math
 
 # ================= PROJ / EPSG FIX (Windows + PostGIS conflicts) =================
-# Forza PROJ_LIB verso il proj.db di pyproj per evitare "EPSG unknown" su Windows
 def _force_proj_lib_to_pyproj():
     try:
         from pyproj import datadir
-        proj_dir = datadir.get_data_dir()  # .../pyproj/proj_dir/share/proj
+        proj_dir = datadir.get_data_dir()
         if proj_dir and os.path.isdir(proj_dir):
             os.environ["PROJ_LIB"] = proj_dir
             print(f"[DEBUG] PROJ_LIB forced to pyproj: {proj_dir}")
@@ -50,7 +57,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
-from mpl_toolkits.axes_grid1 import make_axes_locatable  # ← per cbar affiancate co-alte
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 import pdf_generator
 METRICS_BASENAME = "metrics_circ_a2"
@@ -61,10 +68,6 @@ def _script_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 def _find_latest_dem_working() -> str:
-    """
-    Ritorna il path del dem_working.tif più recente in outputs/*/dem_working.tif.
-    Se non esiste, ritorna stringa vuota.
-    """
     base = os.path.join(_script_dir(), "outputs")
     if not os.path.isdir(base):
         return ""
@@ -91,14 +94,8 @@ def _ensure_outputs_dir(process_id: str) -> str:
     return out_dir
 
 def _find_manifest():
-    """
-    Restituisce (outputs_dir, manifest_path) se trovati.
-    Priorità: env PROCESS_ID -> outputs/<PROCESS_ID>/analysis_images.json
-    Fallback: manifest più recente in outputs/*/analysis_images.json (se esiste).
-    """
     base = os.path.join(_script_dir(), "outputs")
 
-    # 1) PROCESS_ID esplicito
     pid = os.environ.get("PROCESS_ID")
     if pid:
         out_dir = os.path.join(base, pid)
@@ -106,7 +103,6 @@ def _find_manifest():
         if os.path.exists(mp):
             return out_dir, mp
 
-    # 2) fallback: ultimo manifest disponibile
     if os.path.isdir(base):
         candidates = []
         for name in os.listdir(base):
@@ -121,7 +117,6 @@ def _find_manifest():
     return None, None
 
 def _load_manifest_images(manifest_path):
-    """Estrae dal JSON la lista di immagini (preferendo abs_path; fallback a filename)."""
     try:
         with open(manifest_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -137,7 +132,6 @@ def _load_manifest_images(manifest_path):
         return []
 
 def _normalize_and_filter_paths(paths, base_dir=None):
-    """Normalizza e tiene solo i file realmente esistenti."""
     norm = []
     for p in paths:
         if not p:
@@ -153,11 +147,10 @@ def _normalize_and_filter_paths(paths, base_dir=None):
     return norm
 
 def _remove_triplets(paths):
-    """Rimuove ogni triplet_*.png dalla lista (non toccare le doppiette)."""
     return [p for p in paths if "triplet_" not in os.path.basename(p).lower()]
 
 
-# ========== Analysis functions (calcoli invariati) ==========
+# ========== Analysis functions ==========
 
 def find_lowest_base_contour(matrix, base_elevation_ratio=0.05):
     base_level = matrix.min() + (matrix.max() - matrix.min()) * base_elevation_ratio
@@ -175,24 +168,15 @@ def find_opposite_base_points(contour):
     return base_index1, base_index2
 
 def _pixel_to_map_xy(transform, row, col):
-    # centro pixel
     x, y = transform * (col + 0.5, row + 0.5)
     return float(x), float(y)
 
 def distance_between_points(r1, c1, r2, c2, transform):
-    """
-    Distanza in metri tra due punti in coordinate pixel (row/col),
-    usando l'Affine transform del raster.
-    """
     x1, y1 = _pixel_to_map_xy(transform, r1, c1)
     x2, y2 = _pixel_to_map_xy(transform, r2, c2)
     return float(np.hypot(x2 - x1, y2 - y1))
 
 def calculate_area(contour, transform):
-    """
-    Area in m² del contorno (Nx2: [row, col]) usando coordinate mappa (metri)
-    via transform + formula di Shoelace.
-    """
     contour = np.asarray(contour, dtype=float)
     if contour.shape[0] < 3:
         return 0.0
@@ -214,23 +198,23 @@ def calculate_slope(matrix):
     dy = sobel(matrix, axis=0)
     return np.hypot(dx, dy)
 
-def find_caldera_contour(matrix, level_ratio=0.8):
+def find_caldera_contour_iso(matrix, level_ratio=0.8):
     contour_level = matrix.max() * level_ratio
     contours = measure.find_contours(matrix, contour_level)
     if len(contours) == 0:
         raise ValueError("No contours found for the given level ratio.")
-    return max(contours, key=len)
+    return max(contours, key=len), float(contour_level)
 
 def find_opposite_slope_points(slope_matrix, contour):
     contour = np.round(contour).astype(int)
     contour = contour[
-        (contour[:,0] >= 0) & (contour[:,0] < slope_matrix.shape[0]) &
-        (contour[:,1] >= 0) & (contour[:,1] < slope_matrix.shape[1])
+        (contour[:, 0] >= 0) & (contour[:, 0] < slope_matrix.shape[0]) &
+        (contour[:, 1] >= 0) & (contour[:, 1] < slope_matrix.shape[1])
     ]
     if len(contour) == 0:
         raise ValueError("No valid points in contour after filtering.")
     contour_slopes = [slope_matrix[pt[0], pt[1]] for pt in contour]
-    max_index1 = np.argmax(contour_slopes)
+    max_index1 = int(np.argmax(contour_slopes))
     max_slope_index1 = tuple(contour[max_index1])
     opposite_index = (max_index1 + len(contour) // 2) % len(contour)
     max_slope_index2 = tuple(contour[opposite_index])
@@ -355,13 +339,7 @@ def caldera_volume_depth_integrated(
         "caldera_mask_area_m2": float(caldera_mask_area_m2),
     }
 
-
-
 def robust_height_p99_minus_p05(dem: np.ndarray, base_contour: np.ndarray, nodata=None) -> float:
-    """
-    Altezza robusta del vulcano (m): P99 - P05 calcolata *dentro la base*.
-    Fallback: se la maschera base è vuota, usa tutti i pixel validi.
-    """
     dem = np.asarray(dem).astype(float)
 
     valid = np.isfinite(dem)
@@ -381,10 +359,239 @@ def robust_height_p99_minus_p05(dem: np.ndarray, base_contour: np.ndarray, nodat
     return float(np.percentile(z, 99) - np.percentile(z, 5))
 
 
-# ========== Metrics helpers (NUOVO: come Approx1, ma adattato a Approx2) ==========
+# ========== NEW: Caldera rim detection (break-of-morphology) ==========
+
+def _safe_round_int(x):
+    return int(np.clip(int(round(x)), -10**9, 10**9))
+
+def _circular_moving_average(values: np.ndarray, win: int) -> np.ndarray:
+    """
+    Smooth 1D circular series with odd window.
+    """
+    v = np.asarray(values, dtype=float)
+    n = v.size
+    if n == 0:
+        return v
+    win = int(win)
+    if win < 3:
+        return v
+    if win % 2 == 0:
+        win += 1
+    pad = win // 2
+    vv = np.r_[v[-pad:], v, v[:pad]]
+    kernel = np.ones(win, dtype=float) / float(win)
+    sm = np.convolve(vv, kernel, mode="valid")  # length n+pad+pad - win + 1 = n
+    return sm[:n]
+
+def _centroid_from_contour(contour: np.ndarray):
+    c = np.asarray(contour, dtype=float)
+    if c.size == 0:
+        return None
+    return float(np.mean(c[:, 0])), float(np.mean(c[:, 1]))
+
+def _robust_center_from_floor(dem: np.ndarray, mask: np.ndarray, valid: np.ndarray, floor_percentile: float = 10.0):
+    vals = dem[mask & valid]
+    if vals.size < 20:
+        return None
+    thr = float(np.percentile(vals, floor_percentile))
+    rr, cc = np.where(mask & valid & (dem <= thr))
+    if rr.size < 10:
+        return None
+    return float(np.mean(rr)), float(np.mean(cc))
+
+def _first_local_max_after(z: np.ndarray, start_idx: int, min_sep: int = 2):
+    """
+    Finds first local maximum after start_idx+min_sep where dz goes + then -.
+    If not found, returns argmax on tail.
+    """
+    z = np.asarray(z, dtype=float)
+    n = z.size
+    s = int(start_idx) + int(min_sep)
+    if n < 5 or s >= n - 2:
+        return int(np.argmax(z)) if n > 0 else None
+
+    dz = np.diff(z)
+    # local max at i where dz[i-1] > 0 and dz[i] <= 0
+    for i in range(max(2, s), n - 2):
+        if dz[i - 1] > 0 and dz[i] <= 0:
+            return i
+    # fallback
+    return int(np.argmax(z[s:]) + s)
+
+def find_caldera_rim_break_of_morphology(
+    dem: np.ndarray,
+    slope: np.ndarray,
+    coarse_contour: np.ndarray,
+    nodata=None,
+    floor_center_percentile: float = 10.0,
+    n_rays: int = 360,
+    inner_frac: float = 0.35,
+    outer_frac: float = 1.05,
+    smooth_window: int = 11,
+    max_radius_guard: int = 2500
+):
+    """
+    Returns: rim_contour (Nx2 row/col), center_rc (row,col)
+    """
+    demf = dem.astype(float)
+    slp = slope.astype(float)
+
+    valid = np.isfinite(demf)
+    if nodata is not None:
+        try:
+            valid = valid & (demf != float(nodata))
+        except Exception:
+            pass
+
+    coarse_mask = contour_to_mask(coarse_contour, demf.shape)
+    if np.sum(coarse_mask & valid) < 100:
+        # ROI troppo piccola o problematica
+        cen = _centroid_from_contour(coarse_contour)
+        if cen is None:
+            raise ValueError("Coarse caldera ROI invalid and centroid failed.")
+        center_r, center_c = cen
+        return coarse_contour, (center_r, center_c)
+
+    # Center from floor
+    center = _robust_center_from_floor(demf, coarse_mask, valid, floor_percentile=floor_center_percentile)
+    if center is None:
+        cen = _centroid_from_contour(coarse_contour)
+        if cen is None:
+            raise ValueError("Cannot compute caldera center (floor + centroid failed).")
+        center_r, center_c = cen
+    else:
+        center_r, center_c = center
+
+    H, W = demf.shape
+    center_r_i = float(center_r)
+    center_c_i = float(center_c)
+
+    # For each angle, estimate outer radius where it exits ROI (coarse mask)
+    angles = np.linspace(0.0, 2.0 * np.pi, int(n_rays), endpoint=False)
+    rim_points = []
+    radii = []
+
+    for ang in angles:
+        dr = math.sin(ang)
+        dc = math.cos(ang)
+
+        # max possible radius to stay inside image
+        # conservative (avoid long loops): also guard with max_radius_guard
+        max_r_img = min(
+            max_radius_guard,
+            int(max(H, W))
+        )
+
+        # step along ray (pixel grid)
+        rr_list = []
+        cc_list = []
+        for k in range(1, max_r_img):
+            rr = center_r_i + dr * k
+            cc = center_c_i + dc * k
+            rri = int(round(rr))
+            cci = int(round(cc))
+            if rri < 0 or rri >= H or cci < 0 or cci >= W:
+                break
+            rr_list.append(rri)
+            cc_list.append(cci)
+
+        if len(rr_list) < 30:
+            continue
+
+        rr_arr = np.asarray(rr_list, dtype=int)
+        cc_arr = np.asarray(cc_list, dtype=int)
+
+        in_roi = coarse_mask[rr_arr, cc_arr]
+        if not np.any(in_roi):
+            continue
+
+        # find contiguous segment starting near center: we expect first indices maybe inside
+        # take the farthest index still inside ROI (outer boundary along this ray)
+        idx_inside = np.where(in_roi)[0]
+        if idx_inside.size < 10:
+            continue
+        outer_idx = int(idx_inside.max())
+
+        # define search interval around that outer radius
+        r_outer = outer_idx
+        r0 = int(max(5, math.floor(r_outer * float(inner_frac))))
+        r1 = int(min(len(rr_arr) - 1, math.ceil(r_outer * float(outer_frac))))
+        if r1 - r0 < 20:
+            continue
+
+        prof_rr = rr_arr[r0:r1+1]
+        prof_cc = cc_arr[r0:r1+1]
+
+        # valid samples
+        vmask = valid[prof_rr, prof_cc]
+        if np.sum(vmask) < 20:
+            continue
+
+        z_prof = demf[prof_rr, prof_cc]
+        s_prof = slp[prof_rr, prof_cc]
+
+        # if many invalids, skip
+        if not np.isfinite(s_prof).any() or not np.isfinite(z_prof).any():
+            continue
+
+        # pick wall = max slope in interval (robust: ignore invalid)
+        s_tmp = np.where(np.isfinite(s_prof), s_prof, -np.inf)
+        wall_rel = int(np.argmax(s_tmp))
+        if not np.isfinite(s_tmp[wall_rel]):
+            continue
+
+        # crest = first local max in elevation after wall (rim)
+        crest_rel = _first_local_max_after(z_prof, wall_rel, min_sep=2)
+        if crest_rel is None:
+            continue
+
+        rr_rim = int(prof_rr[crest_rel])
+        cc_rim = int(prof_cc[crest_rel])
+
+        # radius from center
+        rad = float(math.hypot(rr_rim - center_r_i, cc_rim - center_c_i))
+
+        rim_points.append((rr_rim, cc_rim))
+        radii.append(rad)
+
+    if len(rim_points) < max(40, int(n_rays * 0.25)):
+        # too few points -> fallback to coarse
+        return coarse_contour, (center_r, center_c)
+
+    rim_points = np.asarray(rim_points, dtype=float)
+    radii = np.asarray(radii, dtype=float)
+
+    # remove outliers by radius
+    r_lo = float(np.percentile(radii, 5))
+    r_hi = float(np.percentile(radii, 95))
+    keep = (radii >= r_lo) & (radii <= r_hi)
+    rim_points = rim_points[keep]
+    radii = radii[keep]
+    if rim_points.shape[0] < max(30, int(n_rays * 0.2)):
+        return coarse_contour, (center_r, center_c)
+
+    # sort by angle (recompute angle from center)
+    angs = np.arctan2(rim_points[:, 0] - center_r_i, rim_points[:, 1] - center_c_i)
+    order = np.argsort(angs)
+    rim_points = rim_points[order]
+    radii = radii[order]
+    angs = angs[order]
+
+    # smooth radii circularly
+    radii_sm = _circular_moving_average(radii, smooth_window)
+
+    # reconstruct smoothed points on same angles (use direction vectors from angle)
+    rr_sm = center_r_i + np.sin(angs) * radii_sm
+    cc_sm = center_c_i + np.cos(angs) * radii_sm
+
+    rim_contour = np.stack([rr_sm, cc_sm], axis=1).astype(float)
+
+    return rim_contour, (center_r, center_c)
+
+
+# ========== Metrics helpers ==========
 
 def _as_serializable(v):
-    # per json (numpy -> python)
     if isinstance(v, (np.integer,)):
         return int(v)
     if isinstance(v, (np.floating,)):
@@ -413,9 +620,6 @@ def dem_nodata_stats(dem, nodata=None):
     }
 
 def contour_perimeter_m(contour, transform) -> float:
-    """
-    Perimetro in metri del contorno (Nx2 row/col) proiettandolo in coordinate mappa via transform.
-    """
     c = np.asarray(contour, dtype=float)
     if c.shape[0] < 2:
         return 0.0
@@ -439,12 +643,7 @@ def _get_by_path(d: dict, path: str):
         cur = cur.get(part)
     return cur
 
-# CSV "umano" verticale: SOLO SI (m, m², m³) e parametri del modello Approx2
-
 HUMAN_FIELDS = [
-    # =========================
-    # META
-    # =========================
     ("Meta", "Run timestamp (UTC)", "meta.timestamp_utc", ""),
     ("Meta", "Run ID (process_id)", "meta.process_id", ""),
     ("Meta", "Original input filename", "meta.original_file_name", ""),
@@ -455,33 +654,21 @@ HUMAN_FIELDS = [
     ("Meta", "Pixel resolution", "meta.res", "m"),
     ("Meta", "NoData value", "meta.nodata", ""),
 
-    # =========================
-    # MORPHOMETRICS — BASE
-    # =========================
     ("Base morphometrics", "Base area", "morphometrics.A_base_m2", "m²"),
     ("Base morphometrics", "Base perimeter", "morphometrics.P_base_m", "m"),
     ("Base morphometrics", "Base diameter (opposite points)", "morphometrics.D_base_m", "m"),
     ("Base morphometrics", "Base radius used in volume", "morphometrics.R_base_m", "m"),
     ("Base morphometrics", "Equivalent base radius from area", "morphometrics.R_eq_base_m", "m"),
 
-    # =========================
-    # MORPHOMETRICS — CALDERA
-    # =========================
     ("Caldera morphometrics", "Caldera area", "morphometrics.A_caldera_m2", "m²"),
     ("Caldera morphometrics", "Caldera perimeter", "morphometrics.P_caldera_m", "m"),
     ("Caldera morphometrics", "Caldera diameter (opposite points)", "morphometrics.D_caldera_m", "m"),
     ("Caldera morphometrics", "Caldera radius used in volume", "morphometrics.R_caldera_m", "m"),
     ("Caldera morphometrics", "Equivalent caldera radius from area", "morphometrics.R_eq_caldera_m", "m"),
 
-    # =========================
-    # HEIGHT MODEL (Approx2)
-    # =========================
     ("Height model (Approx2)", "Height method", "height_model.method", ""),
     ("Height model (Approx2)", "Height (P99 - P05) inside base", "height_model.p99_minus_p05_m", "m"),
 
-    # =========================
-    # CALDERA DEPTH (QA)
-    # =========================
     ("Caldera depth (QA)", "Caldera reference depth (rim p90 - floor p05)", "volume_model.inputs_used.caldera_depth.depth_ref_m", "m"),
     ("Caldera depth (QA)", "Caldera rim reference elevation", "volume_model.inputs_used.caldera_depth.rim_reference.z_rim_ref_m", "m"),
     ("Caldera depth (QA)", "Caldera floor reference elevation", "volume_model.inputs_used.caldera_depth.floor_reference.z_floor_ref_m", "m"),
@@ -492,23 +679,14 @@ HUMAN_FIELDS = [
     ("Caldera depth (QA)", "Caldera status reason", "volume_model.inputs_used.caldera_depth.reason", ""),
     ("Caldera depth (QA)", "Caldera action", "volume_model.inputs_used.caldera_depth.action", ""),
 
-    # =========================
-    # MODEL DESCRIPTORS
-    # =========================
     ("Model descriptors", "Edifice volume model", "volume_model.edifice_model", ""),
     ("Model descriptors", "Caldera volume model", "volume_model.caldera_model", ""),
     ("Model descriptors", "Intermediate frustum-like volume", "volume_model.intermediate.V_frustum_m3", "m³"),
 
-    # =========================
-    # VOLUMES
-    # =========================
     ("Volumes", "Total edifice volume", "volumes.V_total_m3", "m³"),
     ("Volumes", "Caldera volume", "volumes.V_caldera_m3", "m³"),
     ("Volumes", "Effective edifice volume", "volumes.V_effective_m3", "m³"),
 
-    # =========================
-    # DERIVED
-    # =========================
     ("Derived", "Slenderness H/Dbase", "derived.slenderness_H_over_Dbase", ""),
     ("Derived", "Sanity Abase/Dbase²", "derived.sanity_Abase_over_Dbase2", ""),
     ("Derived", "Circularity base", "derived.circularity_base", ""),
@@ -516,7 +694,6 @@ HUMAN_FIELDS = [
     ("Derived", "Equivalent height V/Abase", "derived.eq_height_V_over_Abase_m", "m"),
     ("Derived", "Ratio vs perfect cone", "derived.ratio_vs_cone", ""),
 ]
-
 
 def metrics_to_human_rows(metrics: dict):
     rows = []
@@ -544,28 +721,24 @@ class VolumeAnalysisApp(QMainWindow):
         super().__init__()
         self.setWindowTitle('Volcano Volume Analysis')
         self.dem = dem
-        self.transform = transform  # <-- SALVATO QUI (metrica raster)
+        self.transform = transform
         self.original_file_name = original_file_name
 
-        # meta per export metrics
         self.meta = meta or {}
 
-        # outputs context
         self.process_id = self.meta.get("process_id") or _resolve_process_id()
         self.out_dir = _ensure_outputs_dir(self.process_id)
         self.metrics_basename = METRICS_BASENAME
 
-        self.calculate_results()  # prima dei widget
+        self.calculate_results()
         self.initUI()
 
-        # salva overview + payload + metrics (non blocca la GUI)
         try:
             self._save_overview_png()
             self._emit_stdout_payload()
         except Exception as e:
             print(f"[PY VOL WARN] post-render saving/payload failed: {e}")
 
-        # ✅ metrics: scrive SEMPRE, silenzioso
         try:
             self._write_metrics_files()
         except Exception as e:
@@ -577,7 +750,6 @@ class VolumeAnalysisApp(QMainWindow):
 
         main_layout = QVBoxLayout(central_widget)
 
-        # Figura con constrained layout per margini e cbar
         self.figure = Figure(figsize=(18, 14), constrained_layout=True)
         self.canvas = FigureCanvas(self.figure)
         main_layout.addWidget(self.canvas)
@@ -595,7 +767,6 @@ class VolumeAnalysisApp(QMainWindow):
         self.download_image_button.clicked.connect(self.download_graph_image)
         button_layout.addWidget(self.download_image_button)
 
-        # ✅ Pulsante export metrics (non rompe l'app: se non ti serve, puoi ignorarlo)
         self.export_metrics_button = QPushButton('Export Metrics (JSON + CSV)')
         self.export_metrics_button.setFixedSize(220, 50)
         self.export_metrics_button.clicked.connect(self.export_metrics)
@@ -605,10 +776,10 @@ class VolumeAnalysisApp(QMainWindow):
 
     def calculate_results(self):
         try:
+            # BASE
             self.base_contour = find_lowest_base_contour(self.dem, base_elevation_ratio=0.05)
             self.base_point1, self.base_point2 = find_opposite_base_points(self.base_contour)
 
-            # Distanze base
             self.distance_meters_base = distance_between_points(
                 self.base_point1[0], self.base_point1[1],
                 self.base_point2[0], self.base_point2[1],
@@ -616,12 +787,40 @@ class VolumeAnalysisApp(QMainWindow):
             )
             self.distance_base_km = self.distance_meters_base * 1e-3
 
-            # Caldera
+            # CALDERA: slope map
             self.slope = calculate_slope(self.dem)
-            self.caldera_contour = find_caldera_contour(self.dem, level_ratio=0.8)
+
+            # 1) coarse contour (ROI)
+            self.coarse_caldera_contour, self.coarse_caldera_level_m = find_caldera_contour_iso(self.dem, level_ratio=0.8)
+
+            # 2) refined rim contour (break-of-morphology)
+            nodata = self.meta.get("nodata", None)
+            try:
+                rim_contour, center_rc = find_caldera_rim_break_of_morphology(
+                    dem=self.dem,
+                    slope=self.slope,
+                    coarse_contour=self.coarse_caldera_contour,
+                    nodata=nodata,
+                    floor_center_percentile=10.0,
+                    n_rays=360,
+                    inner_frac=0.35,
+                    outer_frac=1.05,
+                    smooth_window=11,
+                    max_radius_guard=2500
+                )
+                self.caldera_contour = rim_contour
+                self.caldera_center_rc = center_rc  # (row,col) float
+                self.caldera_detection_method = "rim_break_of_morphology"
+            except Exception as e:
+                print(f"[WARN] rim detection failed, fallback to coarse contour: {e}")
+                self.caldera_contour = self.coarse_caldera_contour
+                self.caldera_center_rc = _centroid_from_contour(self.coarse_caldera_contour) or (0.0, 0.0)
+                self.caldera_detection_method = "fallback_coarse_iso"
+
+            # 3) opposite points on contour using slope along *rim* contour
             self.max_slope_index1, self.max_slope_index2 = find_opposite_slope_points(self.slope, self.caldera_contour)
 
-            # Distanze caldera
+            # distance caldera
             self.distance_meters_caldera = distance_between_points(
                 self.max_slope_index1[0], self.max_slope_index1[1],
                 self.max_slope_index2[0], self.max_slope_index2[1],
@@ -629,20 +828,20 @@ class VolumeAnalysisApp(QMainWindow):
             )
             self.distance_caldera_km = self.distance_meters_caldera * 1e-3
 
-            # Aree (m² + km² per GUI)
+            # AREAS
             self.area_base_m2 = float(calculate_area(self.base_contour, self.transform))
             self.area_caldera_m2 = float(calculate_area(self.caldera_contour, self.transform))
             self.area_base = self.area_base_m2 * 1e-6
             self.area_caldera = self.area_caldera_m2 * 1e-6
 
-            # Volumi (Approx2: caldera depth-integrated rim→DEM + fallback percentili)
-            # evita outlier e NoData: P99 - P05 *dentro la base*
-            nodata = self.meta.get("nodata", None)
+            # VOLUMES Approx2 (edifice frustum-like + caldera depth-integrated)
             self.h_max = robust_height_p99_minus_p05(self.dem, self.base_contour, nodata=nodata)
             self.R1 = self.distance_meters_base / 2
             self.R2 = self.distance_meters_caldera / 2
+
             self.v = (1/3) * np.pi * self.h_max * (self.R1**2 + self.R2**2 + self.R1 * self.R2)
             self.v_km3 = self.v * 1e-9
+
             caldera_depth = caldera_volume_depth_integrated(
                 dem=self.dem,
                 caldera_contour=self.caldera_contour,
@@ -680,7 +879,7 @@ class VolumeAnalysisApp(QMainWindow):
             V_caldera_m3 = float(caldera_depth.get("V_caldera_m3", 0.0))
             V_effective_m3 = float(self.v - V_caldera_m3)
 
-            # Classificazione caldera (come Approx1)
+            # classification
             if float(caldera_depth.get("depth_ref_m", 0.0)) <= 0:
                 self.caldera_status = "non_depressive_or_complex"
                 self.caldera_reason = "rim_below_floor"
@@ -694,7 +893,7 @@ class VolumeAnalysisApp(QMainWindow):
                 self.caldera_reason = None
                 self.caldera_action = "computed"
 
-            # Attributi QA per JSON/CSV (preparati come Approx1)
+            # QA attrs
             self.caldera_z_rim_ref_m = caldera_depth.get("z_rim_ref_m", None)
             self.caldera_z_floor_ref_m = caldera_depth.get("z_floor_ref_m", None)
             self.caldera_depth_ref_m = caldera_depth.get("depth_ref_m", None)
@@ -708,14 +907,13 @@ class VolumeAnalysisApp(QMainWindow):
             self.caldera_pixel_area_m2 = caldera_depth.get("pixel_area_m2", None)
             self.caldera_mask_area_m2 = caldera_depth.get("caldera_mask_area_m2", None)
 
-            # Mantieni variabili/attributi esistenti (senza cambiare logica edifice)
+            # legacy attrs
             self.r2 = self.R2 * 1e-3
             self.p = self.r2
 
             self.v_caldera = V_caldera_m3 * 1e-9
             self.v_volcano = V_effective_m3 * 1e-9
 
-            # Descrizioni
             self.description_base = (
                 "Base 1: Represents one of the two opposite points along\n"
                 "the base contour of the volcano. It is selected as part of\n"
@@ -735,7 +933,6 @@ class VolumeAnalysisApp(QMainWindow):
                 "halfway around the contour."
             )
 
-            # Output risultati: riga caldera con N/A (GUI lunga, PDF corta)
             if getattr(self, "caldera_status", None) == "depressive":
                 caldera_line_gui = f"Caldera volume: {self.v_caldera:.3e} km³"
                 caldera_line_pdf = caldera_line_gui
@@ -744,7 +941,6 @@ class VolumeAnalysisApp(QMainWindow):
                 caldera_line_gui = f"Caldera volume: N/A (complex/non-depressive: {reason})"
                 caldera_line_pdf = f"Caldera volume: N/A ({reason})"
 
-            # Testo risultati (GUI)
             self.results_text = (
                 f"Base area of the volcano: {self.area_base:.2f} km²\n"
                 f"Base width (Distance between opposite points of the base): {self.distance_base_km:.2f} km\n"
@@ -764,6 +960,7 @@ class VolumeAnalysisApp(QMainWindow):
                 f"{caldera_line_pdf}",
                 f"Effective volume of the volcanic edifice: {self.v_volcano:.2f} km³"
             ]
+
         except Exception as e:
             QMessageBox.critical(self, "Calculation Error", f"An error occurred during calculation: {e}")
 
@@ -771,15 +968,12 @@ class VolumeAnalysisApp(QMainWindow):
         self.figure.clear()
         fig = self.figure
 
-        # Margini esterni e spaziatura tra pannelli
         fig.set_constrained_layout_pads(w_pad=0.12, h_pad=0.02, wspace=0.40, hspace=0.60)
-
         gs = gridspec.GridSpec(nrows=3, ncols=3, height_ratios=[4, 1, 1.5], figure=fig, wspace=0.4, hspace=0.6)
 
-        # Plot 1: DEM
+        # DEM
         ax1 = fig.add_subplot(gs[0, 0])
         im1 = ax1.imshow(self.dem, cmap='terrain', origin='upper')
-        # Colorbar co-alte, affiancata, tick/label a destra
         div1 = make_axes_locatable(ax1)
         cax1 = div1.append_axes("right", size="4.6%", pad=0.10)
         cax1.set_in_layout(True)
@@ -789,11 +983,10 @@ class VolumeAnalysisApp(QMainWindow):
         cbar1.ax.yaxis.set_label_position('right')
         cbar1.ax.tick_params(labelsize=9, pad=1)
         cbar1.ax.yaxis.labelpad = 2
-
         ax1.set_title("Volcano DEM", fontsize=14, pad=20, y=1.02)
         ax1.axis('on')
 
-        # Plot 2: Base opposta
+        # Base
         ax2 = fig.add_subplot(gs[0, 1])
         im2 = ax2.imshow(self.dem, cmap='terrain', origin='upper')
         div2 = make_axes_locatable(ax2)
@@ -812,7 +1005,7 @@ class VolumeAnalysisApp(QMainWindow):
         ax2.set_title("Opposite Points of the Volcano Base", fontsize=14, pad=20, y=1.02)
         ax2.axis('on')
 
-        # Plot 3: Caldera max slope
+        # Caldera
         ax3 = fig.add_subplot(gs[0, 2])
         im3 = ax3.imshow(self.dem, cmap='terrain', origin='upper')
         div3 = make_axes_locatable(ax3)
@@ -827,7 +1020,20 @@ class VolumeAnalysisApp(QMainWindow):
 
         s1, = ax3.plot(self.max_slope_index1[1], self.max_slope_index1[0], 'ro', markersize=10, label='Max Slope 1')
         s2, = ax3.plot(self.max_slope_index2[1], self.max_slope_index2[0], 'yo', markersize=10, label='Max Slope 2')
+
+        # ✅ coarse ROI (tratteggiato) + center (magenta) + rim (blu)
+        h_roi = None
+        if hasattr(self, "coarse_caldera_contour") and self.coarse_caldera_contour is not None:
+            h_roi, = ax3.plot(self.coarse_caldera_contour[:, 1], self.coarse_caldera_contour[:, 0],
+                              'c--', linewidth=1, label="Coarse ROI")
+
+        h_center = None
+        if hasattr(self, "caldera_center_rc") and self.caldera_center_rc is not None:
+            cr, cc = self.caldera_center_rc
+            h_center, = ax3.plot(cc, cr, 'mo', markersize=7, label="Center (ROI floor)")
+
         cald, = ax3.plot(self.caldera_contour[:, 1], self.caldera_contour[:, 0], 'b-', linewidth=1, label="Caldera Contour")
+
         ax3.set_title("Opposite Maximum Slope Points on the Caldera", fontsize=14, pad=20, y=1.02)
         ax3.axis('on')
 
@@ -838,8 +1044,17 @@ class VolumeAnalysisApp(QMainWindow):
         leg2.get_frame().set_linewidth(1)
 
         l3 = fig.add_subplot(gs[1, 2]); l3.axis('off')
-        leg3 = l3.legend([s1, s2, cald], ['Max Slope 1', 'Max Slope 2', 'Caldera Contour'],
-                         loc='center', frameon=True, edgecolor='black', facecolor='lightgray', ncol=3)
+        handles = [s1, s2, cald]
+        labels = ['Max Slope 1', 'Max Slope 2', 'Caldera Contour']
+        if h_roi is not None:
+            handles.insert(2, h_roi)
+            labels.insert(2, 'Coarse ROI')
+        if h_center is not None:
+            handles.append(h_center)
+            labels.append('Center (ROI floor)')
+
+        leg3 = l3.legend(handles, labels,
+                         loc='center', frameon=True, edgecolor='black', facecolor='lightgray', ncol=2)
         leg3.get_frame().set_linewidth(1)
 
         l1 = fig.add_subplot(gs[1, 0]); l1.axis('off'); l1.text(0.5, 0.5, "", ha='center', va='center')
@@ -855,21 +1070,19 @@ class VolumeAnalysisApp(QMainWindow):
                 bbox=dict(boxstyle="round,pad=0.5", edgecolor="black", facecolor="white"),
                 wrap=True, transform=d3.transAxes)
 
-        # NIENTE fig.subplots_adjust(...): interferisce con constrained_layout
         self.canvas.draw()
 
     # ----- overview + payload -----
     def _save_overview_png(self):
         try:
             out_png = os.path.join(self.out_dir, "circular_approx2_overview.png")
-            self.figure.savefig(out_png, dpi=150)  # niente bbox_inches='tight'
+            self.figure.savefig(out_png, dpi=150)
             print(f"[PY VOL {self.process_id}] saved {out_png}")
         except Exception as e:
             print(f"[PY VOL ERR] failed to save overview png: {e}")
 
     def _emit_stdout_payload(self):
         images = []
-        # manifest standard (se presente)
         outputs_dir, manifest_path = _find_manifest()
         if manifest_path and os.path.exists(manifest_path):
             try:
@@ -882,18 +1095,12 @@ class VolumeAnalysisApp(QMainWindow):
             except Exception as e:
                 print(f"[PY VOL WARN] failed reading manifest for stdout payload: {e}")
 
-        # overview corrente
         images.append(f"/outputs/{self.process_id}/circular_approx2_overview.png")
-
         payload = {"result": self.results_text, "images": images}
         print(json.dumps(payload), flush=True)
 
-    # ----- doppietta finale (stessa gabbia delle doppiette buone) -----
+    # ----- doppietta finale -----
     def _save_final_doublet_png(self, out_path):
-        """
-        Salva una DOPPIETTA 1x2 (base vs caldera) con la STESSA gabbia
-        delle doppiette precedenti: 14.5x5.5, spacer centrale, colorbar 4.6%.
-        """
         from mpl_toolkits.axes_grid1 import make_axes_locatable
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
@@ -901,11 +1108,11 @@ class VolumeAnalysisApp(QMainWindow):
         fig = plt.figure(figsize=(FIG_W, FIG_H))
         gs = gridspec.GridSpec(
             1, 3, figure=fig,
-            width_ratios=[1.0, 0.08, 1.0],   # sinistra | SPACER | destra
+            width_ratios=[1.0, 0.08, 1.0],
             wspace=0.15
         )
 
-        # Sinistra: BASE
+        # BASE
         ax1 = fig.add_subplot(gs[0, 0])
         im1 = ax1.imshow(self.dem, cmap='terrain', origin='upper',
                          interpolation='nearest', resample=False)
@@ -922,7 +1129,6 @@ class VolumeAnalysisApp(QMainWindow):
         cbar1.ax.tick_params(labelsize=9, pad=1)
         cbar1.ax.yaxis.labelpad = 2
 
-        # 🔹 Legenda nel pannello sinistro
         leg1 = ax1.legend(
             handles=[p1, p2, pc],
             labels=['Base 1', 'Base 2', 'Base Contour'],
@@ -933,16 +1139,25 @@ class VolumeAnalysisApp(QMainWindow):
         leg1.get_frame().set_facecolor('white')
         leg1.get_frame().set_edgecolor('black')
 
-        # Spacer
         ax_spacer = fig.add_subplot(gs[0, 1]); ax_spacer.axis('off')
 
-        # Destra: CALDERA
+        # CALDERA
         ax2 = fig.add_subplot(gs[0, 2])
         im2 = ax2.imshow(self.dem, cmap='terrain', origin='upper',
                          interpolation='nearest', resample=False)
-        cc, = ax2.plot(self.caldera_contour[:, 1], self.caldera_contour[:, 0], 'b-', linewidth=1, label='Caldera Contour')
+
+        # include ROI + center in doublet (QA utile)
+        if hasattr(self, "coarse_caldera_contour") and self.coarse_caldera_contour is not None:
+            ax2.plot(self.coarse_caldera_contour[:, 1], self.coarse_caldera_contour[:, 0],
+                     'c--', linewidth=1, label='Coarse ROI')
+        if hasattr(self, "caldera_center_rc") and self.caldera_center_rc is not None:
+            cr, cc = self.caldera_center_rc
+            ax2.plot(cc, cr, 'mo', markersize=6, label='Center (ROI floor)')
+
+        cc_line, = ax2.plot(self.caldera_contour[:, 1], self.caldera_contour[:, 0], 'b-', linewidth=1, label='Caldera Contour')
         s1, = ax2.plot(self.max_slope_index1[1], self.max_slope_index1[0], 'ro', markersize=8, label='Max Slope 1')
         s2, = ax2.plot(self.max_slope_index2[1], self.max_slope_index2[0], 'yo', markersize=8, label='Max Slope 2')
+
         ax2.set_title("Opposite Maximum Slope Points on the Caldera", pad=8, fontsize=12)
         ax2.set_aspect('equal', adjustable='box')
         div2 = make_axes_locatable(ax2)
@@ -953,18 +1168,15 @@ class VolumeAnalysisApp(QMainWindow):
         cbar2.ax.tick_params(labelsize=9, pad=1)
         cbar2.ax.yaxis.labelpad = 2
 
-        # 🔹 Legenda nel pannello destro
-        leg2 = ax2.legend(
-            handles=[s1, s2, cc],
-            labels=['Max Slope 1', 'Max Slope 2', 'Caldera Contour'],
-            loc='upper right',
-            frameon=True
-        )
+        # legenda
+        handles = [s1, s2, cc_line]
+        labels = ['Max Slope 1', 'Max Slope 2', 'Caldera Contour']
+        leg2 = ax2.legend(handles=handles, labels=labels, loc='upper right', frameon=True)
         leg2.get_frame().set_alpha(0.7)
         leg2.get_frame().set_facecolor('white')
         leg2.get_frame().set_edgecolor('black')
 
-        fig.savefig(out_path, dpi=170)  # no bbox_inches='tight'
+        fig.savefig(out_path, dpi=170)
         plt.close(fig)
 
         if not os.path.exists(out_path):
@@ -983,13 +1195,6 @@ class VolumeAnalysisApp(QMainWindow):
             self.download_results()
 
     def download_results(self):
-        """
-        Genera il PDF finale:
-        - prova a caricare DEM + doppiette dal manifest (se presente)
-        - rimuove SOLO le triplette
-        - aggiunge in coda la nuova DOPPIETTA
-        - fail-safe: se lista vuota, usa almeno la doppietta
-        """
         options = QFileDialog.Options()
         file_path, _ = QFileDialog.getSaveFileName(self, "Save Results As", "", "PDF Files (*.pdf)", options=options)
         if not file_path:
@@ -1001,29 +1206,25 @@ class VolumeAnalysisApp(QMainWindow):
             orig_name = os.environ.get("ORIGINAL_FILE_NAME") or self.meta.get("original_file_name") or os.path.basename(self.meta.get("input_dem_path") or "")
             title = f"Calculation Results - Circular Base, Approximation Type 2\nInput DEM: {orig_name}"
 
-            # 1) salva SEMPRE la doppietta accanto al PDF
             out_dir_for_doublet = os.path.dirname(file_path) if os.path.dirname(file_path) else os.getcwd()
             doublet_png = os.path.join(out_dir_for_doublet, "final_doublet_base_vs_caldera.png")
             self._save_final_doublet_png(doublet_png)
 
-            # 2) carica immagini dal manifest
             image_paths = []
             outputs_dir, manifest_path = _find_manifest()
             if manifest_path:
                 manifest_imgs = _load_manifest_images(manifest_path)
                 image_paths = _normalize_and_filter_paths(manifest_imgs, base_dir=outputs_dir)
-                image_paths = _remove_triplets(image_paths)  # togli solo triplette
+                image_paths = _remove_triplets(image_paths)
                 print(f"[INFO] Loaded {len(image_paths)} images from manifest (triplets removed).")
             else:
                 print("[WARN] Manifest not found. Proceeding with doublet only if needed.")
 
-            # 3) aggiungi SEMPRE la nuova doppietta
             if os.path.exists(doublet_png):
                 image_paths.append(doublet_png)
             else:
                 print(f"[WARN] Doublet PNG missing unexpectedly: {doublet_png}")
 
-            # 4) fail-safe
             if not image_paths:
                 image_paths = [doublet_png]
 
@@ -1031,7 +1232,6 @@ class VolumeAnalysisApp(QMainWindow):
             for p in image_paths:
                 print("   -", p)
 
-            # 5) genera PDF
             pdf_generator.generate_pdf(
                 file_path=file_path,
                 results_list=self.results_list,
@@ -1075,43 +1275,35 @@ class VolumeAnalysisApp(QMainWindow):
             QMessageBox.critical(self, "Save Error", f"An error occurred while saving the graph: {e}")
 
     # =========================
-    # ✅ METRICS (NUOVO)
+    # ✅ METRICS
     # =========================
-    
+
     def _build_metrics_dict(self) -> dict:
         crs = self.meta.get("crs")
         res = self.meta.get("res")
         nodata = self.meta.get("nodata")
 
-        # Aree in m²
         A_base_m2 = float(getattr(self, "area_base_m2", float(self.area_base) * 1e6))
         A_caldera_m2 = float(getattr(self, "area_caldera_m2", float(self.area_caldera) * 1e6))
 
-        # Perimetri (m)
         P_base = float(contour_perimeter_m(self.base_contour, self.transform))
         P_caldera = float(contour_perimeter_m(self.caldera_contour, self.transform))
 
-        # Diametri (m)
         D_base = float(self.distance_meters_base)
         D_caldera = float(self.distance_meters_caldera)
 
-        # Raggi (m)
         R_base = float(self.R1)
         R_caldera = float(self.R2)
 
-        # R_eq da area
         R_eq_base = math.sqrt(A_base_m2 / math.pi) if A_base_m2 > 0 else 0.0
         R_eq_caldera = math.sqrt(A_caldera_m2 / math.pi) if A_caldera_m2 > 0 else 0.0
 
-        # Height model (Approx2)
         h_used = float(self.h_max)
 
-        # Volumi SI (m³)
-        V_frustum_m3 = float(self.v)  # già in m³ (edifice totale)
-        V_caldera_m3 = float(self.v_caldera) * 1e9  # km³ -> m³
-        V_eff_m3 = float(self.v_volcano) * 1e9      # km³ -> m³
+        V_frustum_m3 = float(self.v)
+        V_caldera_m3 = float(self.v_caldera) * 1e9
+        V_eff_m3 = float(self.v_volcano) * 1e9
 
-        # Derivate
         circularity_base = (4 * math.pi * A_base_m2 / (P_base ** 2)) if (A_base_m2 > 0 and P_base > 0) else None
         circularity_caldera = (4 * math.pi * A_caldera_m2 / (P_caldera ** 2)) if (A_caldera_m2 > 0 and P_caldera > 0) else None
 
@@ -1122,11 +1314,14 @@ class VolumeAnalysisApp(QMainWindow):
         denom_cone = (1.0/3.0) * A_base_m2 * h_used
         cone_ratio = (V_frustum_m3 / denom_cone) if (denom_cone and denom_cone > 0) else None
 
-        # punti replicabilità
         base_p1_rc = [int(self.base_point1[0]), int(self.base_point1[1])]
         base_p2_rc = [int(self.base_point2[0]), int(self.base_point2[1])]
         cal_p1_rc = [int(self.max_slope_index1[0]), int(self.max_slope_index1[1])]
         cal_p2_rc = [int(self.max_slope_index2[0]), int(self.max_slope_index2[1])]
+
+        # extra caldera detection QA
+        caldera_center_rc = getattr(self, "caldera_center_rc", None)
+        caldera_method = getattr(self, "caldera_detection_method", None)
 
         metrics = {
             "meta": {
@@ -1141,7 +1336,9 @@ class VolumeAnalysisApp(QMainWindow):
                 "nodata": nodata,
                 "params": {
                     "base_elevation_ratio": 0.05,
-                    "caldera_level_ratio": 0.8
+                    "caldera_level_ratio": 0.8,
+                    "caldera_detection_method": caldera_method,
+                    "caldera_center_rc": caldera_center_rc,
                 }
             },
 
@@ -1224,13 +1421,7 @@ class VolumeAnalysisApp(QMainWindow):
         }
         return metrics
 
-
     def _write_metrics_files(self, out_dir=None):
-        """
-        Scrive:
-        - metrics.json (completo, strutturato)
-        - metrics.csv  (umano, verticale, subset)
-        """
         out_dir = out_dir or self.out_dir
         os.makedirs(out_dir, exist_ok=True)
 
@@ -1244,7 +1435,6 @@ class VolumeAnalysisApp(QMainWindow):
         csv_path = os.path.join(out_dir, f"{base}.csv")
         human_rows = metrics_to_human_rows(metrics)
 
-        # ✅ Excel fix: UTF-8 with BOM
         with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow(["section", "metric", "value", "unit"])
@@ -1255,16 +1445,11 @@ class VolumeAnalysisApp(QMainWindow):
         print(f"[INFO] metrics written: {csv_path}")
 
     def export_metrics(self):
-        """
-        Pulsante GUI: esporta nella cartella scelta dall'utente
-        SIA <basename>.json (completo) SIA <basename>.csv (umano verticale).
-        """
         out_dir = QFileDialog.getExistingDirectory(self, "Select folder to export metrics")
         if not out_dir:
             return
 
         try:
-            # usa LA STESSA funzione del salvataggio automatico
             self._write_metrics_files(out_dir=out_dir)
 
             base = getattr(self, "metrics_basename", "metrics")
@@ -1275,6 +1460,7 @@ class VolumeAnalysisApp(QMainWindow):
             )
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"An error occurred while exporting metrics: {e}")
+
 
 # ========== Entry point ==========
 
@@ -1287,9 +1473,6 @@ if __name__ == '__main__':
     input_dem_path = sys.argv[1]
     original_file_name = sys.argv[2] if len(sys.argv) > 2 else "Unknown"
 
-    # Preferisci sempre dem_working.tif:
-    # 1) se PROCESS_ID è disponibile -> outputs/<PROCESS_ID>/dem_working.tif
-    # 2) altrimenti -> outputs/*/dem_working.tif più recente
     pid = os.environ.get("PROCESS_ID")
     if pid:
         candidate = os.path.join(_script_dir(), "outputs", pid, "dem_working.tif")
@@ -1322,7 +1505,6 @@ if __name__ == '__main__':
         print(f"Error opening DEM file: {e}")
         sys.exit(1)
 
-    # meta per export metrics
     meta = {
         "process_id": os.environ.get("PROCESS_ID"),
         "input_dem_path": sys.argv[1],
