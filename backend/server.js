@@ -1,135 +1,247 @@
-// server.js (aggiornato)
+// server.js (docker-ready)
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const { spawn } = require('child_process');
 const path = require('path');
-const fs = require('fs'); // <-- aggiunto
+const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
-const { performance } = require('perf_hooks'); // <-- per timing lato server
+const { performance } = require('perf_hooks');
 
 const app = express();
 app.use(cors());
 
-// Assicurati che esistano le directory fondamentali
-const uploadsDir = path.join(__dirname, 'uploads');
-const outputsDir = path.join(__dirname, 'outputs');
+// ====== Runtime config (Docker-friendly) ======
+const PORT = Number(process.env.PORT || 5000);
+
+// Python executable inside container (or local)
+// e.g. in Docker: PYTHON_BIN=python3
+const PYTHON_BIN = process.env.PYTHON_BIN || process.env.PYTHON_PATH || 'python3';
+
+// Persisted folders
+const uploadsDir = process.env.UPLOADS_DIR
+  ? path.resolve(process.env.UPLOADS_DIR)
+  : path.join(__dirname, 'uploads');
+
+const outputsDir = process.env.OUTPUTS_DIR
+  ? path.resolve(process.env.OUTPUTS_DIR)
+  : path.join(__dirname, 'outputs');
+
+// Ensure base dirs exist
 fs.mkdirSync(uploadsDir, { recursive: true });
 fs.mkdirSync(outputsDir, { recursive: true });
 
-// Servi anche gli output (PNG/PDF) come statici
+// Serve outputs as static (PNG/PDF/JSON) -> http://localhost:5000/outputs/<processId>/...
 app.use('/outputs', express.static(outputsDir));
 
-// Configurazione di multer per gestire l'upload (usa percorso assoluto)
+// ====== Serve frontend build (single-port) ======
+const frontendBuildDir = process.env.FRONTEND_BUILD_DIR
+  ? path.resolve(process.env.FRONTEND_BUILD_DIR)
+  : null;
+
+if (frontendBuildDir && fs.existsSync(frontendBuildDir)) {
+  app.use(express.static(frontendBuildDir));
+
+  // Fallback SPA: qualsiasi rotta non-API torna index.html
+  app.get('*', (req, res, next) => {
+    if (
+      req.path.startsWith('/outputs') ||
+      req.path.startsWith('/process') ||
+      req.path.startsWith('/calculateVolume') ||
+      req.path.startsWith('/processStatus') ||
+      req.path.startsWith('/processComplete') ||
+      req.path.startsWith('/shadedRelief') ||
+      req.path.startsWith('/calculateSlopes') ||
+      req.path.startsWith('/calculateCurvatures') ||
+      req.path.startsWith('/analysis') ||          // <-- IMPORTANTISSIMO: non mandare /analysis a index.html
+      req.path.startsWith('/health')
+    ) {
+      return next(); // <-- QUESTA È LA CHIAVE
+    }
+    return res.sendFile(path.join(frontendBuildDir, 'index.html'));
+  });
+}
+
+// Optional: simple healthcheck endpoint
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+// ====== Multer upload config ======
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadsDir),
-  filename: (req, file, cb) => cb(null, file.originalname) // preserva il nome originale
+  filename: (req, file, cb) => cb(null, file.originalname),
 });
 const upload = multer({ storage });
 
-// Percorso Python (adatta se necessario)
-const pythonPath = 'C:\\Users\\solly\\AppData\\Local\\Programs\\Python\\Python312\\python.exe';
-
-// Stato elaborazioni
+// In-memory processing status
 const processingStatus = {};
 
-// ========== Primo processamento del DEM ==========
+// ====== Helper: spawn python with safe env ======
+function spawnPython({ args, processId }) {
+  const env = {
+    ...process.env,
+    PYTHONUNBUFFERED: '1',
+    PROCESS_ID: processId || '',
+    OUTPUTS_DIR: outputsDir,
+
+    // Headless flags for Docker / CI / servers
+    HEADLESS: process.env.HEADLESS || '1',
+    MPLBACKEND: process.env.MPLBACKEND || 'Agg',
+    QT_QPA_PLATFORM: process.env.QT_QPA_PLATFORM || 'offscreen',
+  };
+
+  return spawn(PYTHON_BIN, args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env,
+  });
+}
+
+// metti vicino agli altri const
+const analysisTplPath = path.join(__dirname, 'views', 'analysis_viewer.html');
+
+// ====== HTML Viewer (template file) ======
+app.get('/analysis/:processId', (req, res) => {
+  const { processId } = req.params;
+
+  try {
+    const tpl = fs.readFileSync(analysisTplPath, 'utf-8');
+    const html = tpl.replaceAll('__PROCESS_ID__', processId);
+
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(200).send(html);
+  } catch (e) {
+    console.error('[ERROR] cannot read analysis_viewer.html:', e);
+    return res.status(500).send('Analysis viewer template not found.');
+  }
+});
+
+// ========== DEM preprocessing ==========
 app.post('/process', upload.single('demFile'), (req, res) => {
   const t0 = performance.now();
+
   const file = req.file;
   if (!file) {
-    console.error("[ERROR] Nessun file caricato.");
-    return res.status(400).json({ error: "Nessun file caricato." });
+    console.error('[ERROR] Nessun file caricato.');
+    return res.status(400).json({ error: 'Nessun file caricato.' });
   }
 
   const scriptPath = path.join(__dirname, 'scripts', 'complete_dem_analysis.py');
+
   const originalFileName = req.body.originalFileName
     ? req.body.originalFileName.split('.')[0]
-    : "Unknown";
+    : 'Unknown';
 
-  // id run
   const processId = uuidv4();
   processingStatus[processId] = { status: 'processing' };
 
-  // Path assoluto del file caricato
   const absFilePath = path.resolve(file.path);
 
-  // AVVIO PYTHON **NON** DETACHED + piping degli stream
-  const child = spawn(
-    pythonPath,
-    [scriptPath, absFilePath, originalFileName, processId],
-    {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, PYTHONUNBUFFERED: '1', PROCESS_ID: processId } // <-- passa PROCESS_ID
-    }
-  );
+  const child = spawnPython({
+    processId,
+    args: [scriptPath, absFilePath, originalFileName, processId],
+  });
 
-  // Log stdout/stderr Python nella console di Node
-  child.stdout.on('data', d => {
+  child.stdout.on('data', (d) => {
     const line = d.toString().trim();
     if (line) console.log(`[PY ${processId}] ${line}`);
   });
 
-  child.stderr.on('data', d => {
+  child.stderr.on('data', (d) => {
     const line = d.toString().trim();
     if (line) console.error(`[PY ${processId} ERR] ${line}`);
   });
 
-  child.on('close', code => {
+  child.on('close', (code) => {
     const dt = (performance.now() - t0).toFixed(1);
     console.log(`[PY ${processId}] exited with code ${code} (server elapsed ${dt} ms)`);
-    // NB: lo stato "completed" lo aggiorna comunque lo script via POST /processComplete/:id
-    // Qui NON lo forziamo, così resti fedele al tuo flusso attuale.
+
+    // Non forzare lo status: lo aggiorna /processComplete/:id
+    // Però in caso di crash, puoi segnare failed:
+    if (code !== 0 && processingStatus[processId]) {
+      processingStatus[processId].status = 'failed';
+    }
   });
 
-  // Rispondi subito con l'id
-  res.json({ message: 'Processing started', processId });
+  // Reply immediately
+  return res.json({ message: 'Processing started', processId });
 });
 
-// Stato
+// Status endpoint (enriched: returns manifest/stats/images when completed)
 app.get('/processStatus/:processId', (req, res) => {
   const { processId } = req.params;
   const statusInfo = processingStatus[processId];
-  if (statusInfo) {
-    res.json({ status: statusInfo.status });
-  } else {
-    res.status(404).json({ error: 'Process ID not found' });
+
+  if (!statusInfo) {
+    return res.status(404).json({ error: 'Process ID not found' });
   }
+
+  const status = statusInfo.status;
+  const payload = { processId, status };
+
+  if (status === 'completed') {
+    const procDir = path.join(outputsDir, processId);
+    const manifestFs = path.join(procDir, 'analysis_images.json');
+    const statsFs = path.join(procDir, 'output_statistics.json');
+
+    payload.outputsBaseUrl = `/outputs/${processId}`;
+    payload.manifestUrl = fs.existsSync(manifestFs) ? `/outputs/${processId}/analysis_images.json` : null;
+    payload.statsUrl = fs.existsSync(statsFs) ? `/outputs/${processId}/output_statistics.json` : null;
+
+    // Optional: include images with ready-to-use URLs
+    if (payload.manifestUrl) {
+      try {
+        const manifest = JSON.parse(fs.readFileSync(manifestFs, 'utf-8'));
+        const imgs = manifest.images || manifest || [];
+        payload.images = (Array.isArray(imgs) ? imgs : []).map((img) => {
+          // accetta sia stringhe che oggetti
+          if (typeof img === 'string') {
+            return { filename: img, url: `/outputs/${processId}/${img}` };
+          }
+          const filename = img.filename || img.file || img.name;
+          return {
+            ...img,
+            url: filename ? `/outputs/${processId}/${filename}` : null,
+          };
+        });
+      } catch (e) {
+        payload.images = null;
+      }
+    }
+  }
+
+  return res.json(payload);
 });
 
-// Notifica di completamento inviata dallo script Python
+// Completion callback from Python
 app.post('/processComplete/:processId', (req, res) => {
   const { processId } = req.params;
   if (processingStatus[processId]) {
     processingStatus[processId].status = 'completed';
     console.log(`[INFO] process ${processId} marked as completed by Python callback`);
-    res.json({ message: 'Process status updated to completed' });
-  } else {
-    res.status(404).json({ error: 'Process ID not found' });
+    return res.json({ message: 'Process status updated to completed' });
   }
+  return res.status(404).json({ error: 'Process ID not found' });
 });
 
-// ========== Calcolo volume ==========
+// ========== Volume calculation ==========
 app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
   const t0 = performance.now();
 
   const file = req.file;
   const volumeType = req.body.volumeType;
   const approximationType = req.body.approximationType;
+
   const originalFileName = req.body.originalFileName
     ? req.body.originalFileName.split('.')[0]
-    : "Unknown";
+    : 'Unknown';
 
-  // Riusa il processId della fase precedente se lo ricevi dal client,
-  // altrimenti creane uno (retro-compatibile).
   const processId = req.body.processId ? String(req.body.processId) : uuidv4();
 
   if (!file || !volumeType || !approximationType || !originalFileName) {
-    console.error("[ERROR] Missing required fields.");
-    return res.status(400).json({ error: "Missing required fields." });
+    console.error('[ERROR] Missing required fields.');
+    return res.status(400).json({ error: 'Missing required fields.' });
   }
 
-  let scriptPath;
+  let scriptPath = null;
   if (volumeType === 'circular') {
     if (approximationType === 'approximation1') {
       scriptPath = path.join(__dirname, 'scripts', 'CircularVolcano_Approx1.py');
@@ -143,57 +255,135 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
       scriptPath = path.join(__dirname, 'scripts', 'EllipticalVolcano_Approx2.py');
     }
   }
-  if (!scriptPath) return res.status(400).json({ error: 'Invalid volumeType or approximationType' });
 
-  // Path assoluto del file caricato
+  if (!scriptPath) {
+    return res.status(400).json({ error: 'Invalid volumeType or approximationType' });
+  }
+
   const absFilePath = path.resolve(file.path);
 
-  const child = spawn(
-    pythonPath,
-    [scriptPath, absFilePath, originalFileName],
-    {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, PYTHONUNBUFFERED: '1', PROCESS_ID: processId } // <-- passa PROCESS_ID
-    }
-  );
+  const child = spawnPython({
+    processId,
+    // NOTA: gli script volume leggono PROCESS_ID da env
+    args: [scriptPath, absFilePath, originalFileName],
+  });
 
-  let resultData = '';
+  let stdoutData = '';
+  let stderrData = '';
 
-  child.stdout.on('data', d => {
+  child.stdout.on('data', (d) => {
     const s = d.toString();
-    resultData += s;
-    // Mostra comunque i log in console
-    s.split(/\r?\n/).forEach(line => {
+    stdoutData += s;
+    s.split(/\r?\n/).forEach((line) => {
       if (line.trim()) console.log(`[PY VOL ${processId}] ${line.trim()}`);
     });
   });
 
-  child.stderr.on('data', d => {
+  child.stderr.on('data', (d) => {
     const s = d.toString();
-    s.split(/\r?\n/).forEach(line => {
+    stderrData += s;
+    s.split(/\r?\n/).forEach((line) => {
       if (line.trim()) console.error(`[PY VOL ${processId} ERR] ${line.trim()}`);
     });
   });
 
-  child.on('close', code => {
+  // helper locale (solo qui, patch minimale)
+  function tryParseJson(s) {
+    try {
+      return JSON.parse(String(s || '').trim());
+    } catch {
+      return null;
+    }
+  }
+
+  child.on('close', (code) => {
     const dt = (performance.now() - t0).toFixed(1);
     console.log(`[TIMING][SERVER] /calculateVolume finished in ${dt} ms (code=${code})`);
+
+    const parsed = tryParseJson(stdoutData);
+
+    // === SUCCESS ===
     if (code === 0) {
-      // Tenta di interpretare l'output come JSON strutturato { result, images: [...] }
-      try {
-        const parsed = JSON.parse(resultData);
-        // Se mancano campi attesi, mantieni retro-compatibilità
-        if (parsed && (parsed.result || parsed.images)) {
-          return res.json(parsed);
-        }
-      } catch (e) {
-        // non è JSON -> fallback
+      // Se stdout è JSON valido: arricchisci e rispondi
+      if (parsed && typeof parsed === 'object') {
+        const pid = parsed.processId || processId;
+        const outputsBaseUrl = `/outputs/${pid}`;
+
+        // >>> QUI: mapping images -> url
+        const images = Array.isArray(parsed.images) ? parsed.images : [];
+        const imagesWithUrl = images.map((img) => {
+          const filename =
+            (img && typeof img === 'object' && (img.filename || img.file || img.name)) ||
+            (typeof img === 'string' ? img : null);
+
+          if (!filename) return { ...(typeof img === 'object' ? img : {}), url: null };
+
+          return {
+            ...(typeof img === 'object' ? img : { filename }),
+            filename,
+            url: `${outputsBaseUrl}/${filename}`,
+          };
+        });
+
+        return res.json({
+          ...parsed,
+          processId: pid,
+          outputsBaseUrl,
+          images: imagesWithUrl,
+        });
       }
-      // Fallback: vecchio comportamento testuale
-      return res.json({ result: resultData });
-    } else {
-      res.status(500).json({ error: 'Error calculating volume' });
+
+      // Fallback: stdout non-JSON
+      return res.json({ result: stdoutData });
     }
+
+    // === ERROR ===
+    // Richiesta: se code!=0 -> 500 + log utile
+    const stdoutPreview = String(stdoutData || '').trim().slice(0, 2000);
+    const stderrPreview = String(stderrData || '').trim().slice(0, 4000);
+
+    console.error(
+      `[ERROR][SERVER] Volume script failed (processId=${processId}, code=${code}).`
+    );
+    if (stderrPreview) console.error(`[ERROR][SERVER] stderr preview:\n${stderrPreview}`);
+    if (stdoutPreview) console.error(`[ERROR][SERVER] stdout preview:\n${stdoutPreview}`);
+
+    // Se stdout era JSON anche in errore, restituiscilo (arricchito) ma con 500
+    if (parsed && typeof parsed === 'object') {
+      const pid = parsed.processId || processId;
+      const outputsBaseUrl = `/outputs/${pid}`;
+
+      const images = Array.isArray(parsed.images) ? parsed.images : [];
+      const imagesWithUrl = images.map((img) => {
+        const filename =
+          (img && typeof img === 'object' && (img.filename || img.file || img.name)) ||
+          (typeof img === 'string' ? img : null);
+
+        if (!filename) return { ...(typeof img === 'object' ? img : {}), url: null };
+
+        return {
+          ...(typeof img === 'object' ? img : { filename }),
+          filename,
+          url: `${outputsBaseUrl}/${filename}`,
+        };
+      });
+
+      return res.status(500).json({
+        ...parsed,
+        processId: pid,
+        outputsBaseUrl,
+        images: imagesWithUrl,
+        code,
+      });
+    }
+
+    return res.status(500).json({
+      error: 'Error calculating volume',
+      processId,
+      code,
+      stderr: stderrPreview || null,
+      stdout: stdoutPreview || null,
+    });
   });
 });
 
@@ -204,20 +394,22 @@ app.post('/shadedRelief', upload.single('demFile'), (req, res) => {
 
   const scriptPath = path.join(__dirname, 'scripts', 'generate_shaded_relief.py');
   const absFilePath = path.resolve(file.path);
-  const child = spawn(pythonPath, [scriptPath, absFilePath], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, PYTHONUNBUFFERED: '1' }
+
+  const child = spawnPython({
+    processId: uuidv4(),
+    args: [scriptPath, absFilePath],
   });
 
-  let output = '';
-  child.stdout.on('data', d => output += d.toString());
-  child.stderr.on('data', d => fs.appendFile('error_log.txt', d.toString(), () => {}));
-  child.on('close', code => {
+  child.stderr.on('data', (d) => {
+    fs.appendFile('error_log.txt', d.toString(), () => {});
+  });
+
+  child.on('close', (code) => {
     if (code !== 0) {
       fs.appendFile('error_log.txt', `Errore Shaded Relief. Exit: ${code}\n`, () => {});
-      return res.status(500).json({ error: "Errore durante la generazione dello Shaded Relief." });
+      return res.status(500).json({ error: 'Errore durante la generazione dello Shaded Relief.' });
     }
-    res.json({ message: 'Shaded Relief generated successfully' });
+    return res.json({ message: 'Shaded Relief generated successfully' });
   });
 });
 
@@ -228,20 +420,22 @@ app.post('/calculateSlopes', upload.single('demFile'), (req, res) => {
 
   const scriptPath = path.join(__dirname, 'scripts', 'generate_slopes.py');
   const absFilePath = path.resolve(file.path);
-  const child = spawn(pythonPath, [scriptPath, absFilePath], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, PYTHONUNBUFFERED: '1' }
+
+  const child = spawnPython({
+    processId: uuidv4(),
+    args: [scriptPath, absFilePath],
   });
 
-  let output = '';
-  child.stdout.on('data', d => output += d.toString());
-  child.stderr.on('data', d => fs.appendFile('error_log.txt', d.toString(), () => {}));
-  child.on('close', code => {
+  child.stderr.on('data', (d) => {
+    fs.appendFile('error_log.txt', d.toString(), () => {});
+  });
+
+  child.on('close', (code) => {
     if (code !== 0) {
       fs.appendFile('error_log.txt', `Errore slopes. Exit: ${code}\n`, () => {});
-      return res.status(500).json({ error: "Errore durante la generazione delle due pendenze." });
+      return res.status(500).json({ error: 'Errore durante la generazione delle due pendenze.' });
     }
-    res.json({ message: 'Slope calculation successful' });
+    return res.json({ message: 'Slope calculation successful' });
   });
 });
 
@@ -252,23 +446,30 @@ app.post('/calculateCurvatures', upload.single('demFile'), (req, res) => {
 
   const scriptPath = path.join(__dirname, 'scripts', 'calculate_curvatures.py');
   const absFilePath = path.resolve(file.path);
-  const child = spawn(pythonPath, [scriptPath, absFilePath], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, PYTHONUNBUFFERED: '1' }
+
+  const child = spawnPython({
+    processId: uuidv4(),
+    args: [scriptPath, absFilePath],
   });
 
   let output = '';
-  child.stdout.on('data', d => output += d.toString());
-  child.stderr.on('data', d => fs.appendFile('error_log.txt', d.toString(), () => {}));
-  child.on('close', code => {
+  child.stdout.on('data', (d) => (output += d.toString()));
+  child.stderr.on('data', (d) => {
+    fs.appendFile('error_log.txt', d.toString(), () => {});
+  });
+
+  child.on('close', (code) => {
     if (code !== 0) {
       fs.appendFile('error_log.txt', `Errore curvature. Exit: ${code}\n`, () => {});
-      return res.status(500).json({ error: "Errore durante la generazione delle curvature." });
+      return res.status(500).json({ error: 'Errore durante la generazione delle curvature.' });
     }
-    res.json({ message: 'Curvature calcolate con successo', output });
+    return res.json({ message: 'Curvature calcolate con successo', output });
   });
 });
 
-app.listen(5000, () => {
-  console.log('[SERVER] listening on http://localhost:5000');
+app.listen(PORT, () => {
+  console.log(`[SERVER] listening on http://localhost:${PORT}`);
+  console.log(`[SERVER] PYTHON_BIN=${PYTHON_BIN}`);
+  console.log(`[SERVER] UPLOADS_DIR=${uploadsDir}`);
+  console.log(`[SERVER] OUTPUTS_DIR=${outputsDir}`);
 });

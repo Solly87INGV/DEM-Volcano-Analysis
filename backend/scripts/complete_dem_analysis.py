@@ -31,6 +31,9 @@ import requests
 import pandas as pd
 import matplotlib.cm as cm
 from matplotlib.widgets import RectangleSelector
+import matplotlib
+if os.environ.get("HEADLESS", "0").lower() in ("1", "true", "yes"):
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ==== Memory & timing helpers ======================================
@@ -220,8 +223,15 @@ def _resolve_process_id(cli_process_id: str | None) -> str:
     return f"local_{int(time.time())}"
 
 def _ensure_outputs_dir(process_id: str) -> str:
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    out_dir = os.path.join(base_dir, "outputs", process_id)
+    # 1) Se definito da Node/Docker, usa OUTPUTS_DIR
+    base = os.environ.get("OUTPUTS_DIR")
+    if base and len(base) > 0:
+        base_dir = os.path.abspath(base)
+    else:
+        # fallback: comportamento attuale (scripts/outputs)
+        base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
+
+    out_dir = os.path.join(base_dir, process_id)
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
 
@@ -1066,7 +1076,6 @@ class DEMAnalysisApp(QMainWindow):
             )
             print(f"[ERROR] Error in on_select: {e}")
 
-# Funzione principale
 def main():
     if len(sys.argv) < 2:
         print("Error: specify the DEM file path as an argument.")
@@ -1074,19 +1083,32 @@ def main():
 
     dem_path = sys.argv[1]
 
-    # Controllo esplicito per il nome originale del file
+    # Nome originale (facoltativo)
     original_file_name = sys.argv[2] if len(sys.argv) > 2 else "Unknown"
 
-    # Ottieni il process_id dagli argomenti della riga di comando
+    # process_id da argv (facoltativo)
     cli_process_id = sys.argv[3] if len(sys.argv) > 3 else None
-    # Preferisci l'env var PROCESS_ID se presente
-    process_id = _resolve_process_id(cli_process_id)
-    if process_id:
-        print(f"[DEBUG] Process ID: {process_id}")
 
-    print(f"[DEBUG] DEM path provided: {dem_path}")
-    print(f"[DEBUG] Original file name: {original_file_name}")
-    print(f"[DEBUG] Number of arguments received: {len(sys.argv)}")
+    # Risolvi process_id: preferisci env PROCESS_ID, poi argv, altrimenti fallback interno
+    process_id = _resolve_process_id(cli_process_id)
+
+    # GARANZIA: mai None
+    if not process_id or not str(process_id).strip():
+        process_id = f"local_{int(time.time())}"
+
+    process_id = str(process_id).strip()
+
+    # out_dir deve esistere SUBITO, perché viene usato anche prima dei PNG (es. statistics_json)
+    out_dir = _ensure_outputs_dir(process_id)
+
+    # Log diagnostico super chiaro (fondamentale per debug docker)
+    print(f"[DEBUG] argv_count={len(sys.argv)}")
+    print(f"[DEBUG] argv_process_id={cli_process_id}")
+    print(f"[DEBUG] env_PROCESS_ID={os.environ.get('PROCESS_ID')}")
+    print(f"[DEBUG] resolved_process_id={process_id}")
+    print(f"[DEBUG] out_dir={out_dir}")
+    print(f"[DEBUG] dem_path={dem_path}")
+    print(f"[DEBUG] original_file_name={original_file_name}")
 
     # ==== Benchmark: start ====
     _t_all_start = time.time()
@@ -1171,8 +1193,9 @@ def main():
         _, smooth_curv_stats = gather_statistics(
             curvature_smoothed, "Amplified and Smoothed Curvature"
         )
-        write_statistics_to_json(total_statistics, filename="output_statistics.json")
-        print("[DEBUG] Statistics written to output_statistics.json")
+        stats_path = os.path.join(out_dir, "output_statistics.json")
+        write_statistics_to_json(total_statistics, filename=stats_path)
+        print(f"[DEBUG] Statistics written to {stats_path}")
         log_memory("after_statistics_json")
 
     # Organizza le analisi in triplette (timed)
@@ -1265,6 +1288,11 @@ def main():
     print(f"[RESULT] Peak RAM = {_peak_mb:.1f} MB")
     print(f"[TIMING] total_end_to_end = {time.time() - _t_all_start:.3f} s")
     log_memory("before_gui_start")
+
+    headless = os.environ.get("HEADLESS", "0").lower() in ("1", "true", "yes")
+    if headless:
+        print("[INFO] HEADLESS=1 -> skipping PyQt GUI and exiting.")
+        sys.exit(0)
 
     # Avvia l'applicazione PyQt5
     try:

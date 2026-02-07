@@ -1,0 +1,184 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>MorphoVolc - Analysis __PROCESS_ID__</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 16px; }
+    .muted { opacity: 0.7; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin: 12px 0; }
+    button { padding: 8px 12px; border-radius: 10px; border: 1px solid #ccc; background: #f7f7f7; cursor: pointer; }
+    button.primary { background: #111; color: #fff; border-color: #111; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .layout { display: grid; grid-template-columns: 1fr; gap: 16px; }
+
+    .heroGrid { display: grid; grid-template-columns: repeat(2, minmax(320px, 1fr)); gap: 12px; }
+    @media (max-width: 900px) { .heroGrid { grid-template-columns: 1fr; } }
+
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 10px; background: #fff; }
+    .card h3 { margin: 6px 0 10px 0; font-size: 14px; font-weight: 700; }
+    .card code { font-size: 12px; }
+    img { width: 100%; height: auto; border-radius: 10px; border: 1px solid #eee; background: #fafafa; }
+
+    .sliderWrap { display: grid; grid-template-columns: 1fr; gap: 10px; }
+    .sliderTop { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .sliderControls { display: flex; gap: 8px; align-items: center; }
+    .counter { font-size: 12px; }
+    .slideBox { border: 1px solid #eee; border-radius: 12px; padding: 10px; background: #fff; }
+    pre { white-space: pre-wrap; word-break: break-word; margin: 0; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <h2>MorphoVolc — DEM analysis viewer</h2>
+  <div class="muted">processId: <code>__PROCESS_ID__</code></div>
+
+  <div class="row">
+    <button onclick="refreshNow()">Refresh</button>
+    <button id="continueBtn" class="primary" onclick="continueToApp()" disabled>Continue</button>
+    <div id="status" class="muted">loading...</div>
+  </div>
+
+  <div class="layout">
+
+    <div class="heroGrid">
+      <div class="card">
+        <h3>DEM overview</h3>
+        <div class="muted"><code id="demUrlTxt">-</code></div>
+        <img id="demImg" alt="dem_overview" />
+      </div>
+
+      <div class="card">
+        <h3>Aspect overview</h3>
+        <div class="muted"><code id="aspUrlTxt">-</code></div>
+        <img id="aspImg" alt="aspect_overview" />
+      </div>
+    </div>
+
+    <div class="sliderWrap">
+      <div class="sliderTop">
+        <h3 style="margin:0;">Double panels</h3>
+        <div class="sliderControls">
+          <button id="prevBtn" onclick="prevSlide()">Prev</button>
+          <button id="nextBtn" onclick="nextSlide()">Next</button>
+          <span class="counter muted" id="counter">0 / 0</span>
+        </div>
+      </div>
+
+      <div class="slideBox">
+        <div class="muted"><code id="slideUrlTxt">-</code></div>
+        <img id="slideImg" alt="double_panel" />
+      </div>
+    </div>
+
+    <div>
+      <h3 style="margin: 0 0 8px 0;">Statistics</h3>
+      <div class="card"><pre id="stats" class="muted">loading...</pre></div>
+    </div>
+
+  </div>
+
+<script>
+const pid = "__PROCESS_ID__";
+let images = [];
+let doubleImages = [];
+let idx = 0;
+
+function pickByName(list, includesStr) {
+  return (list || []).find(it => (it?.filename || it?.name || it?.file || it?.url || '').includes(includesStr));
+}
+function safeUrl(it){ return it?.url || null; }
+
+function renderHero() {
+  const dem = pickByName(images, 'dem_overview');
+  const asp = pickByName(images, 'aspect_overview');
+
+  const demUrl = safeUrl(dem);
+  const aspUrl = safeUrl(asp);
+
+  document.getElementById('demUrlTxt').textContent = demUrl || 'not available yet';
+  document.getElementById('aspUrlTxt').textContent = aspUrl || 'not available yet';
+
+  if (demUrl) document.getElementById('demImg').src = demUrl + '?t=' + Date.now();
+  if (aspUrl) document.getElementById('aspImg').src = aspUrl + '?t=' + Date.now();
+}
+
+function renderSlider() {
+  const slideImg = document.getElementById('slideImg');
+  const slideUrlTxt = document.getElementById('slideUrlTxt');
+  const counter = document.getElementById('counter');
+  const prevBtn = document.getElementById('prevBtn');
+  const nextBtn = document.getElementById('nextBtn');
+
+  const n = doubleImages.length;
+  if (n === 0) {
+    slideImg.removeAttribute('src');
+    slideUrlTxt.textContent = 'No double_* images yet.';
+    counter.textContent = '0 / 0';
+    prevBtn.disabled = true;
+    nextBtn.disabled = true;
+    return;
+  }
+
+  idx = Math.max(0, Math.min(idx, n - 1));
+  const current = doubleImages[idx];
+  const url = safeUrl(current);
+
+  slideUrlTxt.textContent = url || '-';
+  counter.textContent = (idx + 1) + ' / ' + n;
+
+  prevBtn.disabled = (idx === 0);
+  nextBtn.disabled = (idx === n - 1);
+
+  if (url) slideImg.src = url + '?t=' + Date.now();
+}
+
+function prevSlide(){ idx--; renderSlider(); }
+function nextSlide(){ idx++; renderSlider(); }
+
+function continueToApp() {
+  // Porta alla React app (integrata) con step=analysis
+  window.location.href = '/?processId=' + encodeURIComponent(pid) + '&step=analysis';
+}
+
+async function refreshNow() {
+  const statusEl = document.getElementById('status');
+  const statsEl = document.getElementById('stats');
+  const continueBtn = document.getElementById('continueBtn');
+
+  try {
+    const r = await fetch('/processStatus/' + pid, { cache: 'no-store' });
+    const j = await r.json();
+
+    const st = j.status || 'unknown';
+    statusEl.textContent = 'status: ' + st;
+
+    continueBtn.disabled = (st !== 'completed');
+
+    images = j.images || [];
+    doubleImages = images.filter(it => (it?.filename || it?.name || it?.file || it?.url || '').includes('double_'));
+
+    renderHero();
+    renderSlider();
+
+    if (j.statsUrl) {
+      const rs = await fetch(j.statsUrl, { cache: 'no-store' });
+      const js = await rs.json();
+      statsEl.textContent = JSON.stringify(js, null, 2);
+      statsEl.classList.remove('muted');
+    } else {
+      statsEl.textContent = 'No statsUrl yet.';
+      statsEl.classList.add('muted');
+    }
+  } catch (e) {
+    statusEl.textContent = 'error: ' + e;
+  }
+}
+
+// auto-refresh
+refreshNow();
+setInterval(refreshNow, 1500);
+</script>
+</body>
+</html>

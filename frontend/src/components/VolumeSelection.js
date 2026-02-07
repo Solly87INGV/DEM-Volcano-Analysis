@@ -7,15 +7,20 @@ import CardSelection from './CardSelection';
 import axios from 'axios';
 import './VolumeSelection.css';
 
-const VolumeSelection = ({ demFile, onBack, processId }) => {
+const VolumeSelection = ({
+  demFile,
+  onBack,           // back to upload (o back allo step precedente)
+  processId,        // processId della fase /process
+  setStep,          // NEW: per navigare
+  setVolumeRun,     // NEW: salva risultato per viewer
+}) => {
   const [volumeType, setVolumeType] = useState('');
   const [approximationType, setApproximationType] = useState('');
   const [selectedApproximation, setSelectedApproximation] = useState('');
-  const [result, setResult] = useState('');
   const [infoImage, setInfoImage] = useState('');
   const [isLoading, setIsLoading] = useState(false);
 
-  // ⏱️ stato per timing calcolo volume
+  // ⏱️ timing calcolo volume
   const [calcWallMs, setCalcWallMs] = useState(null);
   const [serverPhasesCalc, setServerPhasesCalc] = useState(null);
 
@@ -24,7 +29,6 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
     setApproximationType('');
     setSelectedApproximation('');
     setInfoImage('');
-    setResult('');
     setCalcWallMs(null);
     setServerPhasesCalc(null);
   };
@@ -32,6 +36,7 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
   const handleApproximationSelect = (type) => {
     setApproximationType(type);
     setSelectedApproximation(type);
+
     if (volumeType === 'circular') {
       setInfoImage(type === 'approximation1' ? '/images/1_Circ.png' : '/images/2_Circ.png');
     } else if (volumeType === 'elliptical') {
@@ -39,30 +44,43 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
     }
   };
 
-  const handleBack = () => {
+  const handleBackLocal = () => {
     setVolumeType('');
     setSelectedApproximation('');
     setInfoImage('');
-    setResult('');
     setCalcWallMs(null);
     setServerPhasesCalc(null);
   };
 
   const handleSubmitVolumeCalculation = async () => {
+    if (!demFile) {
+      alert('DEM file missing. Go back and upload/process again.');
+      return;
+    }
+    if (!volumeType || !approximationType) {
+      alert('Select volume type and approximation first.');
+      return;
+    }
+
     setIsLoading(true);
+
     const formData = new FormData();
     formData.append('demFile', demFile);
     formData.append('volumeType', volumeType);
     formData.append('approximationType', approximationType);
 
-    // 👉 passa il processId della fase /process (prop o fallback da localStorage)
+    // ✅ IMPORTANTISSIMO: server.js richiede originalFileName
+    formData.append('originalFileName', demFile?.name || 'Unknown');
+
+    // riusa lo stesso processId della fase /process (così poi agganci outputs/<processId>)
     const effectiveProcessId = processId || localStorage.getItem('lastProcessId');
     if (effectiveProcessId) formData.append('processId', String(effectiveProcessId));
 
     try {
       const t0 = performance.now();
 
-      const response = await axios.post('http://localhost:5000/calculateVolume', formData, {
+      // ✅ endpoint relativo (single-port / docker ok)
+      const response = await axios.post('/calculateVolume', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
 
@@ -71,29 +89,95 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
       setCalcWallMs(dt);
       console.info(`[TIMING] POST /calculateVolume end-to-end: ${dt.toFixed(1)} ms`);
 
-      // fasi lato server (se presenti come header)
       const phaseHeader = response?.headers?.['x-server-phase'];
       if (phaseHeader) {
         try {
           const phasesObj = JSON.parse(phaseHeader);
           setServerPhasesCalc(phasesObj);
           console.info('[PHASES][/calculateVolume]', phasesObj);
-        } catch { /* header non JSON */ }
-      }
-
-      // Supporta risposta strutturata { result, images } o fallback testuale
-      let resText = '';
-      if (response?.data && typeof response.data === 'object') {
-        resText = response.data.result || '';
-      } else if (typeof response?.data === 'string') {
-        try {
-          const maybe = JSON.parse(response.data);
-          resText = typeof maybe.result === 'string' ? maybe.result : response.data;
         } catch {
-          resText = response.data;
+          /* ignore */
         }
       }
-      setResult(resText);
+
+      // ✅ Nuovo: usa direttamente il JSON ritornato dal backend quando disponibile
+      // Atteso: { status, processId, result, images, outputsBaseUrl }
+      let run = null;
+
+      if (response?.data && typeof response.data === 'object') {
+        const d = response.data || {};
+        const pid =
+          d.processId ||
+          effectiveProcessId ||
+          processId ||
+          localStorage.getItem('lastProcessId') ||
+          null;
+
+        const outputsBaseUrl = d.outputsBaseUrl || (pid ? `/outputs/${pid}` : null);
+
+        // normalizza images: garantisce filename + url
+        const images = Array.isArray(d.images)
+          ? d.images.map((img) => {
+              const filename =
+                (img && typeof img === 'object' && (img.filename || img.file || img.name)) ||
+                (typeof img === 'string' ? img : null);
+
+              const url =
+                (img && typeof img === 'object' && img.url) ||
+                (filename && outputsBaseUrl ? `${outputsBaseUrl}/${filename}` : null);
+
+              return {
+                ...(typeof img === 'object' ? img : { filename }),
+                filename,
+                url,
+              };
+            })
+          : [];
+
+        run = {
+          ...d, // status, result (numerico), ecc.
+          processId: pid,
+          outputsBaseUrl,
+          images,
+          volumeType,
+          approximationType,
+          calcWallMs: dt,
+          serverPhasesCalc: serverPhasesCalc,
+        };
+      } else {
+        // fallback: risposta testuale
+        const resText = typeof response?.data === 'string' ? response.data : String(response?.data || '');
+        run = {
+          status: 'unknown',
+          processId: effectiveProcessId || null,
+          resultText: resText,
+          images: [],
+          volumeType,
+          approximationType,
+          calcWallMs: dt,
+          serverPhasesCalc: serverPhasesCalc,
+        };
+      }
+
+      // salva in App state
+      setVolumeRun(run);
+
+      // salva anche in localStorage per reload
+      try {
+        localStorage.setItem('lastVolumeRun', JSON.stringify(run));
+      } catch {
+        /* ignore */
+      }
+
+      // vai al viewer risultati volume
+      setStep('volumeResults');
+
+      // querystring “ripristinabile”
+      const pidForNav = run?.processId || effectiveProcessId;
+      const qs = new URLSearchParams(window.location.search);
+      qs.set('step', 'volumeResults');
+      if (pidForNav) qs.set('processId', String(pidForNav));
+      window.history.replaceState({}, '', '/?' + qs.toString());
     } catch (error) {
       console.error('Error calculating volume:', error);
       alert('Si è verificato un errore durante il calcolo del volume.');
@@ -104,17 +188,20 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
 
   return (
     <Box className="volume-selection-container">
-      <Typography variant="h5" className="success-message">First processing successful</Typography>
+      <Typography variant="h5" className="success-message">
+        First processing successful
+      </Typography>
 
       <Typography variant="h6" className="instruction-message">
-        {volumeType ? "Choose approximation method" : "Choose the type of volcano"}
+        {volumeType ? 'Choose approximation method' : 'Choose the type of volcano'}
       </Typography>
 
       {volumeType ? (
         <>
-          <IconButton onClick={handleBack} className="back-arrow">
+          <IconButton onClick={handleBackLocal} className="back-arrow">
             <ArrowBackIcon />
           </IconButton>
+
           <Box className="main-layout">
             <Box className="card-container">
               {volumeType === 'circular' ? (
@@ -153,6 +240,7 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
                 </>
               )}
             </Box>
+
             {infoImage && (
               <Box className="info-image-container">
                 <img src={infoImage} alt="Description" />
@@ -184,9 +272,11 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
               <CircularProgress />
             </Box>
           )}
+
           <Button variant="contained" color="secondary" onClick={onBack} startIcon={<ArrowBackIcon />}>
             Back to Upload
           </Button>
+
           <Button
             variant="contained"
             color="primary"
@@ -199,30 +289,24 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
         </Box>
       )}
 
-      {(result || calcWallMs != null || serverPhasesCalc) && (
+      {(calcWallMs != null || serverPhasesCalc) && (
         <>
           <Divider sx={{ my: 2 }} />
-          {result && (
-            <Box className="results-container">
-              <Typography variant="h6">Summary of Results</Typography>
-              <Typography sx={{ mt: 1, whiteSpace: 'pre-line' }}>{result}</Typography>
-            </Box>
-          )}
-          {(calcWallMs != null || serverPhasesCalc) && (
-            <Box sx={{ mt: 2 }}>
-              <Typography variant="h6" sx={{ mb: 1 }}>Diagnostics (client-side timings)</Typography>
-              {calcWallMs != null && (
-                <Typography variant="body2">
-                  POST /calculateVolume — wall-time: <b>{calcWallMs.toFixed(1)} ms</b>
-                </Typography>
-              )}
-              {serverPhasesCalc && (
-                <Typography variant="body2" sx={{ mt: 1 }}>
-                  Server phases (/calculateVolume): <code>{JSON.stringify(serverPhasesCalc)}</code>
-                </Typography>
-              )}
-            </Box>
-          )}
+          <Box sx={{ mt: 2 }}>
+            <Typography variant="h6" sx={{ mb: 1 }}>
+              Diagnostics (client-side timings)
+            </Typography>
+            {calcWallMs != null && (
+              <Typography variant="body2">
+                POST /calculateVolume — wall-time: <b>{calcWallMs.toFixed(1)} ms</b>
+              </Typography>
+            )}
+            {serverPhasesCalc && (
+              <Typography variant="body2" sx={{ mt: 1 }}>
+                Server phases (/calculateVolume): <code>{JSON.stringify(serverPhasesCalc)}</code>
+              </Typography>
+            )}
+          </Box>
         </>
       )}
     </Box>

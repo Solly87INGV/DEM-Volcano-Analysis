@@ -1,0 +1,19 @@
+services:
+  morphovolc:
+    build: .
+    container_name: morphovolc
+    ports:
+      - "5000:5000"
+    environment:
+      PORT: "5000"
+      PYTHON_BIN: "/opt/venv/bin/python"
+      HEADLESS: "1"
+      MPLBACKEND: "Agg"
+      QT_QPA_PLATFORM: "offscreen"
+      UPLOADS_DIR: "/app/backend/uploads"
+      OUTPUTS_DIR: "/app/backend/outputs"
+      FRONTEND_BUILD_DIR: "/app/frontend/build"
+    volumes:
+      - ./backend/uploads:/app/backend/uploads
+      - ./backend/outputs:/app/backend/outputs
+    restart: unless-stopped
