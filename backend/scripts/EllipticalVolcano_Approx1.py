@@ -6,7 +6,7 @@
 #  - salva SEMPRE la PNG "final doublet" in:
 #       out_dir = os.path.join(os.environ["OUTPUTS_DIR"], os.environ["PROCESS_ID"])
 #  - scrive volume_results.json nello stesso out_dir con:
-#       { processId, status, result:{...}, images:[{filename,title}] }
+#       { processId, status, moduleKey, result:{...}, images:[{filename,title}] }
 #  - stampa UNA sola riga JSON su stdout (stessa struttura)
 #
 # GUI locale:
@@ -16,7 +16,6 @@
 import sys
 import os
 import json
-import time
 import uuid
 import numpy as np
 import rasterio  # To read DEM files in .tif format
@@ -42,6 +41,12 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable  # ← colorbar co-alte 
 import pdf_generator
 
 
+# =========================
+# [PATCH] module key stabile
+# =========================
+MODULE_KEY = "elliptical_approx1"
+
+
 # ========== helpers: outputs & manifest ==========
 
 def _script_dir():
@@ -49,7 +54,7 @@ def _script_dir():
 
 def _outputs_base_dir():
     """
-    [PATCH] OUTPUTS_DIR da env, fallback a "outputs" vicino allo script.
+    OUTPUTS_DIR da env, fallback a "outputs" vicino allo script.
     """
     env_base = os.environ.get("OUTPUTS_DIR")
     if env_base and str(env_base).strip():
@@ -58,7 +63,7 @@ def _outputs_base_dir():
 
 def _resolve_process_id() -> str:
     """
-    [PATCH] PROCESS_ID da env, fallback a pid univoco (compat locale).
+    PROCESS_ID da env, fallback a pid univoco (compat locale).
     """
     env_id = os.environ.get("PROCESS_ID")
     if env_id and str(env_id).strip():
@@ -67,7 +72,7 @@ def _resolve_process_id() -> str:
 
 def _ensure_outputs_dir(process_id: str) -> str:
     """
-    [PATCH] out_dir = ${OUTPUTS_DIR}/${PROCESS_ID} (fallback locale).
+    out_dir = ${OUTPUTS_DIR}/${PROCESS_ID} (fallback locale).
     """
     out_dir = os.path.join(_outputs_base_dir(), process_id)
     os.makedirs(out_dir, exist_ok=True)
@@ -200,7 +205,7 @@ def find_opposite_slope_points(slope_matrix, contour):
     return max_slope_index1, max_slope_index2
 
 
-# ———————— [PATCH] Core riusabile + salvataggio doublet (no GUI) ——————————
+# ———————— Core riusabile + salvataggio doublet (no GUI) ——————————
 
 def save_final_doublet_png(
     dem,
@@ -209,7 +214,7 @@ def save_final_doublet_png(
     out_path
 ):
     """
-    [PATCH] Salva una DOPPIETTA 1x2 (base vs caldera) con la STESSA gabbia
+    Salva una DOPPIETTA 1x2 (base vs caldera) con la STESSA gabbia
     delle doppiette precedenti: 14.5x5.5, spacer centrale, colorbar 4.6%.
     Funziona anche in headless (Agg).
     """
@@ -239,13 +244,13 @@ def save_final_doublet_png(
     cbar1.ax.tick_params(labelsize=9, pad=1)
     cbar1.ax.yaxis.labelpad = 2
     leg1 = ax1.legend(handles=[p1, p2, pc], labels=['Base 1', 'Base 2', 'Base Contour'],
-                     loc='upper right', frameon=True)
+                      loc='upper right', frameon=True)
     leg1.get_frame().set_alpha(0.7)
     leg1.get_frame().set_facecolor('white')
     leg1.get_frame().set_edgecolor('black')
 
     # Spacer
-    ax_spacer = fig.add_subplot(gs[0, 1]); ax_spacer.axis('off')
+    fig.add_subplot(gs[0, 1]).axis('off')
 
     # Destra: CALDERA
     ax2 = fig.add_subplot(gs[0, 2])
@@ -263,7 +268,7 @@ def save_final_doublet_png(
     cbar2.ax.tick_params(labelsize=9, pad=1)
     cbar2.ax.yaxis.labelpad = 2
     leg2 = ax2.legend(handles=[s1, s2, cc], labels=['Max Slope 1', 'Max Slope 2', 'Caldera Contour'],
-                     loc='upper right', frameon=True)
+                      loc='upper right', frameon=True)
     leg2.get_frame().set_alpha(0.7)
     leg2.get_frame().set_facecolor('white')
     leg2.get_frame().set_edgecolor('black')
@@ -273,6 +278,7 @@ def save_final_doublet_png(
 
     if not os.path.exists(out_path):
         raise RuntimeError(f"Doublet not saved: {out_path}")
+
 
 def run_volume_analysis(
     dem: np.ndarray,
@@ -285,7 +291,7 @@ def run_volume_analysis(
     write_outputs: bool = True,
 ):
     """
-    [PATCH] Core riusabile:
+    Core riusabile:
     - calcola (LOGICA SCIENTIFICA INVARIATA: copiata 1:1 dal tuo calculate_results)
     - in headless (write_outputs=True) salva doppietta + volume_results.json
     Ritorna payload utile per GUI o headless.
@@ -297,7 +303,7 @@ def run_volume_analysis(
     else:
         os.makedirs(outputs_dir, exist_ok=True)
 
-    # --- calcoli invariati (copiati 1:1 da calculate_results) ---
+    # --- calcoli invariati ---
     base_contour = find_lowest_base_contour(dem, base_elevation_ratio=base_elevation_ratio)
     base_point1, base_point2 = find_opposite_base_points(base_contour)
 
@@ -309,14 +315,17 @@ def run_volume_analysis(
     caldera_contour = find_caldera_contour(dem, level_ratio=caldera_level_ratio)
     max_slope_index1, max_slope_index2 = find_opposite_slope_points(slope, caldera_contour)
 
-    distance_pixel_caldera = distance_between_points(max_slope_index1[0], max_slope_index1[1], max_slope_index2[0], max_slope_index2[1])
+    distance_pixel_caldera = distance_between_points(
+        max_slope_index1[0], max_slope_index1[1],
+        max_slope_index2[0], max_slope_index2[1]
+    )
     distance_meters_caldera = distance_pixel_caldera * pixel_size
     distance_caldera_km = distance_meters_caldera * 1e-3
 
     area_base_km2 = calculate_area(base_contour, pixel_size) * 1e-6
     area_caldera_km2 = calculate_area(caldera_contour, pixel_size) * 1e-6
 
-    # Volumi (ellittico – MANTENGO il tuo schema originale)
+    # Volumi (ellittico – MANTENGO il tuo schema originale in Approx1)
     h_max = float(np.max(dem))
     R1 = distance_meters_base / 2.0
     R2 = distance_meters_caldera / 2.0
@@ -355,23 +364,11 @@ def run_volume_analysis(
     )
 
     images = []
-    doublet_abs = None
 
     if write_outputs:
-        # [PATCH] salva SEMPRE la doppietta nel outputs_dir
-        doublet_abs = os.path.join(outputs_dir, "final_doublet_base_vs_caldera.png")
-        save_final_doublet_png(
-            dem,
-            base_contour, base_point1, base_point2,
-            caldera_contour, max_slope_index1, max_slope_index2,
-            doublet_abs
-        )
-        images.append({
-            "filename": os.path.basename(doublet_abs),
-            "title": "Base vs Caldera (doublet)"
-        })
-
-        # (opzionale) aggancia immagini analysis (doppiette) dal manifest, ma SOLO per JSON/slider
+        # ============================
+        # [PATCH] 1) prima: immagini dal manifest (basenames) (NO triplets)
+        # ============================
         out_prev, mp = _find_manifest()
         if mp:
             prev = _load_manifest_images(mp)
@@ -379,14 +376,30 @@ def run_volume_analysis(
             prev = _remove_triplets(prev)
             for pth in prev:
                 fn = os.path.basename(pth)
-                if fn == os.path.basename(doublet_abs):
-                    continue
                 images.append({"filename": fn, "title": fn})
 
-        # [PATCH] wrapper stabile per viewer/server
+        # ============================
+        # [PATCH] 2) poi: salva SEMPRE la doppietta e aggiungila in coda
+        # ============================
+        doublet_abs = os.path.join(outputs_dir, "final_doublet_base_vs_caldera.png")
+        save_final_doublet_png(
+            dem,
+            base_contour, base_point1, base_point2,
+            caldera_contour, max_slope_index1, max_slope_index2,
+            doublet_abs
+        )
+
+        doublet_fn = os.path.basename(doublet_abs)
+        if not any((it.get("filename") == doublet_fn) for it in images):
+            images.append({
+                "filename": doublet_fn,
+                "title": "Base vs Caldera (final doublet)"
+            })
+
         wrapped = {
             "processId": process_id,
             "status": "completed",
+            "moduleKey": MODULE_KEY,
             "result": results,
             "images": images,
         }
@@ -405,6 +418,7 @@ def run_volume_analysis(
     return {
         "process_id": process_id,
         "outputs_dir": outputs_dir,
+        "moduleKey": MODULE_KEY,
         "results": results,
         "human_text": human_text,
         "images": images,
@@ -412,7 +426,7 @@ def run_volume_analysis(
     }
 
 
-# ———————— [PATCH] GUI: import PyQt SOLO se non headless ——————————
+# ———————— GUI: import PyQt SOLO se non headless ——————————
 if not HEADLESS:
     from PyQt5 import QtWidgets, QtGui, QtCore
     from PyQt5.QtWidgets import (
@@ -428,21 +442,20 @@ if not HEADLESS:
     class VolumeAnalysisApp(QMainWindow):
         def __init__(self, dem, original_file_name="Unknown"):
             super().__init__()
-            self.setWindowTitle('Elliptical Volcano Volume Analysis')
+            self.setWindowTitle('Elliptical Volcano Volume Analysis - Approximation 1')
             self.dem = dem
 
-            # outputs context
             self.process_id = _resolve_process_id()
             self.out_dir = _ensure_outputs_dir(self.process_id)
             self.original_file_name = original_file_name
 
-            # [PATCH] usa core riusabile (no scrittura in GUI)
+            # usa core riusabile (no scrittura in GUI)
             payload = run_volume_analysis(self.dem, process_id=self.process_id, outputs_dir=self.out_dir, write_outputs=False)
             self._apply_payload(payload)
 
             self.initUI()
 
-            # salva overview + emetti payload JSON (non blocca la GUI)  (mantengo la tua logica)
+            # overview + stdout payload (mantengo logica esistente)
             try:
                 self._save_overview_png()
                 self._emit_stdout_payload()
@@ -489,7 +502,6 @@ if not HEADLESS:
             )
 
             self.results_text = payload["human_text"]
-
             self.results_list = [
                 f"Base area of the volcano: {self.area_base:.2f} km²",
                 f"Base width (Distance between opposite points of the base): {self.distance_base_km:.2f} km",
@@ -506,7 +518,6 @@ if not HEADLESS:
 
             main_layout = QVBoxLayout(central_widget)
 
-            # Figura con constrained_layout per gestione corretta margini/cbar
             self.figure = Figure(figsize=(18, 14), constrained_layout=True)
             self.canvas = FigureCanvas(self.figure)
             main_layout.addWidget(self.canvas)
@@ -605,7 +616,7 @@ if not HEADLESS:
         def _save_overview_png(self):
             try:
                 out_png = os.path.join(self.out_dir, "elliptical_approx1_overview.png")
-                self.figure.savefig(out_png, dpi=150)  # niente bbox_inches='tight'
+                self.figure.savefig(out_png, dpi=150)
                 print(f"[PY VOL {self.process_id}] saved {out_png}")
             except Exception as e:
                 print(f"[PY VOL ERR] failed to save overview png: {e}")
@@ -625,11 +636,9 @@ if not HEADLESS:
                     print(f"[PY VOL WARN] failed reading manifest for stdout payload: {e}")
 
             images.append(f"/outputs/{self.process_id}/elliptical_approx1_overview.png")
-
             payload = {"result": self.results_text, "images": images}
             print(json.dumps(payload), flush=True)
 
-        # ----- doppietta finale (stessa gabbia) -----
         def _save_final_doublet_png(self, out_path):
             save_final_doublet_png(
                 self.dem,
@@ -638,7 +647,6 @@ if not HEADLESS:
                 out_path
             )
 
-        # ----- UI actions -----
         def show_results(self):
             msg_box = QMessageBox()
             msg_box.setWindowTitle("Summary Results")
@@ -671,8 +679,10 @@ if not HEADLESS:
                     manifest_imgs = _load_manifest_images(manifest_path)
                     image_paths = _normalize_and_filter_paths(manifest_imgs, base_dir=outputs_dir)
                     image_paths = _remove_triplets(image_paths)
+
                 if os.path.exists(doublet_png):
                     image_paths.append(doublet_png)
+
                 if not image_paths:
                     image_paths = [doublet_png]
 
@@ -683,6 +693,7 @@ if not HEADLESS:
                     image_paths=image_paths,
                     captions=[None]*len(image_paths)
                 )
+
                 QMessageBox.information(self, "Success", f"PDF successfully saved to {file_path}")
             except Exception as e:
                 QMessageBox.critical(self, "PDF Error", f"An error occurred while generating the PDF: {e}")
@@ -690,11 +701,7 @@ if not HEADLESS:
         def download_graph_image(self):
             options = QFileDialog.Options()
             file_path, selected_filter = QFileDialog.getSaveFileName(
-                self,
-                "Save Graph As",
-                "",
-                "PNG Files (*.png);;JPG Files (*.jpg);;All Files (*)",
-                options=options
+                self, "Save Graph As", "", "PNG Files (*.png);;JPG Files (*.jpg);;All Files (*)", options=options
             )
             if not file_path:
                 return
@@ -719,7 +726,7 @@ if not HEADLESS:
                 QMessageBox.critical(self, "Save Error", f"An error occurred while saving the graph: {e}")
 
 
-# ========== [PATCH] Entry point con headless/GUI ==========
+# ========== Entry point con headless/GUI ==========
 
 def main(argv=None):
     argv = argv or sys.argv
@@ -754,8 +761,9 @@ def main(argv=None):
                 write_outputs=True
             )
             final_line = {
-                "status": "completed",
                 "processId": payload["process_id"],
+                "status": "completed",
+                "moduleKey": MODULE_KEY,
                 "result": payload["results"],
                 "images": payload["images"],
             }
@@ -763,18 +771,14 @@ def main(argv=None):
             return 0
         except Exception as e:
             err_line = {
-                "status": "failed",
                 "processId": pid,
+                "status": "failed",
+                "moduleKey": MODULE_KEY,
                 "result": {"error": str(e)},
                 "images": [],
             }
             try:
-                _write_json(os.path.join(out_dir, "volume_results.json"), {
-                    "processId": pid,
-                    "status": "failed",
-                    "result": {"error": str(e)},
-                    "images": []
-                })
+                _write_json(os.path.join(out_dir, "volume_results.json"), err_line)
             except Exception:
                 pass
             print(json.dumps(err_line, ensure_ascii=False), flush=True)

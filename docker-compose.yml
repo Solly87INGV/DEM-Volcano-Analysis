@@ -16,4 +16,5 @@ services:
     volumes:
       - ./backend/uploads:/app/backend/uploads
       - ./backend/outputs:/app/backend/outputs
+      - ./frontend/public/images:/app/frontend/public/images:ro   # <-- AGGIUNGI QUESTA
     restart: unless-stopped

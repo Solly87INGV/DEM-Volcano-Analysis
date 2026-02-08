@@ -51,13 +51,14 @@ function buildResultRows(result) {
 // ------------------------------------------------------------
 
 export default function VolumeResultsViewer({
-  volumeRun, // { processId, status, result, images, outputsBaseUrl? }
+  volumeRun, // { processId, status, moduleKey, result, images, outputsBaseUrl? }
   processId: processIdProp,
   onBack,
   onBackToUpload, // opzionale
 }) {
   const [processId, setProcessId] = useState(processIdProp || volumeRun?.processId || null);
   const [status, setStatus] = useState(volumeRun?.status || 'unknown');
+  const [moduleKey, setModuleKey] = useState(volumeRun?.moduleKey || null);
   const [result, setResult] = useState(volumeRun?.result || null);
   const [images, setImages] = useState(normalizeImages(volumeRun?.processId, volumeRun?.images));
   const [slideIdx, setSlideIdx] = useState(0);
@@ -81,6 +82,7 @@ export default function VolumeResultsViewer({
     const pid = volumeRun.processId || processIdProp || processId;
     setProcessId(pid);
     setStatus(volumeRun.status || 'unknown');
+    setModuleKey(volumeRun.moduleKey || null);
     setResult(volumeRun.result || null);
     setImages(normalizeImages(pid, volumeRun.images));
   }, [volumeRun, processIdProp]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -121,6 +123,8 @@ export default function VolumeResultsViewer({
 
         setProcessId(pid);
         setStatus(data.status || 'unknown');
+        setModuleKey((prev) => data.moduleKey || prev || null);
+
 
         // IMPORTANT: supporta sia wrapper {result:{...}} che JSON "nudo" (vecchia forma)
         const maybeResult =
@@ -152,6 +156,45 @@ export default function VolumeResultsViewer({
   }, [processId, status]); // status per stoppare quando diventa completed/failed
 
   const rows = useMemo(() => buildResultRows(result), [result]);
+
+  // --------------------------
+  // ✅ NEW: Download PDF button
+  // --------------------------
+  const canDownloadPdf = Boolean(processId) && Boolean(moduleKey) && status === 'completed';
+
+  const handleDownloadPdf = async () => {
+    if (!processId) return;
+
+    const mk = moduleKey || 'unknown_module';
+    const url = `/api/report/${processId}?moduleKey=${encodeURIComponent(mk)}`;
+
+    try {
+      setLoading(true);
+
+      const resp = await axios.get(url, {
+        responseType: 'blob',
+        headers: { 'Cache-Control': 'no-cache' },
+      });
+
+      const blob = new Blob([resp.data], { type: 'application/pdf' });
+      const objectUrl = window.URL.createObjectURL(blob);
+
+      const a = document.createElement('a');
+      a.href = objectUrl;
+      a.download = `report_${mk}_${processId}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+
+      window.URL.revokeObjectURL(objectUrl);
+    } catch (e) {
+      console.error('PDF download failed:', e);
+      alert('PDF download failed. Check server route /api/report/:processId.');
+    } finally {
+      setLoading(false);
+    }
+  };
+  // --------------------------
 
   const renderSlide = () => {
     if (!current?.img) {
@@ -215,6 +258,12 @@ export default function VolumeResultsViewer({
         </Typography>
         <Typography variant="body2" sx={{ opacity: 0.75 }}>
           processId: <code>{processId || '-'}</code> — status: <b>{status || 'unknown'}</b>
+          {moduleKey ? (
+            <>
+              {' '}
+              — moduleKey: <code>{moduleKey}</code>
+            </>
+          ) : null}
         </Typography>
       </Box>
 
@@ -238,6 +287,20 @@ export default function VolumeResultsViewer({
             Back to Upload
           </Button>
         ) : null}
+
+        {/* ✅ NEW: Download PDF */}
+        <Button
+          variant="contained"
+          onClick={handleDownloadPdf}
+          disabled={!canDownloadPdf || loading}
+          title={
+            canDownloadPdf
+              ? 'Download PDF report'
+              : 'Available when status=completed and moduleKey is present'
+          }
+        >
+          Download PDF
+        </Button>
 
         <Box
           sx={{
@@ -300,7 +363,7 @@ export default function VolumeResultsViewer({
         Results
       </Typography>
 
-      {/* ✅ NEW: pretty, centered results (instead of raw JSON only) */}
+      {/* ✅ pretty, centered results */}
       <Box
         sx={{
           border: '1px solid #ddd',

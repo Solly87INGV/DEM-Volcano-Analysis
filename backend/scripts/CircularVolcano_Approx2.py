@@ -6,7 +6,7 @@
 #  - salva SEMPRE la PNG "final doublet" in:
 #       out_dir = os.path.join(os.environ["OUTPUTS_DIR"], os.environ["PROCESS_ID"])
 #  - scrive volume_results.json nello stesso out_dir con:
-#       { processId, status, result:{...}, images:[{filename,title}] }
+#       { processId, status, moduleKey, result:{...}, images:[{filename,title}] }
 #  - stampa UNA sola riga JSON su stdout (stessa struttura)
 #
 # GUI locale:
@@ -16,7 +16,6 @@
 import sys
 import os
 import json
-import time
 import uuid
 import numpy as np
 import rasterio
@@ -40,6 +39,12 @@ from matplotlib import gridspec
 from mpl_toolkits.axes_grid1 import make_axes_locatable  # ← per cbar affiancate co-alte
 
 import pdf_generator
+
+
+# =========================
+# [PATCH] module key stabile
+# =========================
+MODULE_KEY = "circular_approx2"
 
 
 # ========== helpers path/manifest/output dir ==========
@@ -236,7 +241,7 @@ def save_final_doublet_png(
     cbar1.ax.tick_params(labelsize=9, pad=1)
     cbar1.ax.yaxis.labelpad = 2
     leg1 = ax1.legend(handles=[p1, p2, pc], labels=['Base 1', 'Base 2', 'Base Contour'],
-                     loc='upper right', frameon=True)
+                      loc='upper right', frameon=True)
     leg1.get_frame().set_alpha(0.7)
     leg1.get_frame().set_facecolor('white')
     leg1.get_frame().set_edgecolor('black')
@@ -260,7 +265,7 @@ def save_final_doublet_png(
     cbar2.ax.tick_params(labelsize=9, pad=1)
     cbar2.ax.yaxis.labelpad = 2
     leg2 = ax2.legend(handles=[s1, s2, cc], labels=['Max Slope 1', 'Max Slope 2', 'Caldera Contour'],
-                     loc='upper right', frameon=True)
+                      loc='upper right', frameon=True)
     leg2.get_frame().set_alpha(0.7)
     leg2.get_frame().set_facecolor('white')
     leg2.get_frame().set_edgecolor('black')
@@ -357,20 +362,9 @@ def run_volume_analysis(
     doublet_abs = None
 
     if write_outputs:
-        # [PATCH] salva SEMPRE la doppietta nel outputs_dir
-        doublet_abs = os.path.join(outputs_dir, "final_doublet_base_vs_caldera.png")
-        save_final_doublet_png(
-            dem,
-            base_contour, base_point1, base_point2,
-            caldera_contour, max_slope_index1, max_slope_index2,
-            doublet_abs
-        )
-        images.append({
-            "filename": os.path.basename(doublet_abs),
-            "title": "Base vs Caldera (doublet)"
-        })
-
-        # (opzionale) aggancia immagini analysis (doppiette) dal manifest, ma SOLO per JSON/slider
+        # ============================
+        # [PATCH] 1) prima: manifest images (basenames) (no triplets)
+        # ============================
         out_prev, mp = _find_manifest()
         if mp:
             prev = _load_manifest_images(mp)
@@ -378,15 +372,34 @@ def run_volume_analysis(
             prev = _remove_triplets(prev)
             for pth in prev:
                 fn = os.path.basename(pth)
-                # evita duplicati
-                if fn == os.path.basename(doublet_abs):
-                    continue
                 images.append({"filename": fn, "title": fn})
 
-        # [PATCH] wrapper stabile per viewer/server
+        # ============================
+        # [PATCH] 2) poi: salva SEMPRE la doppietta e aggiungila in coda
+        # ============================
+        doublet_abs = os.path.join(outputs_dir, "final_doublet_base_vs_caldera.png")
+        save_final_doublet_png(
+            dem,
+            base_contour, base_point1, base_point2,
+            caldera_contour, max_slope_index1, max_slope_index2,
+            doublet_abs
+        )
+
+        # evita duplicato se già presente dal manifest
+        doublet_fn = os.path.basename(doublet_abs)
+        if not any(it.get("filename") == doublet_fn for it in images):
+            images.append({
+                "filename": doublet_fn,
+                "title": "Base vs Caldera (final doublet)"
+            })
+
+        # ============================
+        # [PATCH] wrapper stabile per viewer/server (CON moduleKey)
+        # ============================
         wrapped = {
             "processId": process_id,
             "status": "completed",
+            "moduleKey": MODULE_KEY,
             "result": results,
             "images": images,
         }
@@ -725,8 +738,9 @@ def main(argv=None):
                 write_outputs=True
             )
             final_line = {
-                "status": "completed",
                 "processId": payload["process_id"],
+                "status": "completed",
+                "moduleKey": MODULE_KEY,
                 "result": payload["results"],
                 "images": payload["images"],
             }
@@ -735,19 +749,15 @@ def main(argv=None):
         except Exception as e:
             # sempre UNA riga JSON (errore)
             err_line = {
-                "status": "failed",
                 "processId": pid,
+                "status": "failed",
+                "moduleKey": MODULE_KEY,
                 "result": {"error": str(e)},
                 "images": [],
             }
             # prova comunque a scrivere volume_results.json in failed
             try:
-                _write_json(os.path.join(out_dir, "volume_results.json"), {
-                    "processId": pid,
-                    "status": "failed",
-                    "result": {"error": str(e)},
-                    "images": []
-                })
+                _write_json(os.path.join(out_dir, "volume_results.json"), err_line)
             except Exception:
                 pass
 

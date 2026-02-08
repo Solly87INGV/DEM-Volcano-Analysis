@@ -54,6 +54,7 @@ if (frontendBuildDir && fs.existsSync(frontendBuildDir)) {
       req.path.startsWith('/calculateSlopes') ||
       req.path.startsWith('/calculateCurvatures') ||
       req.path.startsWith('/analysis') ||          // <-- IMPORTANTISSIMO: non mandare /analysis a index.html
+      req.path.startsWith('/api/report') ||        // <-- [PATCH] rotta PDF report (non SPA)
       req.path.startsWith('/health')
     ) {
       return next(); // <-- QUESTA È LA CHIAVE
@@ -112,6 +113,116 @@ app.get('/analysis/:processId', (req, res) => {
     console.error('[ERROR] cannot read analysis_viewer.html:', e);
     return res.status(500).send('Analysis viewer template not found.');
   }
+});
+
+/**
+ * ==========================================================
+ * [PATCH] STEP 3 — Unique PDF route (clean server-side build)
+ *   GET /api/report/:processId?moduleKey=circular_approx1
+ *
+ * Behavior:
+ *  - if /outputs/<pid>/report.pdf exists -> serve it
+ *  - else -> run build_pdf_report.py -> create -> serve
+ * ==========================================================
+ */
+app.get('/api/report/:processId', (req, res) => {
+  const t0 = performance.now();
+
+  const { processId } = req.params;
+  const moduleKey = req.query.moduleKey ? String(req.query.moduleKey) : '';
+
+  if (!processId) {
+    return res.status(400).json({ error: 'Missing processId' });
+  }
+
+  const procDir = path.join(outputsDir, processId);
+  const pdfPath = path.join(procDir, 'report.pdf');
+
+  // Serve if already exists
+  if (fs.existsSync(pdfPath)) {
+    const dt = (performance.now() - t0).toFixed(1);
+    console.log(`[TIMING][SERVER] /api/report served existing report.pdf in ${dt} ms (pid=${processId})`);
+    res.setHeader('Content-Type', 'application/pdf');
+    return res.sendFile(pdfPath);
+  }
+
+  // Otherwise build it with python
+  const reportScriptPath = path.join(__dirname, 'scripts', 'build_pdf_report.py');
+
+  if (!fs.existsSync(reportScriptPath)) {
+    console.error(`[ERROR][SERVER] build_pdf_report.py not found at: ${reportScriptPath}`);
+    return res.status(500).json({
+      error: 'Report builder script not found',
+      expectedPath: reportScriptPath,
+      processId,
+    });
+  }
+
+  // Ensure process output dir exists (should already exist, but be safe)
+  fs.mkdirSync(procDir, { recursive: true });
+
+  console.log(`[INFO][SERVER] report.pdf missing -> building (pid=${processId}, moduleKey=${moduleKey || 'N/A'})`);
+
+  // Pass processId + optional moduleKey as args (script can also read env PROCESS_ID/OUTPUTS_DIR)
+  const args = moduleKey
+    ? [reportScriptPath, processId, moduleKey]
+    : [reportScriptPath, processId];
+
+  const child = spawnPython({ processId, args });
+
+  let stderrData = '';
+  let stdoutData = '';
+
+  child.stdout.on('data', (d) => {
+    const s = d.toString();
+    stdoutData += s;
+    s.split(/\r?\n/).forEach((line) => {
+      if (line.trim()) console.log(`[PY PDF ${processId}] ${line.trim()}`);
+    });
+  });
+
+  child.stderr.on('data', (d) => {
+    const s = d.toString();
+    stderrData += s;
+    s.split(/\r?\n/).forEach((line) => {
+      if (line.trim()) console.error(`[PY PDF ${processId} ERR] ${line.trim()}`);
+    });
+  });
+
+  child.on('close', (code) => {
+    const dt = (performance.now() - t0).toFixed(1);
+    console.log(`[TIMING][SERVER] /api/report build finished in ${dt} ms (pid=${processId}, code=${code})`);
+
+    if (code !== 0) {
+      const stderrPreview = String(stderrData || '').trim().slice(0, 4000);
+      const stdoutPreview = String(stdoutData || '').trim().slice(0, 2000);
+
+      console.error(`[ERROR][SERVER] report build failed (pid=${processId}, code=${code})`);
+      if (stderrPreview) console.error(`[ERROR][SERVER] report stderr preview:\n${stderrPreview}`);
+      if (stdoutPreview) console.error(`[ERROR][SERVER] report stdout preview:\n${stdoutPreview}`);
+
+      return res.status(500).json({
+        error: 'Failed to build report.pdf',
+        processId,
+        code,
+        stderr: stderrPreview || null,
+        stdout: stdoutPreview || null,
+      });
+    }
+
+    // Build succeeded: ensure file exists
+    if (!fs.existsSync(pdfPath)) {
+      console.error(`[ERROR][SERVER] build finished but report.pdf not found (pid=${processId})`);
+      return res.status(500).json({
+        error: 'Report build completed but report.pdf is missing',
+        processId,
+        expectedPdfPath: pdfPath,
+      });
+    }
+
+    res.setHeader('Content-Type', 'application/pdf');
+    return res.sendFile(pdfPath);
+  });
 });
 
 // ========== DEM preprocessing ==========
@@ -259,7 +370,35 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
   if (!scriptPath) {
     return res.status(400).json({ error: 'Invalid volumeType or approximationType' });
   }
+  
+  // --- [PATCH] Persist DEM original filename + moduleKey for later PDF naming/title ---
+  try {
+    const procDir = path.join(outputsDir, processId);
+    fs.mkdirSync(procDir, { recursive: true });
 
+    // file.originalname includes extension (e.g. Darwin.tif)
+    const inputDemName = file && file.originalname ? String(file.originalname) : null;
+
+    // derive moduleKey (supported: circular_approx1/2, elliptical_approx1/2)
+    let moduleKey = null;
+    if (volumeType === 'circular' && approximationType === 'approximation1') moduleKey = 'circular_approx1';
+    else if (volumeType === 'circular' && approximationType === 'approximation2') moduleKey = 'circular_approx2';
+    else if (volumeType === 'elliptical' && approximationType === 'approximation1') moduleKey = 'elliptical_approx1';
+    else if (volumeType === 'elliptical' && approximationType === 'approximation2') moduleKey = 'elliptical_approx2';
+
+    const metaPath = path.join(procDir, 'meta.json');
+    const meta = {
+      processId,
+      input_dem_name: inputDemName, // e.g. Darwin.tif
+      input_dem_base: inputDemName ? path.parse(inputDemName).name : null, // e.g. Darwin
+      moduleKey,
+      saved_at: new Date().toISOString(),
+    };
+
+    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf-8');
+  } catch (e) {
+    console.error(`[WARN][SERVER] Failed writing meta.json for ${processId}:`, e);
+  }
   const absFilePath = path.resolve(file.path);
 
   const child = spawnPython({

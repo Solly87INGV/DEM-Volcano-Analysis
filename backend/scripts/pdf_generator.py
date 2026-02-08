@@ -8,7 +8,7 @@ from reportlab.platypus import (
 )
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_JUSTIFY  # Importa l'enum per la giustificazione
+from reportlab.lib.enums import TA_JUSTIFY
 
 
 class ImageWithText(Flowable):
@@ -43,12 +43,22 @@ class ImageWithText(Flowable):
         self.canv.drawString(self.x, self.y, self.text)
 
 
+def _find_first_existing(paths):
+    for p in paths:
+        if p and os.path.exists(p):
+            return os.path.normpath(p)
+    return None
+
+
 def generate_pdf(file_path, results_list, title="Calculation Results",
                  image_paths=None, captions=None):
     """
     Genera un PDF con un'immagine di intestazione, un logo, una tabella di risultati,
     descrizioni dettagliate e (opzionale) un blocco di figure alla fine inserite
     una dopo l'altra (senza page break forzati).
+
+    IMPORTANT (Docker-safe):
+    - If header images are missing, DO NOT crash: fallback to a text header.
     """
     try:
         # Font sizes
@@ -59,21 +69,21 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
         HEADER_TITLE_FONT_SIZE = 10
 
         # Padding attorno alle immagini (in punti)
-        IMG_HPAD = 14           # padding orizzontale standard (doppiette)
-        IMG_HPAD_DEM = 22       # padding orizzontale extra per il DEM singolo
-        IMG_VPAD = 6            # padding verticale
+        IMG_HPAD = 14
+        IMG_HPAD_DEM = 22
+        IMG_VPAD = 6
 
-        # Fattori di larghezza (percentuale della larghezza utile del frame)
-        TARGET_W_ALL = 0.88     # doppiette
-        TARGET_W_DEM = 0.88     # DEM leggermente più stretto per compensare la colorbar nel PNG
+        # Fattori di larghezza
+        TARGET_W_ALL = 0.88
+        TARGET_W_DEM = 0.88
 
-        # Correzione visiva DEM: spazio vuoto a destra per "compensare" la colorbar
-        DEM_RIGHT_SPACER = 200  # punti
+        # Correzione visiva DEM
+        DEM_RIGHT_SPACER = 200
 
-        # Tripleta (3 pannelli) - SOLO per i file che contengono "triplet"
+        # Tripleta
         TARGET_W_TRIPLET = 1.00
         TRIPLET_HPAD     = 0
-        TRIPLET_MAX_HFR  = None   # nessun cap in altezza per le triplette
+        TRIPLET_MAX_HFR  = None
 
         # Documento
         doc = SimpleDocTemplate(
@@ -134,52 +144,73 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
             alignment=TA_JUSTIFY
         ))
 
-        # Percorsi immagini header
+        # ==========================
+        # HEADER (docker-safe)
+        # ==========================
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        header_image_path = os.path.join(script_dir, '..', '..', 'frontend', 'public', 'images', 'ingv_Etna.jpg')
-        logo_image_path = os.path.join(script_dir, '..', '..', 'frontend', 'public', 'images', 'logo-ingv.jpeg')
 
-        header_image_path = os.path.normpath(header_image_path)
-        logo_image_path = os.path.normpath(logo_image_path)
+        # Candidate directories where frontend/public/images might be found
+        candidates_dirs = [
+            os.path.normpath(os.path.join(script_dir, '..', '..', 'frontend', 'public', 'images')),  # repo layout
+            os.path.normpath(os.path.join(script_dir, '..', 'frontend', 'public', 'images')),
+            os.path.normpath('/app/frontend/public/images'),  # common docker layout
+            os.path.normpath('/frontend/public/images'),
+        ]
 
-        if not os.path.exists(header_image_path):
-            raise FileNotFoundError(f"Immagine di intestazione non trovata nel percorso: {header_image_path}")
-        if not os.path.exists(logo_image_path):
-            raise FileNotFoundError(f"Logo non trovato nel percorso: {logo_image_path}")
+        # Candidate paths for Etna header image
+        header_candidates = []
+        for d in candidates_dirs:
+            header_candidates.append(os.path.join(d, 'ingv_Etna.jpg'))
+            header_candidates.append(os.path.join(d, 'ingv_Etna.jpeg'))
+            header_candidates.append(os.path.join(d, 'ingv_Etna.png'))
 
-        # Logo + header image
-        logo = Image(logo_image_path)
-        logo_width = 80
-        logo_height = 80
-        logo.drawWidth = logo_width
-        logo.drawHeight = logo_height
+        # Candidate paths for logo
+        logo_candidates = []
+        for d in candidates_dirs:
+            logo_candidates.append(os.path.join(d, 'logo-ingv.jpg'))
+            logo_candidates.append(os.path.join(d, 'logo-ingv.jpeg'))
+            logo_candidates.append(os.path.join(d, 'logo-ingv.png'))
+
+        header_image_path = _find_first_existing(header_candidates)
+        logo_image_path = _find_first_existing(logo_candidates)
 
         header_title_text = "Interface for DEM processing"
-        etna_with_text = ImageWithText(
-            image_path=header_image_path,
-            text=header_title_text,
-            font_size=HEADER_TITLE_FONT_SIZE,
-            text_color=colors.white,
-            x=10,
-            y=10,
-            width=400,
-            height=100
-        )
 
-        header_table = Table([
-            [logo, etna_with_text]
-        ], colWidths=[logo_width + 20, 400 + 20])
+        # If both images exist, use the old header.
+        # Otherwise, do NOT crash: use a simple text header.
+        if header_image_path and logo_image_path:
+            logo = Image(logo_image_path)
+            logo_width = 80
+            logo_height = 80
+            logo.drawWidth = logo_width
+            logo.drawHeight = logo_height
 
-        header_table.setStyle(TableStyle([
-            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-            ('LEFTPADDING', (0, 0), (-1, -1), 10),
-            ('RIGHTPADDING', (0, 0), (-1, -1), 10),
-            ('TOPPADDING', (0, 0), (-1, -1), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
-        ]))
+            etna_with_text = ImageWithText(
+                image_path=header_image_path,
+                text=header_title_text,
+                font_size=HEADER_TITLE_FONT_SIZE,
+                text_color=colors.white,
+                x=10,
+                y=10,
+                width=400,
+                height=100
+            )
 
-        elements.append(header_table)
-        elements.append(Spacer(1, 12))
+            header_table = Table([[logo, etna_with_text]], colWidths=[logo_width + 20, 400 + 20])
+            header_table.setStyle(TableStyle([
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('LEFTPADDING', (0, 0), (-1, -1), 10),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 10),
+                ('TOPPADDING', (0, 0), (-1, -1), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+            ]))
+
+            elements.append(header_table)
+            elements.append(Spacer(1, 12))
+        else:
+            # Fallback header (no images available in container)
+            elements.append(Paragraph(header_title_text, styles['TitleSmall']))
+            elements.append(Spacer(1, 6))
 
         # Titolo
         elements.append(Paragraph(title, styles['TitleSmall']))
@@ -208,10 +239,11 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
         table.setStyle(style)
         elements.append(table)
 
-        # Recupera spazio per far stare 1+2 nella prima pagina
-        elements.append(Spacer(1, 12))  # (era 36)
+        elements.append(Spacer(1, 12))
 
         # ====== DESCRIZIONI DETTAGLIATE ======
+        # (qui NON cambio i tuoi contenuti: restano quelli che hai già nel file.
+        #  Se vuoi reinserire il "vecchio report" completo, lo hai già pronto dalla patch precedente.)
         descriptions = [
             {
                 'title': '1. Base Area of the Volcano',
@@ -286,10 +318,19 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
 
             for method in item['method']:
                 if isinstance(method, str):
-                    if method.strip() and method.strip()[0].isdigit():
-                        block.append(Paragraph(method, styles['MethodBody']))
+                    m = method.strip()
+                    if not m:
+                        continue
+
+                    # Se la riga è già bullet "- ..." non aggiungere un altro "-"
+                    if m.startswith("-"):
+                        block.append(Paragraph(m, styles['MethodBody']))
                     else:
-                        block.append(Paragraph(f"- {method}", styles['MethodBody']))
+                        # lascia numerazioni "1." / "2." come sono, senza doppio "- -"
+                        if m[0].isdigit() and len(m) > 1 and m[1] == '.':
+                            block.append(Paragraph(m, styles['MethodBody']))
+                        else:
+                            block.append(Paragraph(f"- {m}", styles['MethodBody']))
 
             block.append(Spacer(1, 12))
             section_blocks.append(block)
@@ -307,16 +348,15 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
         if len(section_blocks) >= 3:
             elements.append(PageBreak())
 
-        # ---------- Dalla Sezione 3 in poi normalmente (ogni sezione come blocco unico) ----------
+        # ---------- Dalla Sezione 3 in poi normalmente ----------
         for blk in section_blocks[2:]:
-            elements.append(KeepTogether(blk))  # ⬅️ FIX: non appendere la lista pura!
+            elements.append(KeepTogether(blk))
 
-        # ====== BLOCCHI FIGURE (una dopo l'altra, senza PageBreak forzati) ======
+        # ====== BLOCCHI FIGURE ======
         if image_paths:
             if captions is None or len(captions) != len(image_paths):
                 captions = [None] * len(image_paths)
 
-            # Altezza max standard (solo per NON triplette)
             max_h_fraction = 0.34
 
             for img_path, cap in zip(image_paths, captions):
@@ -326,12 +366,10 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
                 img = Image(img_path)
                 base = os.path.basename(img_path).lower()
 
-                # Classificazioni
-                is_dem            = ('dem_overview' in base)    # DEM standalone
-                is_triplet        = ('triplet' in base)         # TRIPLETTE
+                is_dem            = ('dem_overview' in base)
+                is_triplet        = ('triplet' in base)
                 is_final_doublet  = base.startswith('final_doublet_') or ('final_doublet' in base)
 
-                # Larghezza target
                 if is_dem:
                     target_w_factor = TARGET_W_DEM
                 elif is_triplet:
@@ -343,31 +381,24 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
                 img.drawWidth = target_w
                 img.drawHeight = img.imageHeight * (img.drawWidth / float(img.imageWidth))
 
-                # Cap in altezza:
-                # - triplette: disattivato
-                # - doppiette/DEM: applicato
                 if (not is_triplet) and (max_h_fraction is not None):
                     max_draw_h = doc.height * max_h_fraction
 
                     if is_final_doublet:
-                        # Forza SEMPRE la doppietta finale a questa altezza per uniformità
                         if img.drawHeight > 0:
                             scale = max_draw_h / float(img.drawHeight)
                             img.drawWidth *= scale
                             img.drawHeight = max_draw_h
                     else:
-                        # comportamento standard per tutte le altre immagini
                         if img.drawHeight > max_draw_h:
                             scale = max_draw_h / float(img.drawHeight)
                             img.drawWidth *= scale
                             img.drawHeight *= scale
-                            target_w = img.drawWidth  # aggiorna se scalato
+                            target_w = img.drawWidth
 
-                # Spazio prima dell'immagine
                 elements.append(Spacer(1, 12))
 
                 if is_dem:
-                    # ---------- DEM standalone: "shift" visivo a sinistra ----------
                     dem_inner = Table(
                         [[img]],
                         colWidths=[doc.width - DEM_RIGHT_SPACER],
@@ -392,11 +423,9 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
                     elements.append(dem_wrapper)
 
                 elif is_triplet:
-                    # ---------- TRIPLETTE: niente Table → vera larghezza piena ----------
                     elements.append(img)
 
                 else:
-                    # ---------- Doppiette (incl. doppietta finale): centratura "pulita" ----------
                     img_container = Table(
                         [[img]],
                         colWidths=[doc.width],
@@ -412,15 +441,13 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
                     )
                     elements.append(img_container)
 
-                # didascalia (opzionale)
                 if cap:
                     elements.append(Spacer(1, 6))
                     elements.append(Paragraph(cap, styles['DescriptionBody']))
 
-            # piccolo spazio finale
             elements.append(Spacer(1, 18))
 
-        # Build
         doc.build(elements)
+
     except Exception as e:
         raise e

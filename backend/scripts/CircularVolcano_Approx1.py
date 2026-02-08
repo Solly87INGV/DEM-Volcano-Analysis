@@ -234,7 +234,7 @@ def _get_headless_out_dir_and_pid():
     os.makedirs(out_dir, exist_ok=True)
     return out_dir, pid
 
-# >>> PATCH [FIX]: dal manifest estrai SOLO filename (perché il FE già prefissa /outputs/<pid>/)
+# >>> PATCH [FIX]: dal manifest estrai SOLO filename (perché FE/server già costruiscono /outputs/<pid>/...)
 def _load_manifest_filenames(manifest_path):
     """
     Ritorna lista di dict {filename, title} dai record del manifest.
@@ -252,7 +252,6 @@ def _load_manifest_filenames(manifest_path):
             fn = os.path.basename(str(p))
             if not fn:
                 continue
-            # titolo opzionale (se presente nel manifest), fallback al filename
             title = it.get("title") or it.get("caption") or fn
             out.append({"filename": fn, "title": title})
         return out
@@ -261,7 +260,7 @@ def _load_manifest_filenames(manifest_path):
         return []
 
 def _remove_triplets_entries(entries):
-    """Rimuove triplet_*.png da lista di dict {filename,...}."""
+    """Rimuove triplet_*.png da lista di dict {filename,}."""
     out = []
     for it in entries or []:
         fn = str(it.get("filename", "")).lower()
@@ -317,7 +316,7 @@ def save_final_doublet_png(dem, base_contour, base_point1, base_point2, caldera_
     leg1.get_frame().set_facecolor('white')
     leg1.get_frame().set_edgecolor('black')
 
-    # Spacer centrale
+    # === Spacer centrale ===
     ax_spacer = fig.add_subplot(gs[0, 1])
     ax_spacer.axis('off')
 
@@ -355,6 +354,7 @@ def save_final_doublet_png(dem, base_contour, base_point1, base_point2, caldera_
     if not os.path.exists(out_path):
         raise RuntimeError(f"Doublet not saved: {out_path}")
 
+
 def run_volume_analysis(
     dem: np.ndarray,
     *,
@@ -381,6 +381,7 @@ def run_volume_analysis(
     if outputs_base_url is None:
         outputs_base_url = f"/outputs/{process_id}"
 
+    # --- compute ---
     base_contour = find_lowest_base_contour(dem, base_elevation_ratio=base_elevation_ratio)
     base_point1, base_point2 = find_opposite_base_points(base_contour)
 
@@ -388,17 +389,21 @@ def run_volume_analysis(
     caldera_contour = find_caldera_contour(dem, level_ratio=caldera_level_ratio)
     max_slope_index1, max_slope_index2 = find_opposite_slope_points(slope, caldera_contour)
 
+    # distanze base
     distance_pixel_base = distance_between_points(base_point1[0], base_point1[1], base_point2[0], base_point2[1])
     distance_meters_base = distance_pixel_base * pixel_size
     distance_base_km = distance_meters_base * 1e-3
 
+    # distanze caldera
     distance_pixel_caldera = distance_between_points(max_slope_index1[0], max_slope_index1[1], max_slope_index2[0], max_slope_index2[1])
     distance_meters_caldera = distance_pixel_caldera * pixel_size
     distance_caldera_km = distance_meters_caldera * 1e-3
 
+    # aree
     area_base_km2 = calculate_area(base_contour, pixel_size) * 1e-6
     area_caldera_km2 = calculate_area(caldera_contour, pixel_size) * 1e-6
 
+    # volumi
     h_max_m = float(np.max(dem))
     R1_m = distance_meters_base / 2.0
     R2_m = distance_meters_caldera / 2.0
@@ -407,18 +412,7 @@ def run_volume_analysis(
 
     r2_km = (R2_m * 1e-3)
     caldera_volume_km3 = float((2/3) * np.pi * (r2_km**3))
-
     effective_volume_km3 = float(total_volume_km3 - caldera_volume_km3)
-
-    human_text = (
-        f"Base area of the volcano: {area_base_km2:.2f} km²\n"
-        f"Base width (Distance between opposite points of the base): {distance_base_km:.2f} km\n"
-        f"Caldera area of the volcano: {area_caldera_km2:.2f} km²\n"
-        f"Caldera width (Distance between opposite points of the caldera): {distance_caldera_km:.2f} km\n"
-        f"Total volume of the volcanic edifice: {total_volume_km3:.2f} km³\n"
-        f"Caldera volume: {caldera_volume_km3:.2f} km³\n"
-        f"Effective volume of the volcanic edifice: {effective_volume_km3:.2f} km³"
-    )
 
     results = {
         "base_area_km2": float(area_base_km2),
@@ -433,6 +427,46 @@ def run_volume_analysis(
         "caldera_level_ratio": float(caldera_level_ratio),
         "h_max_m": float(h_max_m),
     }
+
+    human_text = (
+        f"Base area of the volcano: {area_base_km2:.2f} km²\n"
+        f"Base width (Distance between opposite points of the base): {distance_base_km:.2f} km\n"
+        f"Caldera area of the volcano: {area_caldera_km2:.2f} km²\n"
+        f"Caldera width (Distance between opposite points of the caldera): {distance_caldera_km:.2f} km\n"
+        f"Total volume of the volcanic edifice: {total_volume_km3:.2f} km³\n"
+        f"Caldera volume: {caldera_volume_km3:.2f} km³\n"
+        f"Effective volume of the volcanic edifice: {effective_volume_km3:.2f} km³"
+    )
+
+    images_abs = []
+
+    if write_outputs:
+        doublet_png = os.path.join(outputs_dir, "final_doublet_base_vs_caldera.png")
+        try:
+            save_final_doublet_png(
+                dem,
+                base_contour, base_point1, base_point2,
+                caldera_contour, max_slope_index1, max_slope_index2,
+                doublet_png
+            )
+            images_abs.append(doublet_png)
+        except Exception as e:
+            print(f"[WARN] Could not generate final doublet PNG: {e}")
+
+        out_dir_prev, manifest_path = _find_manifest()
+        if manifest_path:
+            manifest_imgs = _load_manifest_images(manifest_path)
+            prev_paths = _normalize_and_filter_paths(manifest_imgs, base_dir=out_dir_prev)
+            prev_paths = _remove_triplets(prev_paths)
+            for p in prev_paths:
+                if p not in images_abs:
+                    images_abs.append(p)
+
+        _write_json(os.path.join(outputs_dir, "volume_results.json"), results)
+
+        images_abs_existing = [p for p in images_abs if os.path.exists(p)]
+        images_manifest = _build_images_manifest(outputs_dir, outputs_base_url, images_abs_existing)
+        _write_json(os.path.join(outputs_dir, "volume_images.json"), images_manifest)
 
     geometry = {
         "base_contour": base_contour,
@@ -451,6 +485,7 @@ def run_volume_analysis(
         "results": results,
         "human_text": human_text,
         "geometry": geometry,
+        "images_abs": [p for p in images_abs if os.path.exists(p)],
     }
 
 
@@ -554,7 +589,6 @@ if not HEADLESS:
         def update_display(self):
             self.figure.clear()
             fig = self.figure
-
             fig.set_constrained_layout_pads(w_pad=0.12, h_pad=0.02, wspace=0.40, hspace=0.60)
 
             gs = gridspec.GridSpec(nrows=3, ncols=3, height_ratios=[4, 1, 1.5], figure=fig, wspace=0.4, hspace=0.6)
@@ -584,6 +618,7 @@ if not HEADLESS:
             cbar2.ax.yaxis.set_label_position('right')
             cbar2.ax.tick_params(labelsize=9, pad=1)
             cbar2.ax.yaxis.labelpad = 2
+
             p1, = ax2.plot(self.base_point1[1], self.base_point1[0], 'ro', markersize=10, label='Base 1')
             p2, = ax2.plot(self.base_point2[1], self.base_point2[0], 'yo', markersize=10, label='Base 2')
             pc, = ax2.plot(self.base_contour[:, 1], self.base_contour[:, 0], 'w-', linewidth=1, label="Base Contour")
@@ -601,6 +636,7 @@ if not HEADLESS:
             cbar3.ax.yaxis.set_label_position('right')
             cbar3.ax.tick_params(labelsize=9, pad=1)
             cbar3.ax.yaxis.labelpad = 2
+
             s1, = ax3.plot(self.max_slope_index1[1], self.max_slope_index1[0], 'ro', markersize=10, label='Max Slope 1')
             s2, = ax3.plot(self.max_slope_index2[1], self.max_slope_index2[0], 'yo', markersize=10, label='Max Slope 2')
             cc, = ax3.plot(self.caldera_contour[:, 1], self.caldera_contour[:, 0], 'b-', linewidth=1, label="Caldera Contour")
@@ -625,7 +661,7 @@ if not HEADLESS:
 
             da3 = fig.add_subplot(gs[2, 2]); da3.axis('off')
             da3.text(0.5, 1.5, self.description_slope, fontsize=10, ha='center', va='center',
-                     bbox=dict(boxstyle="round,pad=0.5", edgecolor='black', facecolor='white'),
+                     bbox=dict(boxstyle="round,pad=0.5", edgecolor="black", facecolor="white"),
                      wrap=True, transform=da3.transAxes)
 
             self.canvas.draw()
@@ -694,7 +730,11 @@ if not HEADLESS:
         def download_graph_image(self):
             options = QFileDialog.Options()
             file_path, selected_filter = QFileDialog.getSaveFileName(
-                self, "Save Graph As", "", "PNG Files (*.png);;JPG Files (*.jpg);;All Files (*)", options=options
+                self,
+                "Save Graph As",
+                "",
+                "PNG Files (*.png);;JPG Files (*.jpg);;All Files (*)",
+                options=options
             )
             if not file_path:
                 return
@@ -755,7 +795,7 @@ def main(argv=None):
                 write_outputs=False
             )
 
-            # salva doppietta in out_dir
+            # salva sempre doppietta finale in out_dir
             doublet_filename = "final_doublet_base_vs_caldera.png"
             doublet_path = os.path.join(out_dir, doublet_filename)
             save_final_doublet_png(
@@ -769,16 +809,22 @@ def main(argv=None):
                 doublet_path
             )
 
-            # >>> FIX: immagini dal manifest come *filename* (NO /outputs/...),
-            # così il FE può fare: /outputs/<pid>/<filename>
+            # >>> FIX: immagini dallo manifest = SOLO BASENAME (NO /outputs/... dentro filename)
             images = []
-            outputs_dir_m, manifest_path = _find_manifest()
-            if manifest_path and os.path.exists(manifest_path):
-                entries = _load_manifest_filenames(manifest_path)
+            out_prev, mp = _find_manifest()
+            if mp and os.path.exists(mp):
+                entries = _load_manifest_filenames(mp)
                 entries = _remove_triplets_entries(entries)
-                images.extend(entries)
+                # dedup per filename mantenendo ordine
+                seen = set()
+                for it in entries:
+                    fn = it.get("filename")
+                    if not fn or fn in seen:
+                        continue
+                    seen.add(fn)
+                    images.append({"filename": fn, "title": it.get("title") or fn})
 
-            # aggiungi sempre la doppietta finale
+            # aggiungi doppietta finale (in coda)
             images.append({
                 "filename": doublet_filename,
                 "title": "Base vs Caldera (final doublet)"
@@ -787,6 +833,7 @@ def main(argv=None):
             out_json = {
                 "processId": pid,
                 "status": "completed",
+                "moduleKey": "circular_approx1",  # <<< STEP 2 standard
                 "result": payload["results"],
                 "images": images
             }
@@ -800,9 +847,11 @@ def main(argv=None):
             out_json = {
                 "processId": str(err_pid),
                 "status": "failed",
+                "moduleKey": "circular_approx1",
                 "result": {"error": str(e)},
                 "images": []
             }
+
             if err_base and str(err_base).strip():
                 try:
                     err_out_dir = os.path.join(os.path.abspath(str(err_base).strip()), str(err_pid))
@@ -814,7 +863,6 @@ def main(argv=None):
         print(json.dumps(out_json, ensure_ascii=False))
         return 0 if status == "completed" else 2
 
-    # GUI locale
     if not HEADLESS:
         app = QApplication(argv)
         ex = VolumeAnalysisApp(dem)
