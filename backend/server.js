@@ -54,7 +54,7 @@ if (frontendBuildDir && fs.existsSync(frontendBuildDir)) {
       req.path.startsWith('/calculateSlopes') ||
       req.path.startsWith('/calculateCurvatures') ||
       req.path.startsWith('/analysis') ||          // <-- IMPORTANTISSIMO: non mandare /analysis a index.html
-      req.path.startsWith('/api/report') ||        // <-- [PATCH] rotta PDF report (non SPA)
+      req.path.startsWith('/api/report') ||        // <-- rotta PDF report (non SPA)
       req.path.startsWith('/health')
     ) {
       return next(); // <-- QUESTA È LA CHIAVE
@@ -96,6 +96,41 @@ function spawnPython({ args, processId }) {
   });
 }
 
+// ====== Helper: write meta.json for report titles ======
+function writeProcessMeta(procDir, metaPatch) {
+  try {
+    fs.mkdirSync(procDir, { recursive: true });
+
+    const metaPath = path.join(procDir, 'meta.json');
+    let existing = {};
+    if (fs.existsSync(metaPath)) {
+      try {
+        existing = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+      } catch {
+        existing = {};
+      }
+    }
+
+    const merged = { ...existing, ...metaPatch };
+    fs.writeFileSync(metaPath, JSON.stringify(merged, null, 2), 'utf-8');
+  } catch (e) {
+    console.warn('[WARN] Could not write meta.json:', e);
+  }
+}
+
+// ====== Helper: derive moduleKey from request ======
+function deriveModuleKey(volumeType, approximationType) {
+  if (volumeType === 'circular') {
+    if (approximationType === 'approximation1') return 'circular_approx1';
+    if (approximationType === 'approximation2') return 'circular_approx2';
+  }
+  if (volumeType === 'elliptical') {
+    if (approximationType === 'approximation1') return 'elliptical_approx1';
+    if (approximationType === 'approximation2') return 'elliptical_approx2';
+  }
+  return '';
+}
+
 // metti vicino agli altri const
 const analysisTplPath = path.join(__dirname, 'views', 'analysis_viewer.html');
 
@@ -117,11 +152,12 @@ app.get('/analysis/:processId', (req, res) => {
 
 /**
  * ==========================================================
- * [PATCH] STEP 3 — Unique PDF route (clean server-side build)
+ * STEP 3 — Unique PDF route (clean server-side build)
  *   GET /api/report/:processId?moduleKey=circular_approx1
  *
  * Behavior:
- *  - if /outputs/<pid>/report.pdf exists -> serve it
+ *  - if moduleKey is provided: prefer serving report_<moduleKey>_*.pdf
+ *  - else: fallback/legacy: serve report.pdf if exists
  *  - else -> run build_pdf_report.py -> create -> serve
  * ==========================================================
  */
@@ -135,13 +171,39 @@ app.get('/api/report/:processId', (req, res) => {
     return res.status(400).json({ error: 'Missing processId' });
   }
 
+  // >>> FIX: qui era OUTPUTS_DIR (non definita) -> outputsDir
   const procDir = path.join(outputsDir, processId);
-  const pdfPath = path.join(procDir, 'report.pdf');
 
-  // Serve if already exists
-  if (fs.existsSync(pdfPath)) {
-    const dt = (performance.now() - t0).toFixed(1);
-    console.log(`[TIMING][SERVER] /api/report served existing report.pdf in ${dt} ms (pid=${processId})`);
+  // Prefer module-specific report PDFs (report_<moduleKey>_*.pdf).
+  // This avoids a common bug: returning an old cached report.pdf produced by another module.
+  const safeModuleKey = (moduleKey || 'circular_approx1').replace(/[^a-zA-Z0-9_-]/g, '');
+  const pickLatestReportPdf = () => {
+    try {
+      if (!fs.existsSync(procDir)) return null;
+      const files = fs.readdirSync(procDir);
+      const candidates = files
+        .filter(f => f.startsWith(`report_${safeModuleKey}_`) && f.toLowerCase().endsWith('.pdf'))
+        .map(f => ({ f, p: path.join(procDir, f) }))
+        .filter(x => fs.existsSync(x.p))
+        .sort((a, b) => fs.statSync(b.p).mtimeMs - fs.statSync(a.p).mtimeMs);
+      return candidates.length ? candidates[0].p : null;
+    } catch (e) {
+      console.warn('[WARN] Could not scan report PDFs:', e);
+      return null;
+    }
+  };
+
+  let pdfPath = null;
+
+  if (moduleKey) {
+    // module-specific request: do NOT serve legacy report.pdf (it may be from another module)
+    pdfPath = pickLatestReportPdf();
+  } else {
+    // legacy / backward compatibility
+    pdfPath = path.join(procDir, 'report.pdf');
+  }
+
+  if (pdfPath && fs.existsSync(pdfPath)) {
     res.setHeader('Content-Type', 'application/pdf');
     return res.sendFile(pdfPath);
   }
@@ -161,7 +223,7 @@ app.get('/api/report/:processId', (req, res) => {
   // Ensure process output dir exists (should already exist, but be safe)
   fs.mkdirSync(procDir, { recursive: true });
 
-  console.log(`[INFO][SERVER] report.pdf missing -> building (pid=${processId}, moduleKey=${moduleKey || 'N/A'})`);
+  console.log(`[INFO][SERVER] report missing -> building (pid=${processId}, moduleKey=${moduleKey || 'N/A'})`);
 
   // Pass processId + optional moduleKey as args (script can also read env PROCESS_ID/OUTPUTS_DIR)
   const args = moduleKey
@@ -202,7 +264,7 @@ app.get('/api/report/:processId', (req, res) => {
       if (stdoutPreview) console.error(`[ERROR][SERVER] report stdout preview:\n${stdoutPreview}`);
 
       return res.status(500).json({
-        error: 'Failed to build report.pdf',
+        error: 'Failed to build report',
         processId,
         code,
         stderr: stderrPreview || null,
@@ -210,11 +272,18 @@ app.get('/api/report/:processId', (req, res) => {
       });
     }
 
-    // Build succeeded: ensure file exists
-    if (!fs.existsSync(pdfPath)) {
-      console.error(`[ERROR][SERVER] build finished but report.pdf not found (pid=${processId})`);
+    // Build succeeded: pick the correct PDF to return
+    if (moduleKey) {
+      pdfPath = pickLatestReportPdf() || path.join(procDir, 'report.pdf');
+    } else {
+      pdfPath = path.join(procDir, 'report.pdf');
+    }
+
+    // Ensure file exists
+    if (!pdfPath || !fs.existsSync(pdfPath)) {
+      console.error(`[ERROR][SERVER] build finished but PDF not found (pid=${processId})`);
       return res.status(500).json({
-        error: 'Report build completed but report.pdf is missing',
+        error: 'Report build completed but PDF is missing',
         processId,
         expectedPdfPath: pdfPath,
       });
@@ -244,6 +313,20 @@ app.post('/process', upload.single('demFile'), (req, res) => {
   const processId = uuidv4();
   processingStatus[processId] = { status: 'processing' };
 
+  // Write meta.json early (useful for report titles / traceability)
+  const procDir = path.join(outputsDir, processId);
+  const inputDemName =
+    (file && file.originalname) ? String(file.originalname)
+      : (originalFileName ? `${String(originalFileName)}.tif` : `${processId}.tif`);
+
+  writeProcessMeta(procDir, {
+    input_dem_name: inputDemName,
+    original_file_stem: String(originalFileName || ''),
+    process_id: String(processId || ''),
+    step: 'complete_dem_analysis',
+    updated_at: new Date().toISOString(),
+  });
+
   const absFilePath = path.resolve(file.path);
 
   const child = spawnPython({
@@ -265,14 +348,11 @@ app.post('/process', upload.single('demFile'), (req, res) => {
     const dt = (performance.now() - t0).toFixed(1);
     console.log(`[PY ${processId}] exited with code ${code} (server elapsed ${dt} ms)`);
 
-    // Non forzare lo status: lo aggiorna /processComplete/:id
-    // Però in caso di crash, puoi segnare failed:
     if (code !== 0 && processingStatus[processId]) {
       processingStatus[processId].status = 'failed';
     }
   });
 
-  // Reply immediately
   return res.json({ message: 'Processing started', processId });
 });
 
@@ -297,13 +377,11 @@ app.get('/processStatus/:processId', (req, res) => {
     payload.manifestUrl = fs.existsSync(manifestFs) ? `/outputs/${processId}/analysis_images.json` : null;
     payload.statsUrl = fs.existsSync(statsFs) ? `/outputs/${processId}/output_statistics.json` : null;
 
-    // Optional: include images with ready-to-use URLs
     if (payload.manifestUrl) {
       try {
         const manifest = JSON.parse(fs.readFileSync(manifestFs, 'utf-8'));
         const imgs = manifest.images || manifest || [];
         payload.images = (Array.isArray(imgs) ? imgs : []).map((img) => {
-          // accetta sia stringhe che oggetti
           if (typeof img === 'string') {
             return { filename: img, url: `/outputs/${processId}/${img}` };
           }
@@ -370,40 +448,30 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
   if (!scriptPath) {
     return res.status(400).json({ error: 'Invalid volumeType or approximationType' });
   }
-  
-  // --- [PATCH] Persist DEM original filename + moduleKey for later PDF naming/title ---
-  try {
-    const procDir = path.join(outputsDir, processId);
-    fs.mkdirSync(procDir, { recursive: true });
 
-    // file.originalname includes extension (e.g. Darwin.tif)
-    const inputDemName = file && file.originalname ? String(file.originalname) : null;
+  // >>> NEW: write meta.json (used by build_pdf_report.py to display DEM name instead of processId)
+  const procDir = path.join(outputsDir, processId);
+  const moduleKey = deriveModuleKey(volumeType, approximationType);
 
-    // derive moduleKey (supported: circular_approx1/2, elliptical_approx1/2)
-    let moduleKey = null;
-    if (volumeType === 'circular' && approximationType === 'approximation1') moduleKey = 'circular_approx1';
-    else if (volumeType === 'circular' && approximationType === 'approximation2') moduleKey = 'circular_approx2';
-    else if (volumeType === 'elliptical' && approximationType === 'approximation1') moduleKey = 'elliptical_approx1';
-    else if (volumeType === 'elliptical' && approximationType === 'approximation2') moduleKey = 'elliptical_approx2';
+  const inputDemName =
+    (file && file.originalname) ? String(file.originalname)
+      : (originalFileName ? `${String(originalFileName)}.tif` : `${processId}.tif`);
 
-    const metaPath = path.join(procDir, 'meta.json');
-    const meta = {
-      processId,
-      input_dem_name: inputDemName, // e.g. Darwin.tif
-      input_dem_base: inputDemName ? path.parse(inputDemName).name : null, // e.g. Darwin
-      moduleKey,
-      saved_at: new Date().toISOString(),
-    };
+  writeProcessMeta(procDir, {
+    input_dem_name: inputDemName,
+    original_file_stem: String(originalFileName || ''),
+    module_key: String(moduleKey || ''),
+    volume_type: String(volumeType || ''),
+    approximation_type: String(approximationType || ''),
+    process_id: String(processId || ''),
+    step: 'calculate_volume',
+    updated_at: new Date().toISOString(),
+  });
 
-    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf-8');
-  } catch (e) {
-    console.error(`[WARN][SERVER] Failed writing meta.json for ${processId}:`, e);
-  }
   const absFilePath = path.resolve(file.path);
 
   const child = spawnPython({
     processId,
-    // NOTA: gli script volume leggono PROCESS_ID da env
     args: [scriptPath, absFilePath, originalFileName],
   });
 
@@ -426,7 +494,6 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
     });
   });
 
-  // helper locale (solo qui, patch minimale)
   function tryParseJson(s) {
     try {
       return JSON.parse(String(s || '').trim());
@@ -441,14 +508,11 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
 
     const parsed = tryParseJson(stdoutData);
 
-    // === SUCCESS ===
     if (code === 0) {
-      // Se stdout è JSON valido: arricchisci e rispondi
       if (parsed && typeof parsed === 'object') {
         const pid = parsed.processId || processId;
         const outputsBaseUrl = `/outputs/${pid}`;
 
-        // >>> QUI: mapping images -> url
         const images = Array.isArray(parsed.images) ? parsed.images : [];
         const imagesWithUrl = images.map((img) => {
           const filename =
@@ -472,22 +536,16 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
         });
       }
 
-      // Fallback: stdout non-JSON
       return res.json({ result: stdoutData });
     }
 
-    // === ERROR ===
-    // Richiesta: se code!=0 -> 500 + log utile
     const stdoutPreview = String(stdoutData || '').trim().slice(0, 2000);
     const stderrPreview = String(stderrData || '').trim().slice(0, 4000);
 
-    console.error(
-      `[ERROR][SERVER] Volume script failed (processId=${processId}, code=${code}).`
-    );
+    console.error(`[ERROR][SERVER] Volume script failed (processId=${processId}, code=${code}).`);
     if (stderrPreview) console.error(`[ERROR][SERVER] stderr preview:\n${stderrPreview}`);
     if (stdoutPreview) console.error(`[ERROR][SERVER] stdout preview:\n${stdoutPreview}`);
 
-    // Se stdout era JSON anche in errore, restituiscilo (arricchito) ma con 500
     if (parsed && typeof parsed === 'object') {
       const pid = parsed.processId || processId;
       const outputsBaseUrl = `/outputs/${pid}`;
