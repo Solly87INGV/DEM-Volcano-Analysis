@@ -14,8 +14,6 @@ const Footer = () => {
         </div>
       </div>
       <div className="footer-info">
-        <p>Site Manager: Marco Solinas</p>
-        <p>Webmasters: Camilla Gentili</p>
       </div>
     </footer>
   );

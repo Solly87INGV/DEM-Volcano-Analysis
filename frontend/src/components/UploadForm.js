@@ -10,6 +10,9 @@ const UploadForm = ({
   setProcessId,
   setStep, // NECESSARIO per passare a "analysis"
 }) => {
+  // ✅ Flag unico per mostrare/nascondere diagnostica UI
+  const SHOW_DIAGNOSTICS = false;
+
   const [selectedFile, setSelectedFile] = useState(null);
   const [uploadMessage, setUploadMessage] = useState('');
   const [isDragOver, setIsDragOver] = useState(false);
@@ -234,7 +237,7 @@ const UploadForm = ({
         </Typography>
       )}
 
-      {(processWallMs != null || pollingWallMs != null) && (
+      {SHOW_DIAGNOSTICS && (processWallMs != null || pollingWallMs != null) && (
         <>
           <Divider sx={{ my: 2 }} />
           <Typography variant="h6" sx={{ mb: 1 }}>Diagnostics</Typography>
