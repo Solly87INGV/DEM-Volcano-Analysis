@@ -1,4 +1,4 @@
-// server.js (aggiornato - fix original filename handling)
+// server.js (docker-ready: env paths + serve React build + python path via env)
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
@@ -11,53 +11,76 @@ const { performance } = require('perf_hooks');
 const app = express();
 app.use(cors());
 
-// Assicurati che esistano le directory fondamentali
-const uploadsDir = path.join(__dirname, 'uploads');
-const outputsDir = path.join(__dirname, 'outputs');
+// ---------------------------
+// Env / Paths (docker-friendly)
+// ---------------------------
+const PORT = Number(process.env.PORT || 5000);
+
+// Use env dirs if provided (compose sets them), fallback to local dev defaults
+const uploadsDir = process.env.UPLOADS_DIR
+  ? path.resolve(process.env.UPLOADS_DIR)
+  : path.join(__dirname, 'uploads');
+
+const outputsDir = process.env.OUTPUTS_DIR
+  ? path.resolve(process.env.OUTPUTS_DIR)
+  : path.join(__dirname, 'outputs');
+
+// Ensure dirs exist
 fs.mkdirSync(uploadsDir, { recursive: true });
 fs.mkdirSync(outputsDir, { recursive: true });
 
-// Servi anche gli output (PNG/PDF) come statici
+// Serve outputs (PNG/PDF) as static
 app.use('/outputs', express.static(outputsDir));
 
-// Configurazione di multer per gestire l'upload (usa percorso assoluto)
+// Python executable (docker sets PYTHON_BIN=/opt/venv/bin/python)
+const pythonPath = process.env.PYTHON_BIN || 'python3';
+
+// Optional: log startup config once
+console.log('[SERVER] config:', {
+  PORT,
+  pythonPath,
+  uploadsDir,
+  outputsDir,
+  FRONTEND_BUILD_DIR: process.env.FRONTEND_BUILD_DIR || '(not set)',
+  HEADLESS: process.env.HEADLESS,
+});
+
+// ---------------------------
+// Multer storage (preserve name)
+// ---------------------------
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadsDir),
-  filename: (req, file, cb) => cb(null, file.originalname) // preserva il nome originale
+  filename: (req, file, cb) => cb(null, file.originalname),
 });
 const upload = multer({ storage });
 
-// Percorso Python (adatta se necessario)
-const pythonPath = 'C:\\Users\\solly\\AppData\\Local\\Programs\\Python\\Python312\\python.exe';
-
-// Stato elaborazioni
+// Processing status map
 const processingStatus = {};
 
-// ========== Primo processamento del DEM ==========
+// ---------------------------
+// DEM preprocess
+// ---------------------------
 app.post('/process', upload.single('demFile'), (req, res) => {
   const t0 = performance.now();
   const file = req.file;
 
   if (!file) {
-    console.error("[ERROR] Nessun file caricato.");
-    return res.status(400).json({ error: "Nessun file caricato." });
+    console.error('[ERROR] Nessun file caricato.');
+    return res.status(400).json({ error: 'Nessun file caricato.' });
   }
 
   const scriptPath = path.join(__dirname, 'scripts', 'complete_dem_analysis.py');
 
-  // ✅ robust: full name always available
-  const originalFileNameRaw = (req.body.originalFileName && String(req.body.originalFileName).trim())
-    ? String(req.body.originalFileName).trim()
-    : file.originalname;
+  const originalFileNameRaw =
+    (req.body.originalFileName && String(req.body.originalFileName).trim())
+      ? String(req.body.originalFileName).trim()
+      : file.originalname;
 
-  // ✅ stem (compatibilità con lo schema precedente)
-  const originalFileStem = path.parse(originalFileNameRaw).name || "Unknown";
+  const originalFileStem = path.parse(originalFileNameRaw).name || 'Unknown';
 
-  // id run
   const processId = uuidv4();
   processingStatus[processId] = { status: 'processing' };
 
-  // Path assoluto del file caricato
   const absFilePath = path.resolve(file.path);
 
   const child = spawn(
@@ -69,24 +92,26 @@ app.post('/process', upload.single('demFile'), (req, res) => {
         ...process.env,
         PYTHONUNBUFFERED: '1',
         PROCESS_ID: processId,
-        // ✅ NEW: disponibili ai Python senza cambiare argv
         ORIGINAL_FILE_NAME: originalFileNameRaw,
         ORIGINAL_FILE_STEM: originalFileStem,
-      }
+        // ensure python can discover where outputs should go (if scripts use env)
+        UPLOADS_DIR: uploadsDir,
+        OUTPUTS_DIR: outputsDir,
+      },
     }
   );
 
-  child.stdout.on('data', d => {
+  child.stdout.on('data', (d) => {
     const line = d.toString().trim();
     if (line) console.log(`[PY ${processId}] ${line}`);
   });
 
-  child.stderr.on('data', d => {
+  child.stderr.on('data', (d) => {
     const line = d.toString().trim();
     if (line) console.error(`[PY ${processId} ERR] ${line}`);
   });
 
-  child.on('close', code => {
+  child.on('close', (code) => {
     const dt = (performance.now() - t0).toFixed(1);
     console.log(`[PY ${processId}] exited with code ${code} (server elapsed ${dt} ms)`);
   });
@@ -94,30 +119,28 @@ app.post('/process', upload.single('demFile'), (req, res) => {
   res.json({ message: 'Processing started', processId });
 });
 
-// Stato
+// Status
 app.get('/processStatus/:processId', (req, res) => {
   const { processId } = req.params;
   const statusInfo = processingStatus[processId];
-  if (statusInfo) {
-    res.json({ status: statusInfo.status });
-  } else {
-    res.status(404).json({ error: 'Process ID not found' });
-  }
+  if (statusInfo) return res.json({ status: statusInfo.status });
+  res.status(404).json({ error: 'Process ID not found' });
 });
 
-// Notifica di completamento inviata dallo script Python
+// Python callback
 app.post('/processComplete/:processId', (req, res) => {
   const { processId } = req.params;
   if (processingStatus[processId]) {
     processingStatus[processId].status = 'completed';
     console.log(`[INFO] process ${processId} marked as completed by Python callback`);
-    res.json({ message: 'Process status updated to completed' });
-  } else {
-    res.status(404).json({ error: 'Process ID not found' });
+    return res.json({ message: 'Process status updated to completed' });
   }
+  res.status(404).json({ error: 'Process ID not found' });
 });
 
-// ========== Calcolo volume ==========
+// ---------------------------
+// Volume
+// ---------------------------
 app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
   const t0 = performance.now();
 
@@ -126,18 +149,17 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
   const approximationType = req.body.approximationType;
 
   if (!file || !volumeType || !approximationType) {
-    console.error("[ERROR] Missing required fields.");
-    return res.status(400).json({ error: "Missing required fields." });
+    console.error('[ERROR] Missing required fields.');
+    return res.status(400).json({ error: 'Missing required fields.' });
   }
 
-  // ✅ robust: full name always available (body OR multer)
-  const originalFileNameRaw = (req.body.originalFileName && String(req.body.originalFileName).trim())
-    ? String(req.body.originalFileName).trim()
-    : file.originalname;
+  const originalFileNameRaw =
+    (req.body.originalFileName && String(req.body.originalFileName).trim())
+      ? String(req.body.originalFileName).trim()
+      : file.originalname;
 
-  const originalFileStem = path.parse(originalFileNameRaw).name || "Unknown";
+  const originalFileStem = path.parse(originalFileNameRaw).name || 'Unknown';
 
-  // Riusa processId precedente se presente
   const processId = req.body.processId ? String(req.body.processId) : uuidv4();
 
   let scriptPath;
@@ -154,13 +176,16 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
       scriptPath = path.join(__dirname, 'scripts', 'EllipticalVolcano_Approx2.py');
     }
   }
-  if (!scriptPath) return res.status(400).json({ error: 'Invalid volumeType or approximationType' });
+
+  if (!scriptPath) {
+    return res.status(400).json({ error: 'Invalid volumeType or approximationType' });
+  }
 
   const absFilePath = path.resolve(file.path);
 
   const child = spawn(
     pythonPath,
-    // ✅ manteniamo lo schema argv attuale: (path, stem)
+    // keep argv schema: (path, stem)
     [scriptPath, absFilePath, originalFileStem],
     {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -168,122 +193,140 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
         ...process.env,
         PYTHONUNBUFFERED: '1',
         PROCESS_ID: processId,
-        // ✅ NEW: disponibili ai Python senza cambiare argv
         ORIGINAL_FILE_NAME: originalFileNameRaw,
         ORIGINAL_FILE_STEM: originalFileStem,
-      }
+        UPLOADS_DIR: uploadsDir,
+        OUTPUTS_DIR: outputsDir,
+      },
     }
   );
 
   let resultData = '';
 
-  child.stdout.on('data', d => {
+  child.stdout.on('data', (d) => {
     const s = d.toString();
     resultData += s;
-    s.split(/\r?\n/).forEach(line => {
+    s.split(/\r?\n/).forEach((line) => {
       if (line.trim()) console.log(`[PY VOL ${processId}] ${line.trim()}`);
     });
   });
 
-  child.stderr.on('data', d => {
+  child.stderr.on('data', (d) => {
     const s = d.toString();
-    s.split(/\r?\n/).forEach(line => {
+    s.split(/\r?\n/).forEach((line) => {
       if (line.trim()) console.error(`[PY VOL ${processId} ERR] ${line.trim()}`);
     });
   });
 
-  child.on('close', code => {
+  child.on('close', (code) => {
     const dt = (performance.now() - t0).toFixed(1);
     console.log(`[TIMING][SERVER] /calculateVolume finished in ${dt} ms (code=${code})`);
 
     if (code === 0) {
       try {
         const parsed = JSON.parse(resultData);
-        if (parsed && (parsed.result || parsed.images)) {
-          return res.json(parsed);
-        }
+        if (parsed && (parsed.result || parsed.images)) return res.json(parsed);
       } catch (e) {
-        // non è JSON -> fallback
+        // not json -> fallback
       }
       return res.json({ result: resultData });
-    } else {
-      res.status(500).json({ error: 'Error calculating volume' });
     }
+    res.status(500).json({ error: 'Error calculating volume' });
   });
 });
 
-// ========== Shaded Relief ==========
+// ---------------------------
+// Shaded Relief
+// ---------------------------
 app.post('/shadedRelief', upload.single('demFile'), (req, res) => {
   const file = req.file;
   if (!file) return res.status(400).send('Nessun file caricato.');
 
   const scriptPath = path.join(__dirname, 'scripts', 'generate_shaded_relief.py');
   const absFilePath = path.resolve(file.path);
+
   const child = spawn(pythonPath, [scriptPath, absFilePath], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, PYTHONUNBUFFERED: '1' }
+    env: { ...process.env, PYTHONUNBUFFERED: '1', OUTPUTS_DIR: outputsDir, UPLOADS_DIR: uploadsDir },
   });
 
-  let output = '';
-  child.stdout.on('data', d => output += d.toString());
-  child.stderr.on('data', d => fs.appendFile('error_log.txt', d.toString(), () => {}));
-  child.on('close', code => {
+  child.on('close', (code) => {
     if (code !== 0) {
       fs.appendFile('error_log.txt', `Errore Shaded Relief. Exit: ${code}\n`, () => {});
-      return res.status(500).json({ error: "Errore durante la generazione dello Shaded Relief." });
+      return res.status(500).json({ error: 'Errore durante la generazione dello Shaded Relief.' });
     }
     res.json({ message: 'Shaded Relief generated successfully' });
   });
 });
 
-// ========== Slopes ==========
+// ---------------------------
+// Slopes
+// ---------------------------
 app.post('/calculateSlopes', upload.single('demFile'), (req, res) => {
   const file = req.file;
   if (!file) return res.status(400).send('Nessun file caricato.');
 
   const scriptPath = path.join(__dirname, 'scripts', 'generate_slopes.py');
   const absFilePath = path.resolve(file.path);
+
   const child = spawn(pythonPath, [scriptPath, absFilePath], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, PYTHONUNBUFFERED: '1' }
+    env: { ...process.env, PYTHONUNBUFFERED: '1', OUTPUTS_DIR: outputsDir, UPLOADS_DIR: uploadsDir },
   });
 
-  let output = '';
-  child.stdout.on('data', d => output += d.toString());
-  child.stderr.on('data', d => fs.appendFile('error_log.txt', d.toString(), () => {}));
-  child.on('close', code => {
+  child.on('close', (code) => {
     if (code !== 0) {
       fs.appendFile('error_log.txt', `Errore slopes. Exit: ${code}\n`, () => {});
-      return res.status(500).json({ error: "Errore durante la generazione delle due pendenze." });
+      return res.status(500).json({ error: 'Errore durante la generazione delle due pendenze.' });
     }
     res.json({ message: 'Slope calculation successful' });
   });
 });
 
-// ========== Curvatures ==========
+// ---------------------------
+// Curvatures
+// ---------------------------
 app.post('/calculateCurvatures', upload.single('demFile'), (req, res) => {
   const file = req.file;
   if (!file) return res.status(400).send('Nessun file caricato.');
 
   const scriptPath = path.join(__dirname, 'scripts', 'calculate_curvatures.py');
   const absFilePath = path.resolve(file.path);
+
   const child = spawn(pythonPath, [scriptPath, absFilePath], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, PYTHONUNBUFFERED: '1' }
+    env: { ...process.env, PYTHONUNBUFFERED: '1', OUTPUTS_DIR: outputsDir, UPLOADS_DIR: uploadsDir },
   });
 
-  let output = '';
-  child.stdout.on('data', d => output += d.toString());
-  child.stderr.on('data', d => fs.appendFile('error_log.txt', d.toString(), () => {}));
-  child.on('close', code => {
+  child.on('close', (code) => {
     if (code !== 0) {
       fs.appendFile('error_log.txt', `Errore curvature. Exit: ${code}\n`, () => {});
-      return res.status(500).json({ error: "Errore durante la generazione delle curvature." });
+      return res.status(500).json({ error: 'Errore durante la generazione delle curvature.' });
     }
-    res.json({ message: 'Curvature calcolate con successo', output });
+    res.json({ message: 'Curvature calcolate con successo' });
   });
 });
 
-app.listen(5000, () => {
-  console.log('[SERVER] listening on http://localhost:5000');
+// ---------------------------
+// Serve React build (Docker prod)
+// ---------------------------
+const frontendBuildDir = process.env.FRONTEND_BUILD_DIR
+  ? path.resolve(process.env.FRONTEND_BUILD_DIR)
+  : null;
+
+if (frontendBuildDir && fs.existsSync(frontendBuildDir)) {
+  app.use(express.static(frontendBuildDir));
+
+  // Catch-all -> index.html (for React Router or deep links)
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(frontendBuildDir, 'index.html'));
+  });
+
+  console.log('[SERVER] serving frontend build from:', frontendBuildDir);
+} else {
+  console.log('[SERVER] frontend build dir not found, API-only mode');
+}
+
+app.listen(PORT, () => {
+  console.log(`[SERVER] listening on http://localhost:${PORT}`);
 });
