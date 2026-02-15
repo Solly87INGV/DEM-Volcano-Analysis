@@ -2,18 +2,25 @@
 
 import sys
 import os
-# --- PROJ FIX (Windows / PostGIS conflict) ---
-try:
-    import pyproj
-    from pyproj import datadir as _pyproj_datadir
+# HEADLESS flag (used later to skip PyQt GUI in Docker)
+HEADLESS = str(os.environ.get("HEADLESS", "")).strip().lower() in ("1", "true", "yes")
 
-    _pyproj_proj_dir = os.path.join(os.path.dirname(pyproj.__file__), "proj_dir", "share", "proj")
-    if os.path.exists(os.path.join(_pyproj_proj_dir, "proj.db")):
-        os.environ["PROJ_LIB"] = _pyproj_proj_dir
-        _pyproj_datadir.set_data_dir(_pyproj_proj_dir)
-        print(f"[DEBUG] PROJ_LIB forced to pyproj: {_pyproj_proj_dir}")
+# --- PROJ FIX (Windows / PostGIS conflict) ---
+# In Docker/Linux forcing PROJ_LIB to pyproj can BREAK rasterio/GDAL (proj.db mismatch).
+try:
+    if os.name == "nt" or os.environ.get("FORCE_PYPROJ_PROJ_LIB") == "1":
+        import pyproj
+        from pyproj import datadir as _pyproj_datadir
+
+        _pyproj_proj_dir = os.path.join(os.path.dirname(pyproj.__file__), "proj_dir", "share", "proj")
+        if os.path.exists(os.path.join(_pyproj_proj_dir, "proj.db")):
+            os.environ["PROJ_LIB"] = _pyproj_proj_dir
+            _pyproj_datadir.set_data_dir(_pyproj_proj_dir)
+            print(f"[DEBUG] PROJ_LIB forced to pyproj: {_pyproj_proj_dir}")
+        else:
+            print("[WARN] pyproj proj_dir not found; PROJ_LIB not forced.")
     else:
-        print("[WARN] pyproj proj_dir not found; PROJ_LIB not forced.")
+        print("[DEBUG] PROJ_LIB not forced (non-Windows environment).")
 except Exception as _e:
     print(f"[WARN] Unable to force PROJ_LIB: {_e}")
 # --- end PROJ FIX ---
@@ -241,9 +248,18 @@ def _resolve_process_id(cli_process_id: str | None) -> str:
     return f"local_{int(time.time())}"
 
 def _ensure_outputs_dir(process_id: str) -> str:
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    out_dir = os.path.join(base_dir, "outputs", process_id)
+    # In Docker we want outputs under OUTPUTS_DIR (mounted and served by Node at /outputs)
+    outputs_base = os.environ.get("OUTPUTS_DIR")
+    if not outputs_base:
+        # fallback (dev/legacy): scripts/outputs/<process_id>
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        outputs_base = os.path.join(base_dir, "outputs")
+
+    out_dir = os.path.join(outputs_base, process_id)
     os.makedirs(out_dir, exist_ok=True)
+
+    print(f"[DEBUG] OUTPUTS_BASE: {outputs_base}")
+    print(f"[DEBUG] OUTPUT DIR: {out_dir}")
     return out_dir
 
 # ==================== OPZIONE 2 — STANDARDIZZAZIONE DEM (AUTOMATICA SOLO SE GEOGRAFICO) ====================
@@ -1458,6 +1474,12 @@ def main():
     print(f"[RESULT] Peak RAM = {_peak_mb:.1f} MB")
     print(f"[TIMING] total_end_to_end = {time.time() - _t_all_start:.3f} s")
     log_memory("before_gui_start")
+
+    # In Docker/headless mode we must NOT start a Qt GUI.
+    if HEADLESS:
+        print("[DEBUG] HEADLESS=1 -> skipping PyQt GUI. Processing completed.")
+    sys.exit(0)
+
 
     # Avvia l'applicazione PyQt5
     try:
