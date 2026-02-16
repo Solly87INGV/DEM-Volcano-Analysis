@@ -1,94 +1,308 @@
+// AnalysisResultsViewer.js
 import React, { useEffect, useMemo, useState } from "react";
+import { Box, Button, Typography, CircularProgress, Divider, Paper } from "@mui/material";
+import axios from "axios";
 
-export default function AnalysisResultsViewer({ processId }) {
+function pickByName(list, includesStr) {
+  return (list || []).find((it) =>
+    String(it?.filename || it?.name || it?.file || it?.url || "").includes(includesStr)
+  );
+}
+function getName(it) {
+  return String(it?.filename || it?.name || it?.file || it?.url || "");
+}
+
+// Frame stile "vecchio" (Paper + cornice scura interna)
+const FramePaper = ({ title, sx, children }) => (
+  <Paper
+    elevation={3}
+    sx={{
+      borderRadius: 3,
+      px: 0.6,
+      py: 0.6,
+      border: "1px solid",
+      borderColor: "divider",
+      background: "linear-gradient(180deg, #ffffff 0%, #f6f7f9 100%)",
+      position: "relative",
+      overflow: "hidden",
+      ...sx,
+    }}
+  >
+    {title ? (
+      <Box sx={{ display: "flex", alignItems: "center", mb: 0.35 }}>
+        <Box
+          sx={{
+            px: 0.9,
+            py: 0.15,
+            borderRadius: 999,
+            border: "1px solid",
+            borderColor: "divider",
+            background: "#fff",
+            boxShadow: "inset 0 1px 0 rgba(255,255,255,0.7)",
+          }}
+        >
+          <Typography variant="subtitle2" sx={{ opacity: 0.85, lineHeight: 1.05 }}>
+            {title}
+          </Typography>
+        </Box>
+      </Box>
+    ) : null}
+
+    <Box
+      sx={{
+        borderRadius: 2.5,
+        overflow: "hidden",
+        background: "linear-gradient(180deg, #1c1c1c 0%, #121212 100%)",
+        border: "1px solid rgba(255,255,255,0.08)",
+        boxShadow: "inset 0 0 0 1px rgba(0,0,0,0.55)",
+        px: 0.35,
+        py: 0.35,
+        display: "flex",
+        justifyContent: "center",
+        alignItems: "center",
+      }}
+    >
+      {children}
+    </Box>
+  </Paper>
+);
+
+export default function AnalysisResultsViewer({
+  processId,
+  onBack,
+  onContinue,
+  requireCompleted = true,
+}) {
+  const [status, setStatus] = useState("unknown");
   const [manifest, setManifest] = useState(null);
   const [err, setErr] = useState("");
-  const [idx, setIdx] = useState(0);
+  const [slideIdx, setSlideIdx] = useState(0);
+  const [loading, setLoading] = useState(true);
 
+  const IMG_MAX_H = "70vh";
+  const IMG_STYLE = {
+    width: "100%",
+    height: "auto",
+    maxHeight: IMG_MAX_H,
+    objectFit: "contain",
+    borderRadius: 14,
+    display: "block",
+    background: "transparent",
+  };
+
+  // 1) Poll status (così Continue può essere disabilitato se non completed)
   useEffect(() => {
     if (!processId) return;
+    let timer = null;
+    let cancelled = false;
+
+    const tick = async () => {
+      try {
+        const r = await axios.get(`/processStatus/${processId}`, {
+          headers: { "Cache-Control": "no-cache" },
+        });
+        if (!cancelled) setStatus(r.data?.status || "unknown");
+      } catch {
+        if (!cancelled) setStatus("error");
+      }
+    };
+
+    tick();
+    timer = setInterval(tick, 1500);
+
+    return () => {
+      cancelled = true;
+      if (timer) clearInterval(timer);
+    };
+  }, [processId]);
+
+  // 2) Load manifest
+  useEffect(() => {
+    if (!processId) return;
+
+    let cancelled = false;
     setErr("");
     setManifest(null);
 
     const url = `/outputs/${processId}/analysis_images.json`;
-    fetch(url)
+    setLoading(true);
+
+    fetch(url, { cache: "no-store" })
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status} fetching ${url}`);
         return r.json();
       })
       .then((data) => {
-        console.log("[AnalysisResultsViewer] manifest loaded:", data);
-        setManifest(data);
-        setIdx(0); // ✅ reset indice ad ogni nuovo processo
+        if (!cancelled) setManifest(data);
       })
-      .catch((e) => setErr(String(e?.message || e)));
+      .catch((e) => {
+        if (!cancelled) setErr(String(e?.message || e));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [processId]);
 
-  const items = useMemo(() => {
+  const images = useMemo(() => {
     if (!manifest) return [];
-    return Array.isArray(manifest) ? manifest : (manifest?.images || manifest?.items || []);
+    return Array.isArray(manifest) ? manifest : (manifest.images || manifest.items || []);
   }, [manifest]);
 
-  if (!processId) return null;
-  if (err) return <div style={{ color: "crimson" }}>Errore: {err}</div>;
-  if (!manifest) return <div>Carico risultati…</div>;
+  const dem = useMemo(() => pickByName(images, "dem_overview"), [images]);
+  const asp = useMemo(() => pickByName(images, "aspect_overview"), [images]);
 
-  if (items.length === 0) {
+  const doubles = useMemo(() => {
+    return (images || [])
+      .filter((it) => getName(it).includes("double_"))
+      .sort((a, b) => getName(a).localeCompare(getName(b), undefined, { numeric: true }));
+  }, [images]);
+
+  const slides = useMemo(() => {
+    const arr = [];
+    arr.push({ type: "overview" });
+    for (const d of doubles) arr.push({ type: "double", img: d });
+    return arr;
+  }, [doubles]);
+
+  useEffect(() => {
+    setSlideIdx((i) => {
+      const max = Math.max(0, slides.length - 1);
+      return Math.min(i, max);
+    });
+  }, [slides.length]);
+
+  const current = slides[slideIdx] || { type: "overview" };
+  const prevDisabled = slideIdx <= 0;
+  const nextDisabled = slideIdx >= slides.length - 1;
+
+  const canContinue = !requireCompleted || status === "completed";
+
+  const imgSrc = (it, fallbackFilename) => {
+    // preferisci public_path quando c’è
+    const base = it?.public_path || (fallbackFilename ? `/outputs/${processId}/${fallbackFilename}` : "");
+    if (!base) return "";
+    return `${base}?t=${Date.now()}`;
+  };
+
+  const renderCurrentSlide = () => {
+    if (current.type === "overview") {
+      return (
+        <FramePaper title="Overview (DEM + Aspect)">
+          <Box
+            sx={{
+              width: "100%",
+              display: "grid",
+              gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" },
+              gap: 2,
+              alignItems: "center",
+            }}
+          >
+            <Box sx={{ width: "100%", display: "flex", justifyContent: "center" }}>
+              {dem ? (
+                <img alt="dem_overview" src={imgSrc(dem, dem?.filename)} style={IMG_STYLE} />
+              ) : (
+                <Typography sx={{ opacity: 0.85, color: "#eaeaea", py: 2 }}>
+                  DEM not available yet.
+                </Typography>
+              )}
+            </Box>
+
+            <Box sx={{ width: "100%", display: "flex", justifyContent: "center" }}>
+              {asp ? (
+                <img alt="aspect_overview" src={imgSrc(asp, asp?.filename)} style={IMG_STYLE} />
+              ) : (
+                <Typography sx={{ opacity: 0.85, color: "#eaeaea", py: 2 }}>
+                  Aspect not available yet.
+                </Typography>
+              )}
+            </Box>
+          </Box>
+        </FramePaper>
+      );
+    }
+
+    const it = current?.img;
+    const title = it?.filename || "Double panel";
+
     return (
-      <div>
-        Manifest letto, ma non contiene immagini in un campo noto.
-        <pre style={{ whiteSpace: "pre-wrap" }}>{JSON.stringify(manifest, null, 2)}</pre>
-      </div>
+      <FramePaper title={title}>
+        <Box sx={{ width: "100%", display: "flex", justifyContent: "center" }}>
+          {it ? (
+            <img alt={title} src={imgSrc(it, it?.filename)} style={IMG_STYLE} />
+          ) : (
+            <Typography sx={{ opacity: 0.85, color: "#eaeaea", py: 2 }}>
+              Not available yet.
+            </Typography>
+          )}
+        </Box>
+      </FramePaper>
     );
-  }
+  };
 
-  const safeIdx = Math.min(Math.max(idx, 0), items.length - 1);
-  const it = items[safeIdx];
-  const filename = it?.filename || it?.file || it?.name || it;
-  const title = (it?.titles && it.titles.join(" | ")) || it?.title || filename || `image_${safeIdx + 1}`;
-  const desc = (it?.descriptions && it.descriptions.join(" / ")) || it?.description || "";
-  const src = it?.public_path || `/outputs/${processId}/${filename}`;
+  if (!processId) return null;
 
   return (
-    <div style={{ marginTop: 16 }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-        <h3 style={{ margin: 0 }}>Risultati (Complete DEM Analysis)</h3>
+    <Box sx={{ width: "100%", pt: { xs: 2, md: 2 }, px: { xs: 1, md: 2 } }}>
+      <Box sx={{ textAlign: "center", mb: 2 }}>
+        <Typography variant="h4" sx={{ mb: 0.5 }}>
+          DEM analysis
+        </Typography>
+        <Typography variant="body2" sx={{ opacity: 0.75 }}>
+          processId: <code>{processId || "-"}</code> — status: <b>{status}</b>
+        </Typography>
+      </Box>
 
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <button onClick={() => setIdx((v) => Math.max(0, v - 1))} disabled={safeIdx === 0}>
-            Prev
-          </button>
-          <div style={{ fontSize: 14 }}>
-            {safeIdx + 1} / {items.length}
-          </div>
-          <button onClick={() => setIdx((v) => Math.min(items.length - 1, v + 1))} disabled={safeIdx === items.length - 1}>
-            Next
-          </button>
-        </div>
-      </div>
+      <Box sx={{ display: "flex", justifyContent: "flex-end", gap: 1, flexWrap: "wrap", mb: 2, alignItems: "center" }}>
+        {onBack ? (
+          <Button variant="outlined" onClick={onBack}>
+            Back
+          </Button>
+        ) : null}
 
-      <div style={{ marginTop: 8, fontWeight: 600 }}>{title}</div>
-      {desc && <div style={{ marginTop: 4, opacity: 0.8, fontSize: 14 }}>{desc}</div>}
+        {onContinue ? (
+          <Button variant="contained" onClick={onContinue} disabled={!canContinue}>
+            Continue
+          </Button>
+        ) : null}
 
-      {/* ✅ area scrollabile */}
-      <div
-        style={{
-          marginTop: 10,
-          border: "1px solid #ddd",
-          borderRadius: 10,
-          padding: 10,
-          maxHeight: "70vh",
-          overflow: "auto",
-          background: "white",
-        }}
-      >
-        <img
-          src={src}
-          alt={title}
-          style={{ width: "100%", height: "auto", display: "block" }}
-          onError={() => console.error("Image not found:", src)}
-        />
-      </div>
-    </div>
+        <Box sx={{ width: 28, height: 28, display: "flex", alignItems: "center", justifyContent: "center" }}>
+          {loading ? <CircularProgress size={20} /> : null}
+        </Box>
+      </Box>
+
+      <Divider sx={{ mb: 2 }} />
+
+      {err ? (
+        <Typography sx={{ color: "crimson" }}>Errore: {err}</Typography>
+      ) : !manifest ? (
+        <Typography>Carico risultati…</Typography>
+      ) : (
+        <Box sx={{ mb: 2 }}>
+          <Box sx={{ display: "flex", justifyContent: "space-between", gap: 1, flexWrap: "wrap", alignItems: "center", mb: 1 }}>
+            <Typography variant="subtitle2">
+              {current.type === "overview" ? "Overview" : "Double panels"}
+            </Typography>
+
+            <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
+              <Button variant="outlined" onClick={() => setSlideIdx((i) => Math.max(0, i - 1))} disabled={prevDisabled}>
+                Prev
+              </Button>
+              <Button variant="outlined" onClick={() => setSlideIdx((i) => Math.min(slides.length - 1, i + 1))} disabled={nextDisabled}>
+                Next
+              </Button>
+              <Typography variant="body2" sx={{ opacity: 0.7 }}>
+                {slides.length === 0 ? "0/0" : `${slideIdx + 1}/${slides.length}`}
+              </Typography>
+            </Box>
+          </Box>
+
+          {renderCurrentSlide()}
+        </Box>
+      )}
+    </Box>
   );
 }

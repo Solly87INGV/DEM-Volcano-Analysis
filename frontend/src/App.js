@@ -75,43 +75,22 @@ function App() {
               processId={processId}
             />
           </>
-        ) : showAnalysisResults ? (
-          // ✅ PAGINA PULITA: SOLO RISULTATI
-          <div style={{ maxWidth: 1200, margin: "0 auto", width: "100%", paddingBottom: 80 }}>
-            <h2 style={{ marginTop: 0 }}>Complete DEM Analysis — Results</h2>
-
-            {/* se processId non c'è, almeno lo segnali */}
-            {!processId ? (
-              <div style={{ color: "crimson" }}>
-                processId mancante: impossibile caricare i risultati.
-              </div>
-            ) : (
-              <AnalysisResultsViewer processId={processId} />
-            )}
-
-            {/* ✅ Sticky footer actions: sempre visibili */}
-            <div
-              style={{
-                position: "sticky",
-                bottom: 0,
-                background: "#fff",
-                borderTop: "1px solid #ddd",
-                padding: "12px 0",
-                marginTop: 16,
-                display: "flex",
-                gap: 12,
-                justifyContent: "flex-end",
-              }}
-            >
-              <button onClick={handleBackToUpload}>Back to upload</button>
-
-              {/* disabled se demFile non è pronto */}
-              <button onClick={handleContinueToVolumes} disabled={!demFile}>
-                Continue
-              </button>
-            </div>
-          </div>
-        ) : (
+) : showAnalysisResults ? (
+  <div style={{ maxWidth: 1200, margin: "0 auto", width: "100%" }}>
+    {!processId ? (
+      <div style={{ color: "crimson" }}>
+        processId mancante: impossibile caricare i risultati.
+      </div>
+    ) : (
+      <AnalysisResultsViewer
+        processId={processId}
+        onBack={handleBackToUpload}
+        onContinue={handleContinueToVolumes}
+        requireCompleted={true}
+      />
+    )}
+  </div>
+) : (
           <VolumeSelection demFile={demFile} onBack={handleBack} />
         )}
       </div>
