@@ -11,6 +11,9 @@ const { performance } = require('perf_hooks');
 const app = express();
 app.use(cors());
 
+// ✅ utile per callback/endpoint futuri che leggono JSON
+app.use(express.json({ limit: '10mb' }));
+
 // ---------------------------
 // Env / Paths (docker-friendly)
 // ---------------------------
@@ -43,6 +46,8 @@ console.log('[SERVER] config:', {
   outputsDir,
   FRONTEND_BUILD_DIR: process.env.FRONTEND_BUILD_DIR || '(not set)',
   HEADLESS: process.env.HEADLESS,
+  PROJ_LIB: process.env.PROJ_LIB,
+  PROJ_DATA: process.env.PROJ_DATA,
 });
 
 // ---------------------------
@@ -54,11 +59,89 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// Processing status map
+// Processing status map (per complete_dem_analysis)
 const processingStatus = {};
 
 // ---------------------------
-// DEM preprocess
+// Python env helper
+// - In Docker/Linux do NOT force PROJ_LIB to pyproj. If PROJ_LIB/PROJ_DATA are set (e.g., from host),
+//   they can break rasterio/GDAL with "DATABASE.LAYOUT.VERSION.MINOR" mismatch.
+// - On Windows we keep them (some setups need pyproj PROJ db to override PostGIS/OSGeo clashes).
+function buildPyEnv(extraEnv = {}) {
+  const env = { ...process.env, ...extraEnv, PYTHONUNBUFFERED: '1' };
+
+  if (process.platform !== 'win32') {
+    if (env.PROJ_LIB) {
+      console.log(`[SERVER] clearing PROJ_LIB for non-Windows run (was: ${env.PROJ_LIB})`);
+      delete env.PROJ_LIB;
+    }
+    if (env.PROJ_DATA) {
+      console.log(`[SERVER] clearing PROJ_DATA for non-Windows run (was: ${env.PROJ_DATA})`);
+      delete env.PROJ_DATA;
+    }
+  }
+
+  return env;
+}
+
+// ---------------------------
+// Helpers
+// ---------------------------
+function normalizeImages(processId, images) {
+  if (!Array.isArray(images)) return [];
+  return images.map((img) => {
+    // se è stringa, la trasformo
+    if (typeof img === 'string') {
+      const filename = img;
+      return { filename, url: `/outputs/${processId}/${filename}` };
+    }
+
+    const filename = img.filename || img.file || img.name;
+    const url =
+      img.url ||
+      img.public_path ||
+      (filename ? `/outputs/${processId}/${filename}` : undefined);
+
+    return { ...img, filename, url };
+  });
+}
+
+function pickPdfPath(procDir, moduleKey) {
+  if (!fs.existsSync(procDir)) return null;
+
+  const files = fs.readdirSync(procDir).filter((f) => f.toLowerCase().endsWith('.pdf'));
+
+  if (files.length === 0) return null;
+
+  // 1) se NON c'è moduleKey: preferisci report.pdf
+  if (!moduleKey) {
+    const reportPdf = files.find((f) => f.toLowerCase() === 'report.pdf');
+    if (reportPdf) return path.join(procDir, reportPdf);
+  }
+
+  // 2) se c'è moduleKey: preferisci report_{moduleKey}_*.pdf
+  if (moduleKey) {
+    const pref = `report_${String(moduleKey)}_`.toLowerCase();
+    const candidate = files.find((f) => f.toLowerCase().startsWith(pref));
+    if (candidate) return path.join(procDir, candidate);
+  }
+
+  // 3) fallback: ultimo PDF modificato
+  let best = null;
+  let bestMtime = -1;
+  for (const f of files) {
+    const full = path.join(procDir, f);
+    const st = fs.statSync(full);
+    if (st.mtimeMs > bestMtime) {
+      bestMtime = st.mtimeMs;
+      best = full;
+    }
+  }
+  return best;
+}
+
+// ---------------------------
+// DEM preprocess (complete_dem_analysis)
 // ---------------------------
 app.post('/process', upload.single('demFile'), (req, res) => {
   const t0 = performance.now();
@@ -88,16 +171,13 @@ app.post('/process', upload.single('demFile'), (req, res) => {
     [scriptPath, absFilePath, originalFileStem, processId],
     {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        PYTHONUNBUFFERED: '1',
+      env: buildPyEnv({
         PROCESS_ID: processId,
         ORIGINAL_FILE_NAME: originalFileNameRaw,
         ORIGINAL_FILE_STEM: originalFileStem,
-        // ensure python can discover where outputs should go (if scripts use env)
         UPLOADS_DIR: uploadsDir,
         OUTPUTS_DIR: outputsDir,
-      },
+      }),
     }
   );
 
@@ -160,6 +240,7 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
 
   const originalFileStem = path.parse(originalFileNameRaw).name || 'Unknown';
 
+  // ✅ fondamentale: usa SEMPRE il processId che arriva dall’analisi, se c’è
   const processId = req.body.processId ? String(req.body.processId) : uuidv4();
 
   let scriptPath;
@@ -185,19 +266,17 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
 
   const child = spawn(
     pythonPath,
-    // keep argv schema: (path, stem)
+    // keep argv schema: (path, stem) -> stem ignorabile se lo script non lo usa
     [scriptPath, absFilePath, originalFileStem],
     {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        PYTHONUNBUFFERED: '1',
+      env: buildPyEnv({
         PROCESS_ID: processId,
         ORIGINAL_FILE_NAME: originalFileNameRaw,
         ORIGINAL_FILE_STEM: originalFileStem,
         UPLOADS_DIR: uploadsDir,
         OUTPUTS_DIR: outputsDir,
-      },
+      }),
     }
   );
 
@@ -223,15 +302,87 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
     console.log(`[TIMING][SERVER] /calculateVolume finished in ${dt} ms (code=${code})`);
 
     if (code === 0) {
+      // ✅ prova JSON, altrimenti fallback
       try {
         const parsed = JSON.parse(resultData);
-        if (parsed && (parsed.result || parsed.images)) return res.json(parsed);
+
+        // normalizza sempre processId + status + images.url (compat VolumeResultsViewer vecchio)
+        const normalized = {
+          processId: parsed.processId || processId,
+          status: parsed.status || 'completed',
+          result: parsed.result ?? parsed,
+          images: normalizeImages(parsed.processId || processId, parsed.images || []),
+          ...parsed,
+        };
+
+        // se parsed ha già result/images bene; altrimenti result diventa parsed
+        if (!('result' in parsed)) normalized.result = parsed;
+
+        return res.json(normalized);
       } catch (e) {
-        // not json -> fallback
+        return res.json({ processId, status: 'completed', result: resultData, images: [] });
       }
-      return res.json({ result: resultData });
     }
+
     res.status(500).json({ error: 'Error calculating volume' });
+  });
+});
+
+// ---------------------------
+// ✅ PDF Report endpoint (serve per VolumeResultsViewer vecchio)
+// GET /api/report/:processId?moduleKey=circular_approx1 (o simile)
+// ---------------------------
+app.get('/api/report/:processId', (req, res) => {
+  const { processId } = req.params;
+  const moduleKey = req.query.moduleKey || req.query.module || '';
+
+  const scriptPath = path.join(__dirname, 'scripts', 'build_pdf_report.py');
+  const procDir = path.join(outputsDir, processId);
+
+  // lancia python che genera il PDF dentro outputs/{processId}
+  const args = [scriptPath, processId];
+  if (moduleKey) args.push(String(moduleKey));
+
+  const child = spawn(pythonPath, args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: buildPyEnv({
+      PROCESS_ID: processId,
+      OUTPUTS_DIR: outputsDir,
+      UPLOADS_DIR: uploadsDir,
+    }),
+  });
+
+  let stderr = '';
+  child.stdout.on('data', (d) => {
+    const line = d.toString().trim();
+    if (line) console.log(`[PY REPORT ${processId}] ${line}`);
+  });
+  child.stderr.on('data', (d) => {
+    const line = d.toString();
+    stderr += line;
+    const t = line.trim();
+    if (t) console.error(`[PY REPORT ${processId} ERR] ${t}`);
+  });
+
+  child.on('close', (code) => {
+    if (code !== 0) {
+      return res.status(500).json({
+        error: 'Error generating PDF report',
+        details: stderr ? String(stderr).slice(0, 2000) : `exit code ${code}`,
+      });
+    }
+
+    const pdfPath = pickPdfPath(procDir, moduleKey);
+    if (!pdfPath) {
+      return res.status(404).json({ error: 'PDF not found after generation' });
+    }
+
+    const filename = path.basename(pdfPath);
+    res.setHeader('Content-Type', 'application/pdf');
+    // inline così si apre in tab; download se preferisci: attachment
+    res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+
+    return res.sendFile(pdfPath);
   });
 });
 
@@ -247,7 +398,7 @@ app.post('/shadedRelief', upload.single('demFile'), (req, res) => {
 
   const child = spawn(pythonPath, [scriptPath, absFilePath], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, PYTHONUNBUFFERED: '1', OUTPUTS_DIR: outputsDir, UPLOADS_DIR: uploadsDir },
+    env: buildPyEnv({ OUTPUTS_DIR: outputsDir, UPLOADS_DIR: uploadsDir }),
   });
 
   child.on('close', (code) => {
@@ -271,7 +422,7 @@ app.post('/calculateSlopes', upload.single('demFile'), (req, res) => {
 
   const child = spawn(pythonPath, [scriptPath, absFilePath], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, PYTHONUNBUFFERED: '1', OUTPUTS_DIR: outputsDir, UPLOADS_DIR: uploadsDir },
+    env: buildPyEnv({ OUTPUTS_DIR: outputsDir, UPLOADS_DIR: uploadsDir }),
   });
 
   child.on('close', (code) => {
@@ -295,7 +446,7 @@ app.post('/calculateCurvatures', upload.single('demFile'), (req, res) => {
 
   const child = spawn(pythonPath, [scriptPath, absFilePath], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, PYTHONUNBUFFERED: '1', OUTPUTS_DIR: outputsDir, UPLOADS_DIR: uploadsDir },
+    env: buildPyEnv({ OUTPUTS_DIR: outputsDir, UPLOADS_DIR: uploadsDir }),
   });
 
   child.on('close', (code) => {

@@ -4,16 +4,20 @@
 # Caldera: depth from DEM (rim–floor) like the "scientifically sensible" approach,
 #          but volume as semi-ellipsoid using caldera ellipse area (A) and DEM-derived depth (c).
 #
-# Report:
-#  - uses DEM + doublets from manifest (if present), removing ONLY triplets
-#  - appends the new DOUBLEt “Base vs Caldera” (same layout as good doublets)
-#  - fail-safe: if list is empty, uses at least the doublet
-# GUI: 3 panels (DEM, Base opposite, Caldera max slope) + overview PNG + payload JSON.
+# ✅ Headless-friendly (aligned with Circular Approx1 changes):
+# - in HEADLESS=1: no PyQt GUI, uses MPL Agg
+# - ALWAYS writes into OUTPUTS_DIR/<PID>/ (or OUTPUTS_BASE, fallback local script outputs)
+# - artifacts:
+#     * metrics_ellip_a1.json
+#     * metrics_ellip_a1.csv
+#     * volume_results.json  (UI-ready)
+#     * final_doublet_base_vs_caldera.png
+# - volume_results.json -> images contains ONLY the final doublet (no complete_dem_analysis images)
+# - does NOT modify analysis_images.json
 #
-# ✅ Integrated:
-#  - metrics.json + metrics.csv (human vertical) in outputs/<process_id>/
-#  - silent auto-export in __init__
-#  - GUI button "Export Metrics (JSON + CSV)"
+# GUI:
+# - still supports 3 panels + overview PNG (GUI-only)
+# - "Export Metrics (JSON + CSV)" button
 
 import sys
 import os
@@ -25,65 +29,159 @@ import math
 import numpy as np
 
 # ================= PROJ / EPSG FIX (Windows + PostGIS conflicts) =================
-# Force PROJ_LIB to pyproj's proj.db to avoid "EPSG unknown" on Windows
-def _force_proj_lib_to_pyproj():
+def _fix_proj_env():
+    """
+    PROJ/GDAL safety:
+    - Windows: OK to force PROJ_LIB to pyproj's bundled data (avoids PostGIS PROJ conflicts).
+    - Linux/Docker: NEVER force pyproj PROJ db. If PROJ_LIB/PROJ_DATA are set, UNSET them to let
+      rasterio/GDAL use their own compatible PROJ data inside the container.
+    """
     try:
-        from pyproj import datadir
-        proj_dir = datadir.get_data_dir()  # .../pyproj/proj_dir/share/proj
-        if proj_dir and os.path.isdir(proj_dir):
-            os.environ["PROJ_LIB"] = proj_dir
-            print(f"[DEBUG] PROJ_LIB forced to pyproj: {proj_dir}")
-    except Exception as e:
-        print(f"[WARN] Could not force PROJ_LIB via pyproj: {e}")
+        is_windows = (os.name == "nt")
 
-_force_proj_lib_to_pyproj()
+        if is_windows:
+            try:
+                from pyproj import datadir
+                proj_dir = datadir.get_data_dir()
+                if proj_dir and os.path.isdir(proj_dir):
+                    os.environ["PROJ_LIB"] = proj_dir
+                    os.environ.pop("PROJ_DATA", None)
+                    print(f"[DEBUG] PROJ_LIB forced to pyproj (Windows): {proj_dir}")
+                else:
+                    print("[WARN] pyproj datadir not found or invalid; PROJ_LIB not set.")
+            except Exception as e:
+                print(f"[WARN] Unable to force PROJ_LIB to pyproj (Windows): {e}")
+            return
+
+        prev_proj_lib = os.environ.pop("PROJ_LIB", None)
+        prev_proj_data = os.environ.pop("PROJ_DATA", None)
+
+        if prev_proj_lib is not None:
+            print(f"[DEBUG] PROJ_LIB unset (non-Windows): {prev_proj_lib}")
+        if prev_proj_data is not None:
+            print(f"[DEBUG] PROJ_DATA unset (non-Windows): {prev_proj_data}")
+
+        if prev_proj_lib is None and prev_proj_data is None:
+            print("[DEBUG] PROJ env OK (non-Windows): PROJ_LIB/PROJ_DATA not set.")
+
+    except Exception as e:
+        print(f"[WARN] Unable to fix PROJ env: {e}")
+
+_fix_proj_env()
 # ================================================================================
+
+def _is_headless() -> bool:
+    v = str(os.environ.get("HEADLESS", "")).strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+HEADLESS = _is_headless()
+
+if HEADLESS:
+    os.environ.setdefault("MPLBACKEND", "Agg")
 
 import rasterio
 from scipy.ndimage import sobel
 from skimage import measure
 
-from PyQt5 import QtWidgets, QtGui, QtCore
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QMessageBox, QFileDialog
-)
+# ---- PyQt5: import solo se NON headless ----
+if not HEADLESS:
+    from PyQt5 import QtWidgets, QtGui, QtCore
+    from PyQt5.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+        QPushButton, QLabel, QMessageBox, QFileDialog
+    )
+else:
+    QtWidgets = QtGui = QtCore = None
 
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+    class QApplication:  # pragma: no cover
+        def __init__(self, *args, **kwargs): pass
+        def exec_(self): return 0
+
+    class QMainWindow:  # pragma: no cover
+        def __init__(self, *args, **kwargs): pass
+
+    class QWidget:  # pragma: no cover
+        pass
+
+    class QVBoxLayout:  # pragma: no cover
+        def __init__(self, *args, **kwargs): pass
+        def addWidget(self, *args, **kwargs): pass
+        def addLayout(self, *args, **kwargs): pass
+
+    class QHBoxLayout:  # pragma: no cover
+        def __init__(self, *args, **kwargs): pass
+        def addWidget(self, *args, **kwargs): pass
+
+    class QPushButton:  # pragma: no cover
+        def __init__(self, *args, **kwargs): pass
+        def setFixedSize(self, *args, **kwargs): pass
+        def clicked(self, *args, **kwargs): return self
+        def connect(self, *args, **kwargs): pass
+
+    class QLabel:  # pragma: no cover
+        def __init__(self, *args, **kwargs): pass
+
+    class QMessageBox:  # pragma: no cover
+        ActionRole = 0
+        Ok = 0
+
+        @staticmethod
+        def critical(parent, title, msg):
+            print(f"[ERROR] {title}: {msg}")
+
+        @staticmethod
+        def information(parent, title, msg):
+            print(f"[INFO] {title}: {msg}")
+
+        def setWindowTitle(self, *args, **kwargs): pass
+        def setText(self, *args, **kwargs): pass
+        def addButton(self, *args, **kwargs): return None
+        def exec_(self): return None
+        def clickedButton(self): return None
+
+    class QFileDialog:  # pragma: no cover
+        Options = object
+
+        @staticmethod
+        def getSaveFileName(*args, **kwargs):
+            return ("", "")
+
+        @staticmethod
+        def getExistingDirectory(*args, **kwargs):
+            return ""
+
+# Matplotlib
+if not HEADLESS:
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+else:
+    FigureCanvas = None
+
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
 from mpl_toolkits.axes_grid1 import make_axes_locatable  # colorbar co-alte affiancate
 
 import pdf_generator
+
 METRICS_BASENAME = "metrics_ellip_a1"
 
-# ========== helpers: outputs & manifest ==========
+
+# ========== helpers: outputs ==========
 
 def _script_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
-def _find_latest_dem_working() -> str:
+def _outputs_base_dir() -> str:
     """
-    Returns the newest dem_working.tif in outputs/*/dem_working.tif.
-    If none exists, returns "".
+    IMPORTANT:
+    - Express serve /outputs da OUTPUTS_DIR (es. /app/backend/outputs)
+    - Quindi qui priorità assoluta a OUTPUTS_DIR.
     """
-    base = os.path.join(_script_dir(), "outputs")
-    if not os.path.isdir(base):
-        return ""
-
-    newest_path = ""
-    newest_mtime = -1.0
-
-    for name in os.listdir(base):
-        cand = os.path.join(base, name, "dem_working.tif")
-        if os.path.exists(cand):
-            mt = os.path.getmtime(cand)
-            if mt > newest_mtime:
-                newest_mtime = mt
-                newest_path = cand
-
-    return newest_path
+    return (
+        os.environ.get("OUTPUTS_DIR")
+        or os.environ.get("OUTPUTS_BASE")
+        or os.path.join(_script_dir(), "outputs")
+    )
 
 def _resolve_process_id() -> str:
     env_id = os.environ.get("PROCESS_ID")
@@ -92,75 +190,12 @@ def _resolve_process_id() -> str:
     return f"local_{int(time.time())}"
 
 def _ensure_outputs_dir(process_id: str) -> str:
-    out_dir = os.path.join(_script_dir(), "outputs", process_id)
+    out_dir = os.path.join(_outputs_base_dir(), process_id)
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
 
-def _find_manifest():
-    """
-    Returns (outputs_dir, manifest_path) if found.
-    Priority: env PROCESS_ID -> outputs/<PROCESS_ID>/analysis_images.json
-    Fallback: newest manifest in outputs/*/analysis_images.json
-    """
-    base = os.path.join(_script_dir(), "outputs")
-
-    # 1) explicit PROCESS_ID
-    pid = os.environ.get("PROCESS_ID")
-    if pid:
-        out_dir = os.path.join(base, pid)
-        mp = os.path.join(out_dir, "analysis_images.json")
-        if os.path.exists(mp):
-            return out_dir, mp
-
-    # 2) fallback: newest available manifest
-    if os.path.isdir(base):
-        candidates = []
-        for name in os.listdir(base):
-            p = os.path.join(base, name, "analysis_images.json")
-            if os.path.exists(p):
-                candidates.append(p)
-        if candidates:
-            candidates.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-            mp = candidates[0]
-            return os.path.dirname(mp), mp
-
-    return None, None
-
-def _load_manifest_images(manifest_path):
-    """Extract image list from JSON (prefer abs_path; fallback to filename)."""
-    try:
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        images = data.get("images", [])
-        paths = []
-        for it in images:
-            p = it.get("abs_path") or it.get("filename")
-            if p:
-                paths.append(p)
-        return paths
-    except Exception as e:
-        print(f"[WARN] Could not read manifest '{manifest_path}': {e}")
-        return []
-
-def _normalize_and_filter_paths(paths, base_dir=None):
-    """Normalize and keep only files that exist."""
-    norm = []
-    for p in paths:
-        if not p:
-            continue
-        pp = p
-        if not os.path.isabs(pp) and base_dir:
-            pp = os.path.join(base_dir, os.path.basename(p))
-        pp = os.path.normpath(pp)
-        if os.path.exists(pp):
-            norm.append(pp)
-        else:
-            print(f"[WARN] Missing image on disk (skipped): {pp}")
-    return norm
-
-def _remove_triplets(paths):
-    """Remove any triplet_*.png from the list (do NOT touch doublets)."""
-    return [p for p in paths if "triplet_" not in os.path.basename(p).lower()]
+def _public_path(process_id: str, filename: str) -> str:
+    return f"/outputs/{process_id}/{filename}"
 
 
 # ========== Analysis Functions ==========
@@ -236,14 +271,14 @@ def find_opposite_slope_points(slope_matrix, contour):
     if len(contour) == 0:
         raise ValueError("No valid points in contour after filtering.")
     contour_slopes = [slope_matrix[pt[0], pt[1]] for pt in contour]
-    max_index1 = np.argmax(contour_slopes)
+    max_index1 = int(np.argmax(contour_slopes))
     max_slope_index1 = tuple(contour[max_index1])
     opposite_index = (max_index1 + len(contour) // 2) % len(contour)
     max_slope_index2 = tuple(contour[opposite_index])
     return max_slope_index1, max_slope_index2
 
 
-# ========== Caldera depth-integrated helpers (rim–floor from DEM) ==========
+# ========== Caldera depth helpers (rim–floor from DEM) ==========
 
 def pixel_area_m2_from_transform(transform):
     try:
@@ -277,7 +312,7 @@ def outside_ring_mask(mask: np.ndarray, offset_px: int = 1, width_px: int = 3) -
     if width_px < 1:
         width_px = 1
 
-    inner = binary_dilation(mask, iterations=offset_px)
+    inner = binary_dilation(mask, iterations=offset_px) if offset_px > 0 else mask
     outer = binary_dilation(mask, iterations=offset_px + width_px)
     ring = outer & (~inner)
     return ring
@@ -311,7 +346,7 @@ def caldera_depth_from_dem(
             pass
 
     px_area = pixel_area_m2_from_transform(transform)
-    caldera_mask_area_m2 = float(np.sum(caldera_mask)) * float(px_area)
+    caldera_mask_area_m2 = float(np.sum(caldera_mask & valid)) * float(px_area)
 
     ring = outside_ring_mask(caldera_mask, offset_px=rim_ring_offset_px, width_px=rim_ring_width_px)
     rim_samples = dem[ring & valid]
@@ -461,9 +496,8 @@ def _get_by_path(d: dict, path: str):
         cur = cur.get(part)
     return cur
 
-# CSV "umano" verticale: SI units where applicable + model params
+# CSV "umano" verticale
 HUMAN_FIELDS = [
-    # META
     ("Meta", "Run timestamp (UTC)", "meta.timestamp_utc", ""),
     ("Meta", "Run ID (process_id)", "meta.process_id", ""),
     ("Meta", "Original input filename", "meta.original_file_name", ""),
@@ -474,23 +508,19 @@ HUMAN_FIELDS = [
     ("Meta", "Pixel resolution", "meta.res", "m"),
     ("Meta", "NoData value", "meta.nodata", ""),
 
-    # BASE
     ("Base morphometrics", "Base area", "morphometrics.A_base_m2", "m²"),
     ("Base morphometrics", "Base perimeter", "morphometrics.P_base_m", "m"),
     ("Base morphometrics", "Base span (opposite points)", "morphometrics.D_base_m", "m"),
     ("Base morphometrics", "Equivalent base radius from area", "morphometrics.R_eq_base_m", "m"),
 
-    # CALDERA
     ("Caldera morphometrics", "Caldera area", "morphometrics.A_caldera_m2", "m²"),
     ("Caldera morphometrics", "Caldera perimeter", "morphometrics.P_caldera_m", "m"),
     ("Caldera morphometrics", "Caldera span (opposite points)", "morphometrics.D_caldera_m", "m"),
     ("Caldera morphometrics", "Equivalent caldera radius from area", "morphometrics.R_eq_caldera_m", "m"),
 
-    # HEIGHT
     ("Height model", "Height method", "height_model.method", ""),
     ("Height model", "Height (P99 - P05) inside base", "height_model.p99_minus_p05_m", "m"),
 
-    # CALDERA DEPTH (DEM)
     ("Caldera depth (DEM)", "Caldera reference depth (rim p90 - floor p05)", "volume_model.inputs_used.caldera_depth.depth_ref_m", "m"),
     ("Caldera depth (DEM)", "Caldera rim reference elevation", "volume_model.inputs_used.caldera_depth.rim_reference.z_rim_ref_m", "m"),
     ("Caldera depth (DEM)", "Caldera floor reference elevation", "volume_model.inputs_used.caldera_depth.floor_reference.z_floor_ref_m", "m"),
@@ -501,16 +531,13 @@ HUMAN_FIELDS = [
     ("Caldera depth (DEM)", "Caldera reason", "volume_model.inputs_used.caldera_depth.reason", ""),
     ("Caldera depth (DEM)", "Caldera action", "volume_model.inputs_used.caldera_depth.action", ""),
 
-    # MODEL DESCRIPTORS
     ("Model descriptors", "Edifice volume model", "volume_model.edifice_model", ""),
     ("Model descriptors", "Caldera volume model", "volume_model.caldera_model", ""),
 
-    # VOLUMES
     ("Volumes", "Total edifice volume", "volumes.V_total_m3", "m³"),
     ("Volumes", "Caldera volume", "volumes.V_caldera_m3", "m³"),
     ("Volumes", "Effective edifice volume", "volumes.V_effective_m3", "m³"),
 
-    # DERIVED
     ("Derived", "Slenderness H/Dbase", "derived.slenderness_H_over_Dbase", ""),
     ("Derived", "Sanity Abase/Dbase²", "derived.sanity_Abase_over_Dbase2", ""),
     ("Derived", "Circularity base", "derived.circularity_base", ""),
@@ -534,34 +561,35 @@ def metrics_to_human_rows(metrics: dict):
 class VolumeAnalysisApp(QMainWindow):
     def __init__(self, dem, transform, meta=None, original_file_name="Unknown"):
         super().__init__()
-        self.setWindowTitle('Elliptical Volcano Volume Analysis — Approximation 1')
+        if hasattr(self, "setWindowTitle"):
+            self.setWindowTitle('Elliptical Volcano Volume Analysis — Approximation 1')
+
         self.dem = dem
         self.transform = transform
-
-        # meta for metrics export
         self.meta = meta or {}
 
         # outputs context
         self.process_id = self.meta.get("process_id") or _resolve_process_id()
         self.out_dir = _ensure_outputs_dir(self.process_id)
+
         self.original_file_name = original_file_name
         self.metrics_basename = METRICS_BASENAME
 
-        self.calculate_results()  # before widgets
-        self.initUI()
+        # compute first
+        self.calculate_results()
 
-        # save overview + stdout payload (non-blocking)
-        try:
-            self._save_overview_png()
-            self._emit_stdout_payload()
-        except Exception as e:
-            print(f"[PY VOL WARN] post-render saving/payload failed: {e}")
+        # GUI only if not headless
+        if not HEADLESS:
+            self.initUI()
+            try:
+                self._save_overview_png()
+            except Exception as e:
+                print(f"[PY VOL WARN] overview saving failed: {e}")
+        else:
+            print("[DEBUG] HEADLESS=1 -> GUI disabled (no Qt windows).")
 
-        # ✅ metrics: always write, silent
-        try:
-            self._write_metrics_files()
-        except Exception as e:
-            print(f"[WARN] metrics export failed: {e}")
+        # ALWAYS write artifacts for UI/backend
+        self._write_all_artifacts()
 
     def initUI(self):
         central_widget = QWidget()
@@ -599,9 +627,7 @@ class VolumeAnalysisApp(QMainWindow):
         self.figure.clear()
         fig = self.figure
 
-        # Keep some extra right padding for ticks/labels
         fig.set_constrained_layout_pads(w_pad=0.12, h_pad=0.02, wspace=0.40, hspace=0.60)
-
         gs = gridspec.GridSpec(nrows=3, ncols=3, height_ratios=[4, 1, 1.5], figure=fig, wspace=0.4, hspace=0.6)
 
         # Plot 1: Volcano DEM
@@ -682,203 +708,178 @@ class VolumeAnalysisApp(QMainWindow):
         self.canvas.draw()
 
     def calculate_results(self):
-        try:
-            self.base_contour = find_lowest_base_contour(self.dem, base_elevation_ratio=0.05)
-            self.base_point1, self.base_point2 = find_opposite_base_points(self.base_contour)
+        nodata = self.meta.get("nodata", None)
 
-            # Base span
-            self.distance_meters_base = distance_between_points(
-                self.base_point1[0], self.base_point1[1],
-                self.base_point2[0], self.base_point2[1],
-                self.transform
-            )
-            self.distance_base_km = self.distance_meters_base * 1e-3
+        self.base_contour = find_lowest_base_contour(self.dem, base_elevation_ratio=0.05)
+        self.base_point1, self.base_point2 = find_opposite_base_points(self.base_contour)
 
-            # Caldera
-            self.slope = calculate_slope(self.dem)
-            self.caldera_contour = find_caldera_contour(self.dem, level_ratio=0.8)
-            self.max_slope_index1, self.max_slope_index2 = find_opposite_slope_points(self.slope, self.caldera_contour)
+        # Base span
+        self.distance_meters_base = distance_between_points(
+            self.base_point1[0], self.base_point1[1],
+            self.base_point2[0], self.base_point2[1],
+            self.transform
+        )
+        self.distance_base_km = self.distance_meters_base * 1e-3
 
-            # Caldera span
-            self.distance_meters_caldera = distance_between_points(
-                self.max_slope_index1[0], self.max_slope_index1[1],
-                self.max_slope_index2[0], self.max_slope_index2[1],
-                self.transform
-            )
-            self.distance_caldera_km = self.distance_meters_caldera * 1e-3
+        # Caldera
+        self.slope = calculate_slope(self.dem)
+        self.caldera_contour = find_caldera_contour(self.dem, level_ratio=0.8)
+        self.max_slope_index1, self.max_slope_index2 = find_opposite_slope_points(self.slope, self.caldera_contour)
 
-            # Areas (m² + km² for GUI)
-            self.area_base_m2 = float(calculate_area(self.base_contour, self.transform))
-            self.area_caldera_m2 = float(calculate_area(self.caldera_contour, self.transform))
-            self.area_base = self.area_base_m2 * 1e-6
-            self.area_caldera = self.area_caldera_m2 * 1e-6
+        # Caldera span
+        self.distance_meters_caldera = distance_between_points(
+            self.max_slope_index1[0], self.max_slope_index1[1],
+            self.max_slope_index2[0], self.max_slope_index2[1],
+            self.transform
+        )
+        self.distance_caldera_km = self.distance_meters_caldera * 1e-3
 
-            # Height (robust, inside base)
-            nodata = self.meta.get("nodata", None)
-            self.h_max = robust_height_p99_minus_p05_inside_base(self.dem, self.base_contour, nodata=nodata)
+        # Areas (m² + km² for GUI)
+        self.area_base_m2 = float(calculate_area(self.base_contour, self.transform))
+        self.area_caldera_m2 = float(calculate_area(self.caldera_contour, self.transform))
+        self.area_base = self.area_base_m2 * 1e-6
+        self.area_caldera = self.area_caldera_m2 * 1e-6
 
-            # Edifice volume: elliptical frustum-like using areas directly
-            A1 = float(self.area_base_m2)
-            A2 = float(self.area_caldera_m2)
-            self.v = (self.h_max / 3.0) * (A1 + A2 + math.sqrt(A1 * A2)) if (A1 > 0 and A2 > 0 and self.h_max > 0) else 0.0
-            self.v_km3 = self.v * 1e-9
+        # Height (robust, inside base)
+        self.h_max = robust_height_p99_minus_p05_inside_base(self.dem, self.base_contour, nodata=nodata)
 
-            # Caldera depth from DEM (rim–floor) + fallback percentiles (as in circular)
-            caldera_depth = caldera_depth_from_dem(
+        # Edifice volume: elliptical frustum-like using areas directly
+        A1 = float(self.area_base_m2)
+        A2 = float(self.area_caldera_m2)
+        self.v = (self.h_max / 3.0) * (A1 + A2 + math.sqrt(A1 * A2)) if (A1 > 0 and A2 > 0 and self.h_max > 0) else 0.0
+        self.v_km3 = self.v * 1e-9
+
+        # Caldera depth from DEM (rim–floor) + fallback percentiles
+        caldera_depth = caldera_depth_from_dem(
+            dem=self.dem,
+            caldera_contour=self.caldera_contour,
+            transform=self.transform,
+            nodata=nodata,
+            rim_percentile=90.0,
+            floor_percentile=5.0,
+            rim_ring_offset_px=1,
+            rim_ring_width_px=3
+        )
+
+        depth_raw = float(caldera_depth.get("depth_ref_m", 0.0) or 0.0)
+        depth_clamped = float(caldera_depth.get("depth_ref_m_clamped", 0.0) or 0.0)
+
+        self.caldera_fallback_used = False
+        if depth_raw <= 0:
+            caldera_depth_fb = caldera_depth_from_dem(
                 dem=self.dem,
                 caldera_contour=self.caldera_contour,
                 transform=self.transform,
                 nodata=nodata,
-                rim_percentile=90.0,
-                floor_percentile=5.0,
+                rim_percentile=98.0,
+                floor_percentile=2.0,
                 rim_ring_offset_px=1,
                 rim_ring_width_px=3
             )
+            depth_fb_raw = float(caldera_depth_fb.get("depth_ref_m", 0.0) or 0.0)
+            depth_fb_clamped = float(caldera_depth_fb.get("depth_ref_m_clamped", 0.0) or 0.0)
 
-            depth_raw = float(caldera_depth.get("depth_ref_m", 0.0) or 0.0)
-            depth_clamped = float(caldera_depth.get("depth_ref_m_clamped", 0.0) or 0.0)
+            if depth_fb_raw > depth_raw:
+                caldera_depth = caldera_depth_fb
+                depth_raw = depth_fb_raw
+                depth_clamped = depth_fb_clamped
+                self.caldera_fallback_used = True
 
-            self.caldera_fallback_used = False
-            if depth_raw <= 0:
-                caldera_depth_fb = caldera_depth_from_dem(
-                    dem=self.dem,
-                    caldera_contour=self.caldera_contour,
-                    transform=self.transform,
-                    nodata=nodata,
-                    rim_percentile=98.0,
-                    floor_percentile=2.0,
-                    rim_ring_offset_px=1,
-                    rim_ring_width_px=3
-                )
-                depth_fb_raw = float(caldera_depth_fb.get("depth_ref_m", 0.0) or 0.0)
-                depth_fb_clamped = float(caldera_depth_fb.get("depth_ref_m_clamped", 0.0) or 0.0)
+        # Classification from depth result
+        self.caldera_status = caldera_depth.get("status", None)
+        self.caldera_reason = caldera_depth.get("reason", None)
+        self.caldera_action = caldera_depth.get("action", None)
 
-                if depth_fb_raw > depth_raw:
-                    caldera_depth = caldera_depth_fb
-                    depth_raw = depth_fb_raw
-                    depth_clamped = depth_fb_clamped
-                    self.caldera_fallback_used = True
+        # Caldera volume: semi-ellipsoid using A_caldera and DEM-derived depth
+        # V = (2/3) * A * c
+        if self.caldera_status == "depressive" and depth_clamped > 0 and self.area_caldera_m2 > 0:
+            V_caldera_m3 = (2.0 / 3.0) * float(self.area_caldera_m2) * float(depth_clamped)
+        else:
+            V_caldera_m3 = 0.0
 
-            # Classification from depth result
-            self.caldera_status = caldera_depth.get("status", None)
-            self.caldera_reason = caldera_depth.get("reason", None)
-            self.caldera_action = caldera_depth.get("action", None)
+        V_effective_m3 = float(max(0.0, self.v - V_caldera_m3))
+        self.v_caldera = V_caldera_m3 * 1e-9
+        self.v_volcano = V_effective_m3 * 1e-9
 
-            # Caldera volume: semi-ellipsoid using A_caldera and DEM-derived depth
-            # V = (2/3) * A * c   (since A = πab, semi-ellipsoid = 2/3 πab c)
-            if self.caldera_status == "depressive" and depth_clamped > 0 and self.area_caldera_m2 > 0:
-                V_caldera_m3 = (2.0 / 3.0) * float(self.area_caldera_m2) * float(depth_clamped)
-            else:
-                V_caldera_m3 = 0.0
+        # Keep QA attributes for metrics
+        self.caldera_z_rim_ref_m = caldera_depth.get("z_rim_ref_m", None)
+        self.caldera_z_floor_ref_m = caldera_depth.get("z_floor_ref_m", None)
+        self.caldera_depth_ref_m = caldera_depth.get("depth_ref_m", None)
+        self.caldera_depth_ref_m_clamped = caldera_depth.get("depth_ref_m_clamped", None)
+        self.caldera_rim_method = caldera_depth.get("rim_method", None)
+        self.caldera_rim_ring_offset_px = caldera_depth.get("rim_ring_offset_px", None)
+        self.caldera_rim_ring_width_px = caldera_depth.get("rim_ring_width_px", None)
+        self.caldera_rim_sample_count = caldera_depth.get("rim_sample_count", None)
+        self.caldera_rim_percentile = caldera_depth.get("rim_percentile", None)
+        self.caldera_floor_percentile = caldera_depth.get("floor_percentile", None)
+        self.caldera_pixel_area_m2 = caldera_depth.get("pixel_area_m2", None)
+        self.caldera_mask_area_m2 = caldera_depth.get("caldera_mask_area_m2", None)
 
-            V_effective_m3 = float(max(0.0, self.v - V_caldera_m3))
-            self.v_caldera = V_caldera_m3 * 1e-9
-            self.v_volcano = V_effective_m3 * 1e-9
+        # Descriptions
+        self.description_base = (
+            "Base 1: Represents one of the two opposite points along\n"
+            "the base contour of the volcano. It is selected as part of\n"
+            "the base delimitation process, relying on a specific\n"
+            "elevation threshold calculated from the DEM.\n\n"
+            "Base 2: Represents the point opposite to Base 1 along\n"
+            "the base contour.\n"
+            "Its position is automatically calculated considering the\n"
+            "geometry of the base to obtain a representative width."
+        )
+        self.description_slope = (
+            "Max Slope 1: Represents the point on the caldera\n"
+            "contour with the highest slope, calculated using a\n"
+            "slope map derived from the DEM.\n\n"
+            "Max Slope 2: This is the point on the caldera contour\n"
+            "opposite to Max Slope 1, positioned approximately\n"
+            "halfway around the contour."
+        )
 
-            # Keep QA attributes for metrics
-            self.caldera_z_rim_ref_m = caldera_depth.get("z_rim_ref_m", None)
-            self.caldera_z_floor_ref_m = caldera_depth.get("z_floor_ref_m", None)
-            self.caldera_depth_ref_m = caldera_depth.get("depth_ref_m", None)
-            self.caldera_depth_ref_m_clamped = caldera_depth.get("depth_ref_m_clamped", None)
-            self.caldera_rim_method = caldera_depth.get("rim_method", None)
-            self.caldera_rim_ring_offset_px = caldera_depth.get("rim_ring_offset_px", None)
-            self.caldera_rim_ring_width_px = caldera_depth.get("rim_ring_width_px", None)
-            self.caldera_rim_sample_count = caldera_depth.get("rim_sample_count", None)
-            self.caldera_rim_percentile = caldera_depth.get("rim_percentile", None)
-            self.caldera_floor_percentile = caldera_depth.get("floor_percentile", None)
-            self.caldera_pixel_area_m2 = caldera_depth.get("pixel_area_m2", None)
-            self.caldera_mask_area_m2 = caldera_depth.get("caldera_mask_area_m2", None)
+        # Lines for caldera volume / depth
+        if self.caldera_status == "depressive":
+            caldera_line_gui = f"Caldera volume (semi-ellipsoid): {self.v_caldera:.3e} km³"
+            caldera_line_pdf = caldera_line_gui
+        else:
+            reason = self.caldera_reason or "complex/non-depressive"
+            caldera_line_gui = f"Caldera volume: N/A ({reason})"
+            caldera_line_pdf = f"Caldera volume: N/A ({reason})"
 
-            # Descriptions
-            self.description_base = (
-                "Base 1: Represents one of the two opposite points along\n"
-                "the base contour of the volcano. It is selected as part of\n"
-                "the base delimitation process, relying on a specific\n"
-                "elevation threshold calculated from the DEM.\n\n"
-                "Base 2: Represents the point opposite to Base 1 along\n"
-                "the base contour.\n"
-                "Its position is automatically calculated considering the\n"
-                "geometry of the base to obtain a representative width."
-            )
-            self.description_slope = (
-                "Max Slope 1: Represents the point on the caldera\n"
-                "contour with the highest slope, calculated using a\n"
-                "slope map derived from the DEM.\n\n"
-                "Max Slope 2: This is the point on the caldera contour\n"
-                "opposite to Max Slope 1, positioned approximately\n"
-                "halfway around the contour."
-            )
+        caldera_depth_km = float(depth_clamped) * 1e-3 if depth_clamped is not None else 0.0
 
-            # Lines for caldera volume / depth
-            if self.caldera_status == "depressive":
-                caldera_line_gui = f"Caldera volume (semi-ellipsoid): {self.v_caldera:.3e} km³"
-                caldera_line_pdf = caldera_line_gui
-            else:
-                reason = self.caldera_reason or "complex/non-depressive"
-                caldera_line_gui = f"Caldera volume: N/A ({reason})"
-                caldera_line_pdf = f"Caldera volume: N/A ({reason})"
+        # Results text (GUI)
+        self.results_text = (
+            f"Base area of the volcano: {self.area_base:.2f} km²\n"
+            f"Base span (Distance between opposite points of the base): {self.distance_base_km:.2f} km\n"
+            f"Caldera area of the volcano: {self.area_caldera:.2f} km²\n"
+            f"Caldera span (Distance between opposite points of the caldera): {self.distance_caldera_km:.2f} km\n"
+            f"Caldera depth (DEM rim–floor): {caldera_depth_km:.2f} km\n"
+            f"Total volume of the volcanic edifice (elliptical frustum): {self.v_km3:.2f} km³\n"
+            f"{caldera_line_gui}\n"
+            f"Effective volume of the volcanic edifice: {self.v_volcano:.2f} km³"
+        )
 
-            caldera_depth_km = float(depth_clamped) * 1e-3 if depth_clamped is not None else 0.0
+        # Results list (PDF)
+        self.results_list = [
+            f"Base area of the volcano: {self.area_base:.2f} km²",
+            f"Base span (Distance between opposite points of the base): {self.distance_base_km:.2f} km",
+            f"Caldera area of the volcano: {self.area_caldera:.2f} km²",
+            f"Caldera span (Distance between opposite points of the caldera): {self.distance_caldera_km:.2f} km",
+            f"Caldera depth (DEM rim–floor): {caldera_depth_km:.2f} km",
+            f"Total volume of the volcanic edifice (elliptical frustum): {self.v_km3:.2f} km³",
+            f"{caldera_line_pdf}",
+            f"Effective volume of the volcanic edifice: {self.v_volcano:.2f} km³",
+        ]
 
-            # Results text (GUI)
-            self.results_text = (
-                f"Base area of the volcano: {self.area_base:.2f} km²\n"
-                f"Base span (Distance between opposite points of the base): {self.distance_base_km:.2f} km\n"
-                f"Caldera area of the volcano: {self.area_caldera:.2f} km²\n"
-                f"Caldera span (Distance between opposite points of the caldera): {self.distance_caldera_km:.2f} km\n"
-                f"Caldera depth (DEM rim–floor): {caldera_depth_km:.2f} km\n"
-                f"Total volume of the volcanic edifice (elliptical frustum): {self.v_km3:.2f} km³\n"
-                f"{caldera_line_gui}\n"
-                f"Effective volume of the volcanic edifice: {self.v_volcano:.2f} km³"
-            )
-
-            # Results list (PDF)
-            self.results_list = [
-                f"Base area of the volcano: {self.area_base:.2f} km²",
-                f"Base span (Distance between opposite points of the base): {self.distance_base_km:.2f} km",
-                f"Caldera area of the volcano: {self.area_caldera:.2f} km²",
-                f"Caldera span (Distance between opposite points of the caldera): {self.distance_caldera_km:.2f} km",
-                f"Caldera depth (DEM rim–floor): {caldera_depth_km:.2f} km",
-                f"Total volume of the volcanic edifice (elliptical frustum): {self.v_km3:.2f} km³",
-                f"{caldera_line_pdf}",
-                f"Effective volume of the volcanic edifice: {self.v_volcano:.2f} km³",
-            ]
-
-        except Exception as e:
-            QMessageBox.critical(self, "Calculation Error", f"An error occurred during calculation: {e}")
-
-    # ----- overview + payload -----
+    # ----- overview (GUI-only) -----
     def _save_overview_png(self):
-        try:
-            out_png = os.path.join(self.out_dir, "elliptical_approx1_overview.png")
-            self.figure.savefig(out_png, dpi=150)  # no bbox_inches='tight'
-            print(f"[PY VOL {self.process_id}] saved {out_png}")
-        except Exception as e:
-            print(f"[PY VOL ERR] failed to save overview png: {e}")
+        out_png = os.path.join(self.out_dir, "elliptical_approx1_overview.png")
+        self.figure.savefig(out_png, dpi=150)
+        print(f"[PY VOL {self.process_id}] saved {out_png}")
 
-    def _emit_stdout_payload(self):
-        images = []
-        outputs_dir, manifest_path = _find_manifest()
-        if manifest_path and os.path.exists(manifest_path):
-            try:
-                with open(manifest_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                for entry in data.get("images", []):
-                    public = entry.get("public_path")
-                    if public:
-                        images.append(public)
-            except Exception as e:
-                print(f"[PY VOL WARN] failed reading manifest for stdout payload: {e}")
-
-        images.append(f"/outputs/{self.process_id}/elliptical_approx1_overview.png")
-
-        payload = {"result": self.results_text, "images": images}
-        print(json.dumps(payload), flush=True)
-
-    # ----- final doublet -----
+    # ----- final doublet (ALWAYS) -----
     def _save_final_doublet_png(self, out_path):
         """
-        Saves a 1x2 DOUBLEt (base vs caldera) with the SAME layout used elsewhere:
+        Saves a 1x2 DOUBLEt (base vs caldera):
         14.5x5.5, central spacer, 4.6% colorbar.
         """
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
@@ -904,20 +905,6 @@ class VolumeAnalysisApp(QMainWindow):
         cax1 = div1.append_axes("right", size="4.6%", pad=0.10)
         cbar1 = fig.colorbar(im1, cax=cax1)
         cbar1.set_label("Elevation (m)", rotation=90)
-        cbar1.ax.yaxis.set_ticks_position('right')
-        cbar1.ax.yaxis.set_label_position('right')
-        cbar1.ax.tick_params(labelsize=9, pad=1)
-        cbar1.ax.yaxis.labelpad = 2
-
-        leg1 = ax1.legend(
-            handles=[p1, p2, pc],
-            labels=['Base 1', 'Base 2', 'Base Contour'],
-            loc='upper right',
-            frameon=True
-        )
-        leg1.get_frame().set_alpha(0.7)
-        leg1.get_frame().set_facecolor('white')
-        leg1.get_frame().set_edgecolor('black')
 
         # Spacer
         ax_spacer = fig.add_subplot(gs[0, 1]); ax_spacer.axis('off')
@@ -935,130 +922,12 @@ class VolumeAnalysisApp(QMainWindow):
         cax2 = div2.append_axes("right", size="4.6%", pad=0.10)
         cbar2 = fig.colorbar(im2, cax=cax2)
         cbar2.set_label("Elevation (m)", rotation=90)
-        cbar2.ax.yaxis.set_ticks_position('right')
-        cbar2.ax.yaxis.set_label_position('right')
-        cbar2.ax.tick_params(labelsize=9, pad=1)
-        cbar2.ax.yaxis.labelpad = 2
-
-        leg2 = ax2.legend(
-            handles=[s1, s2, cc],
-            labels=['Max Slope 1', 'Max Slope 2', 'Caldera Contour'],
-            loc='upper right',
-            frameon=True
-        )
-        leg2.get_frame().set_alpha(0.7)
-        leg2.get_frame().set_facecolor('white')
-        leg2.get_frame().set_edgecolor('black')
 
         fig.savefig(out_path, dpi=170)
         plt.close(fig)
 
         if not os.path.exists(out_path):
             raise RuntimeError(f"Doublet not saved: {out_path}")
-
-    # ----- UI actions -----
-    def show_results(self):
-        msg_box = QMessageBox()
-        msg_box.setWindowTitle("Summary Results")
-        msg_box.setText(self.results_text)
-        download_button = msg_box.addButton("Download Full Report", QMessageBox.ActionRole)
-        msg_box.addButton(QMessageBox.Ok)
-        msg_box.exec_()
-
-        if msg_box.clickedButton() == download_button:
-            self.download_results()
-
-    def download_results(self):
-        """
-        Generate the final PDF:
-        - load DEM + doublets from manifest (if present)
-        - remove ONLY triplets
-        - append the new DOUBLEt
-        - fail-safe: if list is empty, use at least the doublet
-        """
-        options = QFileDialog.Options()
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save Results As", "", "PDF Files (*.pdf)", options=options)
-        if not file_path:
-            return
-        if not file_path.lower().endswith('.pdf'):
-            file_path += '.pdf'
-
-        try:
-            orig_name = os.environ.get("ORIGINAL_FILE_NAME") or self.meta.get("original_file_name") or os.path.basename(self.meta.get("input_dem_path") or "")
-            title = f"Calculation Results - Elliptical Base, Approximation Type 1\nInput DEM: {orig_name}"
-
-            # 1) always save the doublet next to the PDF
-            out_dir_for_doublet = os.path.dirname(file_path) if os.path.dirname(file_path) else os.getcwd()
-            doublet_png = os.path.join(out_dir_for_doublet, "final_doublet_base_vs_caldera.png")
-            self._save_final_doublet_png(doublet_png)
-
-            # 2) load images from manifest
-            image_paths = []
-            outputs_dir, manifest_path = _find_manifest()
-            if manifest_path:
-                manifest_imgs = _load_manifest_images(manifest_path)
-                image_paths = _normalize_and_filter_paths(manifest_imgs, base_dir=outputs_dir)
-                image_paths = _remove_triplets(image_paths)
-                print(f"[INFO] Loaded {len(image_paths)} images from manifest (triplets removed).")
-            else:
-                print("[WARN] Manifest not found. Proceeding with doublet only if needed.")
-
-            # 3) always append the new doublet
-            if os.path.exists(doublet_png):
-                image_paths.append(doublet_png)
-            else:
-                print(f"[WARN] Doublet PNG missing unexpectedly: {doublet_png}")
-
-            # 4) fail-safe
-            if not image_paths:
-                image_paths = [doublet_png]
-
-            print("[INFO] Images in PDF (count={}):".format(len(image_paths)))
-            for p in image_paths:
-                print("   -", p)
-
-            # 5) build PDF
-            pdf_generator.generate_pdf(
-                file_path=file_path,
-                results_list=self.results_list,
-                title=title,
-                image_paths=image_paths,
-                captions=[None] * len(image_paths)
-            )
-            QMessageBox.information(self, "Success", f"PDF successfully saved to {file_path}")
-        except Exception as e:
-            QMessageBox.critical(self, "PDF Error", f"An error occurred while generating the PDF: {e}")
-
-    def download_graph_image(self):
-        options = QFileDialog.Options()
-        file_path, selected_filter = QFileDialog.getSaveFileName(
-            self,
-            "Save Graph As",
-            "",
-            "PNG Files (*.png);;JPG Files (*.jpg);;All Files (*)",
-            options=options
-        )
-        if not file_path:
-            return
-
-        if selected_filter.startswith("PNG"):
-            fmt = 'png'
-            if not file_path.lower().endswith('.png'):
-                file_path += '.png'
-        elif selected_filter.startswith("JPG"):
-            fmt = 'jpg'
-            if not file_path.lower().endswith('.jpg') and not file_path.lower().endswith('.jpeg'):
-                file_path += '.jpg'
-        else:
-            fmt = 'png'
-            if not file_path.lower().endswith('.png'):
-                file_path += '.png'
-
-        try:
-            self.figure.savefig(file_path, format=fmt)
-            QMessageBox.information(self, "Success", f"Graph successfully saved as {fmt.upper()} to {file_path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Save Error", f"An error occurred while saving the graph: {e}")
 
     # =========================
     # ✅ METRICS
@@ -1198,8 +1067,8 @@ class VolumeAnalysisApp(QMainWindow):
     def _write_metrics_files(self, out_dir=None):
         """
         Writes:
-        - metrics.json (full structured)
-        - metrics.csv  (human vertical subset)
+        - metrics_ellip_a1.json (full structured)
+        - metrics_ellip_a1.csv  (human vertical subset)
         """
         out_dir = out_dir or self.out_dir
         os.makedirs(out_dir, exist_ok=True)
@@ -1214,7 +1083,6 @@ class VolumeAnalysisApp(QMainWindow):
         csv_path = os.path.join(out_dir, f"{base}.csv")
         human_rows = metrics_to_human_rows(metrics)
 
-        # Excel fix: UTF-8 with BOM
         with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow(["section", "metric", "value", "unit"])
@@ -1224,19 +1092,179 @@ class VolumeAnalysisApp(QMainWindow):
         print(f"[INFO] metrics written: {json_path}")
         print(f"[INFO] metrics written: {csv_path}")
 
+    # =========================
+    # ✅ UI payload (volume_results.json)
+    # =========================
+    def _write_volume_results_json(self):
+        """
+        File richiesto dalla UI:
+          /outputs/<PID>/volume_results.json
+
+        CHANGE:
+        - images contiene SOLO la final doublet (come richiesto).
+        """
+        # pixel size (m)
+        pixel_size_m = None
+        res = self.meta.get("res")
+        try:
+            if res and isinstance(res, (list, tuple)) and len(res) >= 1:
+                pixel_size_m = float(res[0])
+        except Exception:
+            pixel_size_m = None
+
+        # caldera volume: None se non computed
+        caldera_km3 = float(self.v_caldera) if getattr(self, "caldera_status", None) == "depressive" else None
+
+        payload = {
+            "processId": self.process_id,
+            "status": "completed",
+            "moduleKey": "elliptical_approx1",
+            "summaryText": self.results_text,
+
+            "result": {
+                "base_area_km2": float(self.area_base),
+                "base_width_km": float(self.distance_base_km),
+                "caldera_area_km2": float(self.area_caldera),
+                "caldera_width_km": float(self.distance_caldera_km),
+                "total_volume_km3": float(self.v_km3),
+                "caldera_volume_km3": caldera_km3,
+                "effective_volume_km3": float(self.v_volcano),
+                "h_max_m": float(getattr(self, "h_max", 0.0)),
+                "pixel_size_m": pixel_size_m,
+            },
+
+            # ✅ SOLO la final doublet
+            "images": ["final_doublet_base_vs_caldera.png"],
+
+            "links": {
+                "metrics_json": _public_path(self.process_id, f"{self.metrics_basename}.json"),
+                "metrics_csv": _public_path(self.process_id, f"{self.metrics_basename}.csv"),
+                "final_doublet": _public_path(self.process_id, "final_doublet_base_vs_caldera.png"),
+            }
+        }
+
+        out_path = os.path.join(self.out_dir, "volume_results.json")
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+
+        print(f"[INFO] volume_results written: {out_path}")
+
+        # headless: stampa anche su stdout per eventuali parse lato server
+        if HEADLESS:
+            try:
+                print(json.dumps(payload, ensure_ascii=False), flush=True)
+            except Exception:
+                pass
+
+    def _write_all_artifacts(self):
+        # 1) metrics
+        try:
+            self._write_metrics_files()
+        except Exception as e:
+            print(f"[WARN] metrics export failed: {e}")
+
+        # 2) final doublet
+        doublet_path = os.path.join(self.out_dir, "final_doublet_base_vs_caldera.png")
+        try:
+            self._save_final_doublet_png(doublet_path)
+        except Exception as e:
+            print(f"[WARN] Could not save final doublet: {e}")
+
+        # 3) volume_results.json
+        try:
+            self._write_volume_results_json()
+        except Exception as e:
+            print(f"[WARN] Could not write volume_results.json: {e}")
+
+    # ----- UI actions -----
+    def show_results(self):
+        msg_box = QMessageBox()
+        msg_box.setWindowTitle("Summary Results")
+        msg_box.setText(self.results_text)
+        download_button = msg_box.addButton("Download Full Report", QMessageBox.ActionRole)
+        msg_box.addButton(QMessageBox.Ok)
+        msg_box.exec_()
+
+        if msg_box.clickedButton() == download_button:
+            self.download_results()
+
+    def download_results(self):
+        """
+        PDF GUI mode (unchanged behavior from your original, but now independent from manifest logic).
+        In GUI, we include at least the final doublet.
+        """
+        options = QFileDialog.Options()
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save Results As", "", "PDF Files (*.pdf)", options=options)
+        if not file_path:
+            return
+        if not file_path.lower().endswith('.pdf'):
+            file_path += '.pdf'
+
+        try:
+            orig_name = os.environ.get("ORIGINAL_FILE_NAME") or self.meta.get("original_file_name") or os.path.basename(self.meta.get("input_dem_path") or "")
+            title = f"Calculation Results - Elliptical Base, Approximation Type 1\nInput DEM: {orig_name}"
+
+            out_dir_for_doublet = os.path.dirname(file_path) if os.path.dirname(file_path) else os.getcwd()
+            doublet_png = os.path.join(out_dir_for_doublet, "final_doublet_base_vs_caldera.png")
+            self._save_final_doublet_png(doublet_png)
+
+            image_paths = [doublet_png] if os.path.exists(doublet_png) else []
+            if not image_paths:
+                image_paths = [doublet_png]
+
+            pdf_generator.generate_pdf(
+                file_path=file_path,
+                results_list=self.results_list,
+                title=title,
+                image_paths=image_paths,
+                captions=[None] * len(image_paths)
+            )
+            QMessageBox.information(self, "Success", f"PDF successfully saved to {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "PDF Error", f"An error occurred while generating the PDF: {e}")
+
+    def download_graph_image(self):
+        options = QFileDialog.Options()
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Save Graph As",
+            "",
+            "PNG Files (*.png);;JPG Files (*.jpg);;All Files (*)",
+            options=options
+        )
+        if not file_path:
+            return
+
+        if selected_filter.startswith("PNG"):
+            fmt = 'png'
+            if not file_path.lower().endswith('.png'):
+                file_path += '.png'
+        elif selected_filter.startswith("JPG"):
+            fmt = 'jpg'
+            if not file_path.lower().endswith('.jpg') and not file_path.lower().endswith('.jpeg'):
+                file_path += '.jpg'
+        else:
+            fmt = 'png'
+            if not file_path.lower().endswith('.png'):
+                file_path += '.png'
+
+        try:
+            self.figure.savefig(file_path, format=fmt)
+            QMessageBox.information(self, "Success", f"Graph successfully saved as {fmt.upper()} to {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", f"An error occurred while saving the graph: {e}")
+
     def export_metrics(self):
         """
         Pulsante GUI: esporta nella cartella scelta dall'utente
-        SIA <basename>.json (completo) SIA <basename>.csv (umano verticale).
+        SIA <basename>.json SIA <basename>.csv.
         """
         out_dir = QFileDialog.getExistingDirectory(self, "Select folder to export metrics")
         if not out_dir:
             return
 
         try:
-            # usa LA STESSA funzione del salvataggio automatico
             self._write_metrics_files(out_dir=out_dir)
-
             base = getattr(self, "metrics_basename", "metrics")
             QMessageBox.information(
                 self,
@@ -1246,6 +1274,7 @@ class VolumeAnalysisApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"An error occurred while exporting metrics: {e}")
 
+
 # ========== Entry Point ==========
 
 if __name__ == '__main__':
@@ -1253,36 +1282,15 @@ if __name__ == '__main__':
         print("Usage: python EllipticalVolcano_Approx1.py <dem_file_path> [original_file_name]")
         sys.exit(1)
 
-    dem_file_path = sys.argv[1]
     input_dem_path = sys.argv[1]
     original_file_name = sys.argv[2] if len(sys.argv) > 2 else "Unknown"
 
-    # Prefer dem_working.tif (metric):
-    # 1) outputs/<PROCESS_ID>/dem_working.tif
-    # 2) fallback: newest dem_working.tif in outputs/*
-    base_outputs = os.path.join(_script_dir(), "outputs")
-    chosen = None
+    process_id = _resolve_process_id()
+    out_dir = _ensure_outputs_dir(process_id)
 
-    pid = os.environ.get("PROCESS_ID")
-    if pid:
-        candidate = os.path.join(base_outputs, pid, "dem_working.tif")
-        if os.path.exists(candidate):
-            chosen = candidate
-            print(f"[DEBUG] Using dem_working from PROCESS_ID: {chosen}")
-
-    if chosen is None and os.path.isdir(base_outputs):
-        latest = _find_latest_dem_working()
-        if latest:
-            chosen = latest
-            print(f"[DEBUG] Using most recent dem_working: {chosen}")
-
-    if chosen is not None:
-        dem_file_path = chosen
-    else:
-        print("[ERROR] dem_working.tif not found in outputs/. "
-              "This module would run on the original DEM (often geographic) and produce ~0 values. "
-              "Run standardization first or pass dem_working.tif explicitly.")
-        sys.exit(1)
+    # Prefer working DEM from outputs/<PID>/dem_working.tif if present
+    candidate = os.path.join(out_dir, "dem_working.tif")
+    dem_file_path = candidate if os.path.exists(candidate) else input_dem_path
 
     if not os.path.exists(dem_file_path):
         print(f"Error: File '{dem_file_path}' does not exist.")
@@ -1295,17 +1303,22 @@ if __name__ == '__main__':
             crs = src.crs
             res = src.res
             nodata = src.nodata
+
+            print(f"[DEBUG] DEM opened for elliptical volume. Path={dem_file_path}")
+            print(f"[DEBUG] CRS={crs}  RES={res}  Transform={transform}  NODATA={nodata}")
+
+            # refuse geographic
             if (crs is None) or getattr(crs, "is_geographic", False):
-                print(f"[ERROR] DEM CRS is not metric (CRS={crs}). "
-                      f"Refusing to compute because results would collapse to ~0.")
+                print(f"[ERROR] DEM CRS is not metric (CRS={crs}). Refusing to compute because results would collapse to ~0.")
                 sys.exit(1)
+
     except Exception as e:
         print(f"Error opening DEM file: {e}")
         sys.exit(1)
 
     meta = {
-        "process_id": os.environ.get("PROCESS_ID"),
-        "input_dem_path": sys.argv[1],
+        "process_id": process_id,
+        "input_dem_path": input_dem_path,
         "working_dem_path": dem_file_path,
         "crs": crs,
         "res": res,
@@ -1313,6 +1326,11 @@ if __name__ == '__main__':
         "original_file_name": os.environ.get("ORIGINAL_FILE_NAME") or os.path.basename(input_dem_path),
         "original_file_stem": os.environ.get("ORIGINAL_FILE_STEM") or os.path.splitext(os.path.basename(input_dem_path))[0],
     }
+
+    if HEADLESS:
+        _ = VolumeAnalysisApp(dem, transform, meta=meta, original_file_name=original_file_name)
+        print("[INFO] Headless run completed (no GUI).")
+        sys.exit(0)
 
     app = QApplication(sys.argv)
     ex = VolumeAnalysisApp(dem, transform, meta=meta, original_file_name=original_file_name)
