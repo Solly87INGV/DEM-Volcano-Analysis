@@ -1,5 +1,5 @@
 // VolumeSelection.js
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { Box, Typography, Button, IconButton, CircularProgress, Divider } from '@mui/material';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import AssessmentIcon from '@mui/icons-material/Assessment';
@@ -7,31 +7,64 @@ import CardSelection from './CardSelection';
 import axios from 'axios';
 import './VolumeSelection.css';
 
-const VolumeSelection = ({ demFile, onBack, processId }) => {
+const API_BASE = 'http://localhost:5000';
+
+const VolumeSelection = ({
+  demFile,
+  onBack,
+  processId,
+  setStep,        // ✅ NEW (from App wrapper)
+  setVolumeRun,   // ✅ NEW (from App)
+}) => {
   const [volumeType, setVolumeType] = useState('');
   const [approximationType, setApproximationType] = useState('');
   const [selectedApproximation, setSelectedApproximation] = useState('');
-  const [result, setResult] = useState('');
   const [infoImage, setInfoImage] = useState('');
   const [isLoading, setIsLoading] = useState(false);
 
-  // ⏱️ stato per timing calcolo volume
+  // output UI (kept for debug, but we won't render inline anymore)
+  const [resultText, setResultText] = useState('');
+  const [effectivePid, setEffectivePid] = useState(null);
+  const [metrics, setMetrics] = useState(null);
+  const [manifest, setManifest] = useState(null);
+
+  // ⏱️ timing
   const [calcWallMs, setCalcWallMs] = useState(null);
   const [serverPhasesCalc, setServerPhasesCalc] = useState(null);
+
+  const manifestImages = useMemo(() => {
+    const imgs = manifest?.images || [];
+    return imgs
+      .map(it => ({
+        filename: it.filename,
+        publicPath: it.public_path,
+        titles: it.titles || [],
+        descriptions: it.descriptions || []
+      }))
+      .filter(it => !!it.publicPath);
+  }, [manifest]);
+
+  const resetOutputs = () => {
+    setResultText('');
+    setEffectivePid(null);
+    setMetrics(null);
+    setManifest(null);
+    setCalcWallMs(null);
+    setServerPhasesCalc(null);
+  };
 
   const handleVolumeSelect = (type) => {
     setVolumeType(type);
     setApproximationType('');
     setSelectedApproximation('');
     setInfoImage('');
-    setResult('');
-    setCalcWallMs(null);
-    setServerPhasesCalc(null);
+    resetOutputs();
   };
 
   const handleApproximationSelect = (type) => {
     setApproximationType(type);
     setSelectedApproximation(type);
+
     if (volumeType === 'circular') {
       setInfoImage(type === 'approximation1' ? '/images/1_Circ.png' : '/images/2_Circ.png');
     } else if (volumeType === 'elliptical') {
@@ -43,67 +76,92 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
     setVolumeType('');
     setSelectedApproximation('');
     setInfoImage('');
-    setResult('');
-    setCalcWallMs(null);
-    setServerPhasesCalc(null);
+    resetOutputs();
   };
+
+  async function fetchJsonOrNull(url) {
+    try {
+      const r = await fetch(url, { cache: 'no-store' });
+      if (!r.ok) return null;
+      return await r.json();
+    } catch {
+      return null;
+    }
+  }
 
   const handleSubmitVolumeCalculation = async () => {
     setIsLoading(true);
-    const formData = new FormData();
+    resetOutputs();
 
-    // --- files & params ---
+    const formData = new FormData();
     formData.append('demFile', demFile);
     formData.append('volumeType', volumeType);
     formData.append('approximationType', approximationType);
 
-    // ✅ NEW: passa SEMPRE il nome originale del file di input (serve per report+metrics)
-    // fallback: localStorage (se lo hai salvato in UploadForm) -> Unknown
     const originalFileName =
       (demFile && demFile.name) ||
       localStorage.getItem('lastOriginalFileName') ||
       'Unknown';
     formData.append('originalFileName', originalFileName);
 
-    // 👉 passa il processId della fase /process (prop o fallback da localStorage)
-    const effectiveProcessId = processId || localStorage.getItem('lastProcessId');
-    if (effectiveProcessId) formData.append('processId', String(effectiveProcessId));
+    const pidFromProp = processId || localStorage.getItem('lastProcessId');
+    if (pidFromProp) formData.append('processId', String(pidFromProp));
 
     try {
       const t0 = performance.now();
-
-      const response = await axios.post('http://localhost:5000/calculateVolume', formData, {
+      const response = await axios.post(`${API_BASE}/calculateVolume`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
-
       const t1 = performance.now();
-      const dt = t1 - t0;
-      setCalcWallMs(dt);
-      console.info(`[TIMING] POST /calculateVolume end-to-end: ${dt.toFixed(1)} ms`);
+      setCalcWallMs(t1 - t0);
 
-      // fasi lato server (se presenti come header)
       const phaseHeader = response?.headers?.['x-server-phase'];
       if (phaseHeader) {
         try {
-          const phasesObj = JSON.parse(phaseHeader);
-          setServerPhasesCalc(phasesObj);
-          console.info('[PHASES][/calculateVolume]', phasesObj);
-        } catch { /* header non JSON */ }
+          setServerPhasesCalc(JSON.parse(phaseHeader));
+        } catch { /* ignore */ }
       }
 
-      // Supporta risposta strutturata { result, images } o fallback testuale
-      let resText = '';
-      if (response?.data && typeof response.data === 'object') {
-        resText = response.data.result || '';
-      } else if (typeof response?.data === 'string') {
-        try {
-          const maybe = JSON.parse(response.data);
-          resText = typeof maybe.result === 'string' ? maybe.result : response.data;
-        } catch {
-          resText = response.data;
-        }
+      // 🔑 PID definitivo
+      const pid = response?.data?.processId || pidFromProp || null;
+      setEffectivePid(pid);
+
+      // fallback: se server ti ha dato result string, mettila
+      const serverResult = response?.data?.result;
+      if (typeof serverResult === 'string') setResultText(serverResult);
+
+      // (debug fetch: metrics/manifest) — non serve alla UI finale, ma utile se vuoi controllare
+      if (pid) {
+        const metricsUrl = `${API_BASE}/outputs/${pid}/metrics.json`;
+        const manifestUrl = `${API_BASE}/outputs/${pid}/analysis_images.json`;
+        const [m, man] = await Promise.all([
+          fetchJsonOrNull(metricsUrl),
+          fetchJsonOrNull(manifestUrl),
+        ]);
+        setMetrics(m);
+        setManifest(man);
       }
-      setResult(resText);
+
+      // ✅ CARICA volume_results.json (se presente) e passa tutto al viewer separato
+      let vr = null;
+      if (pid) {
+        const vrUrl = `${API_BASE}/outputs/${pid}/volume_results.json`;
+        vr = await fetchJsonOrNull(vrUrl);
+      }
+
+      // costruisci payload compatibile con VolumeResultsViewer
+      const run = {
+        processId: pid,
+        status: vr?.status || response?.data?.status || 'completed',
+        moduleKey: vr?.moduleKey || response?.data?.moduleKey || `${volumeType}_${approximationType}`,
+        // VolumeResultsViewer gestisce result sia come "result" che come "root object"
+        result: vr?.result || vr?.numbers || response?.data?.result || null,
+        images: vr?.images || response?.data?.images || [],
+      };
+
+      if (setVolumeRun) setVolumeRun(run);
+      if (setStep) setStep('results'); // App wrapper -> volumeResults
+      return;
     } catch (error) {
       console.error('Error calculating volume:', error);
       alert('Si è verificato un errore durante il calcolo del volume.');
@@ -111,6 +169,33 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
       setIsLoading(false);
     }
   };
+
+  // piccola tabella “umana” da metrics.json (debug only, we won't render inline)
+  const quickRows = useMemo(() => {
+    const mm = metrics?.morphometrics;
+    const vv = metrics?.volumes;
+    if (!mm && !vv) return [];
+
+    const rows = [];
+    if (mm) {
+      rows.push(['Base area (m²)', mm.A_base_m2]);
+      rows.push(['Base perimeter (m)', mm.P_base_m]);
+      rows.push(['Base diameter (m)', mm.D_base_m]);
+      rows.push(['Caldera area (m²)', mm.A_caldera_m2]);
+      rows.push(['Caldera perimeter (m)', mm.P_caldera_m]);
+      rows.push(['Caldera diameter (m)', mm.D_caldera_m]);
+      rows.push(['Height used (m)', mm.h_max_m]);
+    }
+    if (vv) {
+      rows.push(['Total volume (m³)', vv.V_total_m3]);
+      rows.push(['Caldera volume (m³)', vv.V_caldera_m3]);
+      rows.push(['Effective volume (m³)', vv.V_effective_m3]);
+    }
+    return rows.filter(r => r[1] !== undefined && r[1] !== null);
+  }, [metrics]);
+
+  // ✅ inline results OFF: questa schermata deve solo selezionare e lanciare il run
+  const SHOW_INLINE_RESULTS = false;
 
   return (
     <Box className="volume-selection-container">
@@ -125,6 +210,7 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
           <IconButton onClick={handleBack} className="back-arrow">
             <ArrowBackIcon />
           </IconButton>
+
           <Box className="main-layout">
             <Box className="card-container">
               {volumeType === 'circular' ? (
@@ -163,6 +249,7 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
                 </>
               )}
             </Box>
+
             {infoImage && (
               <Box className="info-image-container">
                 <img src={infoImage} alt="Description" />
@@ -209,18 +296,70 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
         </Box>
       )}
 
-      {(result || calcWallMs != null || serverPhasesCalc) && (
+      {SHOW_INLINE_RESULTS && (resultText || metrics || manifest || calcWallMs != null || serverPhasesCalc) && (
         <>
           <Divider sx={{ my: 2 }} />
-          {result && (
-            <Box className="results-container">
-              <Typography variant="h6">Summary of Results</Typography>
-              <Typography sx={{ mt: 1, whiteSpace: 'pre-line' }}>{result}</Typography>
-            </Box>
-          )}
+
+          <Box className="results-container">
+            <Typography variant="h6">Results (debug)</Typography>
+
+            {effectivePid && (
+              <Typography variant="body2" sx={{ mt: 1 }}>
+                processId: <b>{effectivePid}</b>
+              </Typography>
+            )}
+
+            {resultText && (
+              <Typography sx={{ mt: 1, whiteSpace: 'pre-line' }}>
+                {resultText}
+              </Typography>
+            )}
+
+            {metrics && (
+              <Box sx={{ mt: 2 }}>
+                <Typography variant="h6">Numerical results (from metrics.json)</Typography>
+                <Box component="table" sx={{ width: '100%', mt: 1, borderCollapse: 'collapse' }}>
+                  <tbody>
+                    {quickRows.map(([k, v]) => (
+                      <tr key={k}>
+                        <td style={{ padding: '6px 8px', borderBottom: '1px solid #ddd' }}>{k}</td>
+                        <td style={{ padding: '6px 8px', borderBottom: '1px solid #ddd', textAlign: 'right' }}>
+                          {typeof v === 'number' ? v.toLocaleString() : String(v)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </Box>
+              </Box>
+            )}
+
+            {manifestImages.length > 0 && (
+              <Box sx={{ mt: 2 }}>
+                <Typography variant="h6">Images (from analysis_images.json)</Typography>
+                <Box sx={{ display: 'flex', gap: 2, overflowX: 'auto', py: 1 }}>
+                  {manifestImages.map((it) => (
+                    <Box key={it.publicPath} sx={{ minWidth: 360 }}>
+                      <img
+                        src={`${API_BASE}${it.publicPath}`}
+                        alt={it.filename}
+                        style={{ width: '100%', borderRadius: 8 }}
+                      />
+                      <Typography variant="body2" sx={{ mt: 1 }}>
+                        <b>{it.titles?.join(' | ') || it.filename}</b>
+                      </Typography>
+                      {it.descriptions?.[0] && (
+                        <Typography variant="caption">{it.descriptions[0]}</Typography>
+                      )}
+                    </Box>
+                  ))}
+                </Box>
+              </Box>
+            )}
+          </Box>
+
           {(calcWallMs != null || serverPhasesCalc) && (
             <Box sx={{ mt: 2 }}>
-              <Typography variant="h6" sx={{ mb: 1 }}>Diagnostics (client-side timings)</Typography>
+              <Typography variant="h6" sx={{ mb: 1 }}>Diagnostics</Typography>
               {calcWallMs != null && (
                 <Typography variant="body2">
                   POST /calculateVolume — wall-time: <b>{calcWallMs.toFixed(1)} ms</b>
