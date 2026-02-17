@@ -24,57 +24,114 @@ const UploadForm = ({
   const [serverPhasesPolling, setServerPhasesPolling] = useState(null);
 
   useEffect(() => {
-    let pollingInterval = null;
+    if (!processId) return;
 
-    if (processId) {
-      setIsProcessing(true);
+    let timer = null;
+    let stopped = false;
+    let inFlight = false;
 
-      const tPollStart = performance.now();
+    // base polling + backoff in caso di errore
+    let delay = 2000;
+    const maxDelay = 15000;
 
-      pollingInterval = setInterval(async () => {
-        try {
-          const response = await axios.get(`/processStatus/${processId}`);
+    const tPollStart = performance.now();
+    const controller = new AbortController();
 
-          const phaseHeader = response?.headers?.["x-server-phase"];
-          if (phaseHeader) {
-            try {
-              const phasesObj = JSON.parse(phaseHeader);
-              setServerPhasesPolling(phasesObj);
-              console.info("[PHASES][POLLING]", phasesObj);
-            } catch {
-              /* ignore */
-            }
+    setIsProcessing(true);
+
+    const stop = () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      try {
+        controller.abort();
+      } catch {
+        /* ignore */
+      }
+    };
+
+    const schedule = (ms) => {
+      if (stopped) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(tick, ms);
+    };
+
+    const tick = async () => {
+      if (stopped) return;
+
+      // evita overlap (inFlight) e non accumula richieste
+      if (inFlight) return schedule(delay);
+
+      inFlight = true;
+      try {
+        const response = await axios.get(`/processStatus/${processId}`, {
+          signal: controller.signal,
+          timeout: 8000,
+          headers: { "Cache-Control": "no-cache" },
+        });
+
+        const phaseHeader = response?.headers?.["x-server-phase"];
+        if (phaseHeader) {
+          try {
+            const phasesObj = JSON.parse(phaseHeader);
+            setServerPhasesPolling(phasesObj);
+            console.info("[PHASES][POLLING]", phasesObj);
+          } catch {
+            /* ignore */
           }
-
-          if (response.data.status === "completed") {
-            clearInterval(pollingInterval);
-
-            // ✅ QUI: quando complete_dem_analysis finisce, PASSA ALLA PAGINA RISULTATI (pulita)
-            setDemFile(selectedFile);
-            setShowAnalysisResults(true);
-
-            setIsProcessing(false);
-
-            const tPollEnd = performance.now();
-            const dt = tPollEnd - tPollStart;
-            setPollingWallMs(dt);
-            console.info(`[TIMING] /processStatus polling → completed: ${dt.toFixed(1)} ms`);
-          } else if (response.data.status === "error") {
-            clearInterval(pollingInterval);
-            setUploadMessage("Error during processing.");
-            setIsProcessing(false);
-          }
-        } catch (error) {
-          console.error("Error checking processing status:", error);
-          clearInterval(pollingInterval);
-          setUploadMessage("Error checking processing status.");
-          setIsProcessing(false);
         }
-      }, 2000);
-    }
+
+        const st = response?.data?.status;
+
+        if (st === "completed") {
+          stop();
+
+          // ✅ passa alla pagina risultati (pulita)
+          setDemFile(selectedFile);
+          setShowAnalysisResults(true);
+
+          setIsProcessing(false);
+
+          const tPollEnd = performance.now();
+          const dt = tPollEnd - tPollStart;
+          setPollingWallMs(dt);
+          console.info(`[TIMING] /processStatus polling → completed: ${dt.toFixed(1)} ms`);
+          return;
+        }
+
+        if (st === "error") {
+          stop();
+          setUploadMessage("Error during processing.");
+          setIsProcessing(false);
+          return;
+        }
+
+        // successo (ma non finito): reset backoff
+        delay = 2000;
+      } catch (error) {
+        // abort/cleanup: uscita pulita
+        if (error?.name === "CanceledError" || error?.name === "AbortError") {
+          inFlight = false;
+          return;
+        }
+
+        console.error("Error checking processing status:", error);
+
+        // NON fermiamo tutto al primo errore: backoff e riprova
+        // così evitiamo di piantare la UI per una micro-interruzione.
+        delay = Math.min(maxDelay, Math.round(delay * 1.8));
+
+        setUploadMessage("Temporary network issue while checking status. Retrying...");
+      } finally {
+        inFlight = false;
+        schedule(delay);
+      }
+    };
+
+    // avvio immediato
+    tick();
 
     return () => {
-      if (pollingInterval) clearInterval(pollingInterval);
+      stop();
     };
   }, [processId, selectedFile, setDemFile, setShowAnalysisResults]);
 
@@ -129,6 +186,7 @@ const UploadForm = ({
 
       const response = await axios.post("/process", formData, {
         headers: { "Content-Type": "multipart/form-data" },
+        timeout: 600000, // 10 min (upload+inizio processing) - evita timeout strani su file grossi
       });
 
       const t1 = performance.now();

@@ -86,9 +86,9 @@ const FramePaper = ({ title, sx, children }) => (
       sx={{
         borderRadius: 2.5,
         overflow: 'hidden',
-        background: 'linear-gradient(180deg, #1c1c1c 0%, #121212 100%)',
-        border: '1px solid rgba(255,255,255,0.08)',
-        boxShadow: 'inset 0 0 0 1px rgba(0,0,0,0.55)',
+        background: '#fff',
+        border: '1px solid rgba(0,0,0,0.10)',
+        boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.6)',
         px: 0.35,
         py: 0.35,
         display: 'flex',
@@ -257,6 +257,39 @@ export default function VolumeResultsViewer({ volumeRun, processId: processIdPro
     }
   };
 
+  // ✅ NEW: download metrics (JSON/CSV) via /api/metrics/:processId
+  const handleDownloadMetrics = async (format) => {
+    if (!processId) return;
+    const mk = moduleKey || 'unknown_module';
+    const url = `/api/metrics/${processId}?moduleKey=${encodeURIComponent(mk)}&format=${encodeURIComponent(format)}`;
+
+    try {
+      setLoading(true);
+      const resp = await axios.get(url, {
+        responseType: 'blob',
+        headers: { 'Cache-Control': 'no-cache' },
+      });
+
+      const mime = format === 'csv' ? 'text/csv' : 'application/json';
+      const blob = new Blob([resp.data], { type: mime });
+      const objectUrl = window.URL.createObjectURL(blob);
+
+      const a = document.createElement('a');
+      a.href = objectUrl;
+      a.download = `metrics_${mk}_${processId}.${format}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+
+      window.URL.revokeObjectURL(objectUrl);
+    } catch (e) {
+      console.error(`Metrics ${format} download failed:`, e);
+      alert(`Metrics ${String(format).toUpperCase()} download failed. Check server route /api/metrics/:processId.`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const renderSlide = () => {
     if (!current) {
       return (
@@ -333,6 +366,25 @@ export default function VolumeResultsViewer({ volumeRun, processId: processIdPro
       <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 1, flexWrap: 'wrap', mb: 2, alignItems: 'center' }}>
         <Button variant="outlined" onClick={onBack}>Back</Button>
         {onBackToUpload ? <Button variant="outlined" onClick={onBackToUpload}>Back to Upload</Button> : null}
+
+        {/* ✅ NEW: metrics exports (same gating as PDF) */}
+        <Button
+          variant="outlined"
+          onClick={() => handleDownloadMetrics('json')}
+          disabled={!canDownloadPdf || loading}
+          title={canDownloadPdf ? 'Download metrics JSON' : 'Available when status=completed and moduleKey is present'}
+        >
+          Download JSON
+        </Button>
+
+        <Button
+          variant="outlined"
+          onClick={() => handleDownloadMetrics('csv')}
+          disabled={!canDownloadPdf || loading}
+          title={canDownloadPdf ? 'Download metrics CSV' : 'Available when status=completed and moduleKey is present'}
+        >
+          Download CSV
+        </Button>
 
         <Button
           variant="contained"

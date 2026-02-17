@@ -55,8 +55,9 @@ const FramePaper = ({ title, sx, children }) => (
         background: "linear-gradient(180deg, #1c1c1c 0%, #121212 100%)",
         border: "1px solid rgba(255,255,255,0.08)",
         boxShadow: "inset 0 0 0 1px rgba(0,0,0,0.55)",
-        px: 0.35,
-        py: 0.35,
+        // ✅ meno padding = più spazio utile per le immagini
+        px: 0.15,
+        py: 0.15,
         display: "flex",
         justifyContent: "center",
         alignItems: "center",
@@ -79,7 +80,11 @@ export default function AnalysisResultsViewer({
   const [slideIdx, setSlideIdx] = useState(0);
   const [loading, setLoading] = useState(true);
 
+  // ✅ default per le slide "double_*.png"
   const IMG_MAX_H = "70vh";
+  // ✅ più generoso SOLO per l’overview (DEM + Aspect)
+  const IMG_MAX_H_OVERVIEW = "85vh";
+
   const IMG_STYLE = {
     width: "100%",
     height: "auto",
@@ -195,7 +200,11 @@ export default function AnalysisResultsViewer({
           <Box
             sx={{
               width: "100%",
+              // ✅ più largo su desktop per “far respirare” le due colonne
+              maxWidth: { xs: "100%", md: 1500 },
+              mx: "auto",
               display: "grid",
+              // ✅ affiancate su desktop
               gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" },
               gap: 2,
               alignItems: "center",
@@ -203,7 +212,11 @@ export default function AnalysisResultsViewer({
           >
             <Box sx={{ width: "100%", display: "flex", justifyContent: "center" }}>
               {dem ? (
-                <img alt="dem_overview" src={imgSrc(dem, dem?.filename)} style={IMG_STYLE} />
+                <img
+                  alt="dem_overview"
+                  src={imgSrc(dem, dem?.filename)}
+                  style={{ ...IMG_STYLE, maxHeight: IMG_MAX_H_OVERVIEW }}
+                />
               ) : (
                 <Typography sx={{ opacity: 0.85, color: "#eaeaea", py: 2 }}>
                   DEM not available yet.
@@ -213,7 +226,11 @@ export default function AnalysisResultsViewer({
 
             <Box sx={{ width: "100%", display: "flex", justifyContent: "center" }}>
               {asp ? (
-                <img alt="aspect_overview" src={imgSrc(asp, asp?.filename)} style={IMG_STYLE} />
+                <img
+                  alt="aspect_overview"
+                  src={imgSrc(asp, asp?.filename)}
+                  style={{ ...IMG_STYLE, maxHeight: IMG_MAX_H_OVERVIEW }}
+                />
               ) : (
                 <Typography sx={{ opacity: 0.85, color: "#eaeaea", py: 2 }}>
                   Aspect not available yet.
@@ -338,7 +355,16 @@ export default function AnalysisResultsViewer({
         <Typography>Carico risultati…</Typography>
       ) : (
         <Box sx={{ mb: 2 }}>
-          <Box sx={{ display: "flex", justifyContent: "space-between", gap: 1, flexWrap: "wrap", alignItems: "center", mb: 1 }}>
+          <Box
+            sx={{
+              display: "flex",
+              justifyContent: "space-between",
+              gap: 1,
+              flexWrap: "wrap",
+              alignItems: "center",
+              mb: 1,
+            }}
+          >
             <Typography variant="subtitle2">
               {current.type === "overview" ? "Overview" : "Double panels"}
             </Typography>

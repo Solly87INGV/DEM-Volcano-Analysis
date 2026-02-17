@@ -164,6 +164,57 @@ function deriveModuleKey(volumeType, approximationType) {
   return '';
 }
 
+// ✅ NEW: map moduleKey -> metrics tag naming (per match dei file legacy)
+function moduleKeyToMetricsTag(moduleKey) {
+  const mk = String(moduleKey || '').toLowerCase().trim();
+  if (mk === 'circular_approx1') return 'circ_a1';
+  if (mk === 'circular_approx2') return 'circ_a2';
+  if (mk === 'elliptical_approx1') return 'ell_a1';
+  if (mk === 'elliptical_approx2') return 'ell_a2';
+  return '';
+}
+
+// ✅ NEW: pick best metrics file in procDir for (moduleKey, ext)
+function pickMetricsPath(procDir, moduleKey, ext /* 'csv'|'json' */) {
+  try {
+    if (!fs.existsSync(procDir)) return null;
+
+    const wantedExt = String(ext || '').toLowerCase();
+    const files = fs.readdirSync(procDir);
+
+    const candidates = files
+      .filter((f) => f.toLowerCase().endsWith('.' + wantedExt))
+      .filter((f) => f.toLowerCase().includes('metrics')) // keep only metrics*
+      .map((f) => ({ f, p: path.join(procDir, f) }))
+      .filter((x) => fs.existsSync(x.p));
+
+    if (!candidates.length) return null;
+
+    const tag = moduleKeyToMetricsTag(moduleKey);
+    if (tag) {
+      // prefer metrics_<tag>*.<ext> (es: metrics_circ_a2.json)
+      const pref = `metrics_${tag}`.toLowerCase();
+      const tagged = candidates
+        .filter((x) => x.f.toLowerCase().startsWith(pref))
+        .sort((a, b) => fs.statSync(b.p).mtimeMs - fs.statSync(a.p).mtimeMs);
+      if (tagged.length) return tagged[0].p;
+
+      // secondary: any file that contains tag
+      const contains = candidates
+        .filter((x) => x.f.toLowerCase().includes(tag))
+        .sort((a, b) => fs.statSync(b.p).mtimeMs - fs.statSync(a.p).mtimeMs);
+      if (contains.length) return contains[0].p;
+    }
+
+    // fallback: newest metrics*.ext
+    candidates.sort((a, b) => fs.statSync(b.p).mtimeMs - fs.statSync(a.p).mtimeMs);
+    return candidates[0].p;
+  } catch (e) {
+    console.warn('[WARN] pickMetricsPath failed:', e);
+    return null;
+  }
+}
+
 // ---------------------------
 // Optional: simple healthcheck endpoint (useful for Docker)
 // ---------------------------
@@ -395,73 +446,95 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
 });
 
 // ---------------------------
-// ✅ PDF Report endpoint (STRICT when moduleKey is provided)
+// ✅ NEW: Metrics export endpoint
+// GET /api/metrics/:processId?moduleKey=elliptical_approx2&format=json|csv
+// - picks the best metrics file in outputs/<pid>/
+// - sends it as attachment
+// ---------------------------
+app.get('/api/metrics/:processId', (req, res) => {
+  const { processId } = req.params;
+  const moduleKey = req.query.moduleKey ? String(req.query.moduleKey) : '';
+  const format = (req.query.format ? String(req.query.format) : 'json').toLowerCase();
+
+  if (!processId) return res.status(400).json({ error: 'Missing processId' });
+  if (format !== 'json' && format !== 'csv') {
+    return res.status(400).json({ error: 'Invalid format. Use format=json or format=csv' });
+  }
+
+  const procDir = path.join(outputsDir, processId);
+  const metricsPath = pickMetricsPath(procDir, moduleKey, format);
+
+  if (!metricsPath) {
+    return res.status(404).json({
+      error: 'Metrics file not found',
+      processId,
+      moduleKey: moduleKey || null,
+      format,
+    });
+  }
+
+  const filename = path.basename(metricsPath);
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  if (format === 'json') res.setHeader('Content-Type', 'application/json');
+  if (format === 'csv') res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+
+  return res.sendFile(metricsPath);
+});
+
+// ---------------------------
+// ✅ PDF Report endpoint (aligned behavior with old app)
 // GET /api/report/:processId?moduleKey=circular_approx1
-//
-// Behavior:
-//  - if moduleKey provided: serve ONLY report_<moduleKey>_*.pdf (never report.pdf, never newest)
-//  - else: legacy -> report.pdf (if exists), otherwise newest pdf (optional) OR build -> report.pdf
-//  - if missing -> build with python -> then serve the best match (strict rules apply)
 // ---------------------------
 app.get('/api/report/:processId', (req, res) => {
   const t0 = performance.now();
 
   const { processId } = req.params;
-  const moduleKey = req.query.moduleKey
-    ? String(req.query.moduleKey)
-    : (req.query.module ? String(req.query.module) : '');
+  const moduleKey = req.query.moduleKey ? String(req.query.moduleKey) : (req.query.module ? String(req.query.module) : '');
 
   if (!processId) {
     return res.status(400).json({ error: 'Missing processId' });
   }
 
   const procDir = path.join(outputsDir, processId);
-  const safeModuleKey = (moduleKey || '').replace(/[^a-zA-Z0-9_-]/g, '');
 
-  function pickReportPdfStrict() {
+  const safeModuleKey = (moduleKey || 'circular_approx1').replace(/[^a-zA-Z0-9_-]/g, '');
+  const pickLatestReportPdf = () => {
     try {
       if (!fs.existsSync(procDir)) return null;
       const files = fs.readdirSync(procDir);
-
-      // STRICT: if moduleKey is provided, accept ONLY report_<moduleKey>_*.pdf
-      if (safeModuleKey) {
-        const pref = `report_${safeModuleKey}_`.toLowerCase();
-        const candidates = files
-          .filter((f) => f.toLowerCase().startsWith(pref) && f.toLowerCase().endsWith('.pdf'))
-          .map((f) => ({ f, p: path.join(procDir, f) }))
-          .filter((x) => fs.existsSync(x.p))
-          .sort((a, b) => fs.statSync(b.p).mtimeMs - fs.statSync(a.p).mtimeMs);
-
-        return candidates.length ? candidates[0].p : null;
-      }
-
-      // LEGACY: no moduleKey -> prefer report.pdf
-      const legacy = path.join(procDir, 'report.pdf');
-      if (fs.existsSync(legacy)) return legacy;
-
-      // Optional fallback (no moduleKey only): newest pdf
-      const pdfs = files
+      const candidates = files
         .filter((f) => f.toLowerCase().endsWith('.pdf'))
         .map((f) => ({ f, p: path.join(procDir, f) }))
-        .filter((x) => fs.existsSync(x.p))
-        .sort((a, b) => fs.statSync(b.p).mtimeMs - fs.statSync(a.p).mtimeMs);
+        .filter((x) => fs.existsSync(x.p));
 
-      return pdfs.length ? pdfs[0].p : null;
+      if (moduleKey) {
+        const pref = `report_${safeModuleKey}_`.toLowerCase();
+        const mod = candidates
+          .filter((x) => x.f.toLowerCase().startsWith(pref))
+          .sort((a, b) => fs.statSync(b.p).mtimeMs - fs.statSync(a.p).mtimeMs);
+        if (mod.length) return mod[0].p;
+
+        const legacy = path.join(procDir, 'report.pdf');
+        if (fs.existsSync(legacy)) return legacy;
+      } else {
+        const legacy = path.join(procDir, 'report.pdf');
+        if (fs.existsSync(legacy)) return legacy;
+      }
+
+      candidates.sort((a, b) => fs.statSync(b.p).mtimeMs - fs.statSync(a.p).mtimeMs);
+      return candidates.length ? candidates[0].p : null;
     } catch (e) {
       console.warn('[WARN] Could not scan report PDFs:', e);
       return null;
     }
-  }
+  };
 
-  // If already exists, serve without rebuilding
-  let pdfPath = pickReportPdfStrict();
+  let pdfPath = pickLatestReportPdf();
   if (pdfPath && fs.existsSync(pdfPath)) {
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `inline; filename="${path.basename(pdfPath)}"`);
     return res.sendFile(pdfPath);
   }
 
-  // Otherwise build it with python
   const reportScriptPath = path.join(__dirname, 'scripts', 'build_pdf_report.py');
 
   if (!fs.existsSync(reportScriptPath)) {
@@ -475,10 +548,10 @@ app.get('/api/report/:processId', (req, res) => {
 
   fs.mkdirSync(procDir, { recursive: true });
 
-  console.log(`[INFO][SERVER] report missing -> building (pid=${processId}, moduleKey=${safeModuleKey || 'N/A'})`);
+  console.log(`[INFO][SERVER] report missing -> building (pid=${processId}, moduleKey=${moduleKey || 'N/A'})`);
 
-  const args = safeModuleKey
-    ? [reportScriptPath, processId, safeModuleKey]
+  const args = moduleKey
+    ? [reportScriptPath, processId, moduleKey]
     : [reportScriptPath, processId];
 
   const child = spawnPython({ processId, args });
@@ -523,28 +596,18 @@ app.get('/api/report/:processId', (req, res) => {
       });
     }
 
-    // Re-pick after build (STRICT rules apply)
-    pdfPath = pickReportPdfStrict();
+    pdfPath = pickLatestReportPdf();
 
     if (!pdfPath || !fs.existsSync(pdfPath)) {
-      // If moduleKey was requested, be explicit: you asked for X but it doesn't exist
-      if (safeModuleKey) {
-        return res.status(404).json({
-          error: 'Module-specific PDF not found after generation',
-          processId,
-          moduleKey: safeModuleKey,
-          hint: `Expected a file starting with report_${safeModuleKey}_ in ${procDir}`,
-        });
-      }
-
-      return res.status(404).json({
-        error: 'PDF not found after generation',
+      console.error(`[ERROR][SERVER] build finished but PDF not found (pid=${processId})`);
+      return res.status(500).json({
+        error: 'Report build completed but PDF is missing',
         processId,
+        expectedPdfPath: pdfPath,
       });
     }
 
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `inline; filename="${path.basename(pdfPath)}"`);
     return res.sendFile(pdfPath);
   });
 });
@@ -644,9 +707,10 @@ if (frontendBuildDir && fs.existsSync(frontendBuildDir)) {
       req.path.startsWith('/calculateCurvatures') ||
       req.path.startsWith('/analysis') ||
       req.path.startsWith('/api/report') ||
+      req.path.startsWith('/api/metrics') || // ✅ NEW: non farla mangiare dalla SPA
       req.path.startsWith('/health')
     ) {
-      return next(); // <-- CHIAVE: non far mangiare queste rotte dalla SPA
+      return next();
     }
     return res.sendFile(path.join(frontendBuildDir, 'index.html'));
   });

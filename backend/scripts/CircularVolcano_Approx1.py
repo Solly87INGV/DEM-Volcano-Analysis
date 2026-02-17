@@ -77,7 +77,17 @@ import numpy as np
 import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from rasterio.crs import CRS
-from scipy.ndimage import sobel, binary_dilation
+
+# ✅ Allowed new imports (SciPy already present) for morphological rim detection
+from scipy.ndimage import (
+    sobel,
+    binary_dilation,
+    binary_closing,
+    binary_fill_holes,
+    gaussian_filter,
+    label,
+)
+
 from skimage import measure
 from skimage.draw import polygon
 
@@ -198,6 +208,57 @@ def _public_path(process_id: str, filename: str) -> str:
     return f"/outputs/{process_id}/{filename}"
 
 
+# -------------------- DEM selection (manifest-first) --------------------
+
+def _resolve_dem_path_manifest_first(input_dem_path: str, process_id: str) -> dict:
+    """
+    OBIETTIVO A) Eliminare divergenze dovute a DEM diverso (manifest-first)
+
+    Priorità obbligatoria:
+    1) Se esiste analysis_images.json (manifest complete_dem_analysis), usa dem_working.tif nella stessa cartella.
+    2) Se non trovato, usa outputs/<PROCESS_ID>/dem_working.tif se esiste.
+    3) Altrimenti usa l’input DEM passato a riga di comando.
+
+    Ritorna dict con:
+      - selected_path
+      - reason
+      - manifest_path (se trovato)
+      - manifest_dir (se trovato)
+    """
+    out_dir = _ensure_outputs_dir(process_id)
+
+    manifest_path = os.path.join(out_dir, "analysis_images.json")
+    if os.path.exists(manifest_path):
+        manifest_dir = os.path.dirname(manifest_path)
+        manifest_dem = os.path.join(manifest_dir, "dem_working.tif")
+        if os.path.exists(manifest_dem):
+            return {
+                "selected_path": manifest_dem,
+                "reason": "manifest-first: analysis_images.json -> dem_working.tif in manifest dir",
+                "manifest_path": manifest_path,
+                "manifest_dir": manifest_dir,
+            }
+        else:
+            # Manifest exists but dem_working.tif missing: continue with next priority, but log clearly.
+            print(f"[WARN] analysis_images.json found but dem_working.tif not found in same folder: {manifest_dem}")
+
+    candidate = os.path.join(out_dir, "dem_working.tif")
+    if os.path.exists(candidate):
+        return {
+            "selected_path": candidate,
+            "reason": "outputs-working: outputs/<PID>/dem_working.tif exists",
+            "manifest_path": manifest_path if os.path.exists(manifest_path) else None,
+            "manifest_dir": os.path.dirname(manifest_path) if os.path.exists(manifest_path) else None,
+        }
+
+    return {
+        "selected_path": input_dem_path,
+        "reason": "fallback-input: using CLI input DEM",
+        "manifest_path": manifest_path if os.path.exists(manifest_path) else None,
+        "manifest_dir": os.path.dirname(manifest_path) if os.path.exists(manifest_path) else None,
+    }
+
+
 # -------------------- Funzioni di analisi di base --------------------
 
 def find_lowest_base_contour(matrix, base_elevation_ratio=0.05):
@@ -225,6 +286,10 @@ def calculate_slope(matrix):
 
 
 def find_caldera_contour(matrix, level_ratio=0.8):
+    """
+    Legacy method (quota-based). Non usato più per definire la caldera in calculate_results().
+    Lasciato per compatibilità / debug.
+    """
     contour_level = float(matrix.max() * level_ratio)
     contours = measure.find_contours(matrix, contour_level)
     if len(contours) == 0:
@@ -332,6 +397,253 @@ def outside_ring_mask(mask: np.ndarray, offset_px: int = 1, width_px: int = 3) -
 
     ring = outer & (~inner)
     return ring
+
+
+# -------------------- NEW: Morphological rim detection (ROI + slope + morphology) --------------------
+
+def _center_from_roi_peak_or_centroid(demf: np.ndarray, roi: np.ndarray) -> tuple:
+    """
+    Center strategy (headless-friendly):
+    1) Peak (argmax elevation) within ROI (robust "summit" proxy)
+    2) Fallback: centroid of ROI mask
+    Returns: (center_row, center_col, method_str)
+    """
+    try:
+        vals = demf[roi]
+        if vals.size > 0 and np.any(np.isfinite(vals)):
+            tmp = np.full(demf.shape, -np.inf, dtype=float)
+            tmp[roi] = demf[roi]
+            r, c = np.unravel_index(int(np.nanargmax(tmp)), tmp.shape)
+            return float(r), float(c), "peak_in_roi"
+    except Exception:
+        pass
+
+    rr, cc = np.where(roi)
+    if rr.size == 0:
+        return float(demf.shape[0] / 2.0), float(demf.shape[1] / 2.0), "fallback_image_center"
+    return float(np.mean(rr)), float(np.mean(cc)), "roi_centroid"
+
+
+def find_caldera_contour_morphological(
+    dem: np.ndarray,
+    base_contour: np.ndarray,
+    slope: np.ndarray = None,
+    nodata=None,
+    roi_dilate_px: int = 6,
+    smooth_sigma: float = 1.0,
+    slope_q: float = 88.0,
+    min_component_px: int = 500,
+    closing_iterations: int = 2,
+    extra_dilate_px: int = 0,
+    # ✅ NEW selection knobs (center-biased)
+    max_area_frac: float = 0.35,
+    selection_mode: str = "center_biased",  # "center_biased" | "largest"
+) -> tuple:
+    """
+    OBIETTIVO B) Rim detection “morfologica” (ROI + morfologia + slope/break-in-slope-like)
+
+    - ROI = interno della base (base_contour -> contour_to_mask) + dilatazione opzionale
+    - slope map (Sobel) -> threshold robusto su percentile calcolato SOLO dentro ROI
+    - candidati rim = slope alta dentro ROI
+    - morfologia: binary_closing + fill_holes (+ eventuale dilatazione leggera)
+    - componenti connesse: seleziona la "giusta" (default: center-biased per evitare l'anello esterno del fianco)
+    - contorno finale: measure.find_contours(mask, 0.5) -> quello più lungo
+
+    Ritorna:
+      (caldera_contour, debug_dict)
+    """
+    if dem is None or dem.size == 0:
+        raise ValueError("DEM is empty. Cannot detect caldera rim.")
+
+    if base_contour is None or len(base_contour) < 3:
+        raise ValueError("Base contour is missing/too small. Cannot build ROI for caldera rim detection.")
+
+    demf = dem.astype(float)
+
+    valid = np.isfinite(demf)
+    if nodata is not None:
+        valid = valid & (demf != float(nodata))
+
+    roi = contour_to_mask(base_contour, demf.shape)
+    roi_dilate_px = int(max(0, roi_dilate_px))
+    if roi_dilate_px > 0:
+        roi = binary_dilation(roi, iterations=roi_dilate_px)
+
+    roi = roi & valid
+    roi_px = int(np.sum(roi))
+    if roi_px < max(50, int(min_component_px * 0.5)):
+        raise ValueError(
+            f"ROI too small after dilation/valid masking (roi_px={roi_px}). "
+            "Cannot perform morphological rim detection."
+        )
+
+    if slope is None:
+        slope = calculate_slope(demf)
+
+    slopef = slope.astype(float)
+    if smooth_sigma is not None and float(smooth_sigma) > 0:
+        slopef = gaussian_filter(slopef, sigma=float(smooth_sigma))
+
+    roi_slopes = slopef[roi]
+    roi_slopes = roi_slopes[np.isfinite(roi_slopes)]
+    if roi_slopes.size == 0:
+        raise ValueError("No finite slope values inside ROI. Cannot detect rim.")
+
+    slope_q = float(slope_q)
+    if slope_q <= 0.0 or slope_q >= 100.0:
+        raise ValueError(f"slope_q must be in (0,100). Got {slope_q}")
+
+    thr = float(np.percentile(roi_slopes, slope_q))
+    candidates = (slopef >= thr) & roi
+
+    # Morphology to make region coherent
+    closing_iterations = int(max(0, closing_iterations))
+    if closing_iterations > 0:
+        candidates = binary_closing(candidates, iterations=closing_iterations)
+
+    candidates = binary_fill_holes(candidates)
+
+    extra_dilate_px = int(max(0, extra_dilate_px))
+    if extra_dilate_px > 0:
+        candidates = binary_dilation(candidates, iterations=extra_dilate_px)
+
+    # Ensure still inside ROI
+    candidates = candidates & roi
+
+    cand_px = int(np.sum(candidates))
+    if cand_px == 0:
+        raise ValueError(
+            "Morphological rim detection produced empty candidate mask. "
+            f"(slope_q={slope_q}, thr={thr}, roi_px={roi_px})"
+        )
+
+    lbl, ncomp = label(candidates)
+    if ncomp <= 0:
+        raise ValueError("Morphological rim detection found no connected components after labeling.")
+
+    # Component stats
+    min_component_px = int(max(1, min_component_px))
+    max_area_frac = float(max(0.0, max_area_frac))
+    if max_area_frac <= 0.0 or max_area_frac > 1.0:
+        raise ValueError(f"max_area_frac must be in (0,1]. Got {max_area_frac}")
+
+    # Eligible list with stats
+    comps = []
+    sizes = []
+    for comp_id in range(1, ncomp + 1):
+        mask_i = (lbl == comp_id)
+        sz = int(np.sum(mask_i))
+        sizes.append(sz)
+        if sz < min_component_px:
+            continue
+
+        area_frac = float(sz / float(max(1, roi_px)))
+        if area_frac > max_area_frac:
+            continue
+
+        rr, cc = np.where(mask_i)
+        if rr.size == 0:
+            continue
+
+        cr = float(np.mean(rr))
+        cc_ = float(np.mean(cc))
+        mean_s = float(np.mean(slopef[mask_i])) if np.any(mask_i) else 0.0
+        comps.append({
+            "id": int(comp_id),
+            "px": int(sz),
+            "area_frac": float(area_frac),
+            "centroid_rc": (cr, cc_),
+            "mean_slope": float(mean_s),
+        })
+
+    if not comps:
+        raise ValueError(
+            "No connected component meets min_component_px AND max_area_frac constraints. "
+            f"ncomp={ncomp}, roi_px={roi_px}, sizes(sample)={sizes[:10]}{'...' if len(sizes)>10 else ''}, "
+            f"min_component_px={min_component_px}, max_area_frac={max_area_frac}"
+        )
+
+    # ✅ NEW: center-biased selection to avoid outer flank ring
+    center_r, center_c, center_method = _center_from_roi_peak_or_centroid(demf, roi)
+
+    selection_mode = str(selection_mode or "center_biased").strip().lower()
+    if selection_mode not in ("center_biased", "largest"):
+        raise ValueError(f"Invalid selection_mode='{selection_mode}'. Use 'center_biased' or 'largest'.")
+
+    if selection_mode == "largest":
+        best = max(comps, key=lambda d: d["px"])
+        selection_reason = "largest_component_within_constraints"
+    else:
+        # center-biased score: minimize distance to center, with mild preference for steeper mean slope
+        # normalize distances by sqrt(roi_px) to keep it scale-stable
+        dist_norm_denom = float(max(1.0, math.sqrt(roi_px)))
+        for d in comps:
+            cr, cc_ = d["centroid_rc"]
+            dist = float(np.hypot(cr - center_r, cc_ - center_c))
+            d["dist_to_center_px"] = dist
+            d["dist_to_center_norm"] = float(dist / dist_norm_denom)
+
+        # mean_slope normalization
+        ms = [d["mean_slope"] for d in comps]
+        ms_min = float(min(ms))
+        ms_max = float(max(ms))
+        ms_rng = float(ms_max - ms_min) if (ms_max - ms_min) > 0 else 1.0
+
+        # Score: smaller dist is better; slightly reward mean_slope; slightly penalize area_frac (avoid huge rings)
+        for d in comps:
+            mean_s_norm = float((d["mean_slope"] - ms_min) / ms_rng)
+            d["mean_slope_norm"] = mean_s_norm
+            d["score"] = float(
+                (-1.0 * d["dist_to_center_norm"]) +
+                (0.15 * mean_s_norm) +
+                (-0.30 * d["area_frac"])
+            )
+
+        best = max(comps, key=lambda d: d["score"])
+        selection_reason = "center_biased_score"
+
+    best_id = int(best["id"])
+    best_mask = (lbl == best_id)
+
+    contours = measure.find_contours(best_mask.astype(np.uint8), 0.5)
+    if not contours:
+        raise ValueError("Connected component selected, but no contour could be extracted (find_contours returned empty).")
+
+    caldera_contour = max(contours, key=len)
+
+    debug = {
+        "method": "morphological_slope_roi",
+        "roi_dilate_px": int(roi_dilate_px),
+        "smooth_sigma": float(smooth_sigma),
+        "slope_q": float(slope_q),
+        "slope_threshold": float(thr),
+        "closing_iterations": int(closing_iterations),
+        "extra_dilate_px": int(extra_dilate_px),
+        "min_component_px": int(min_component_px),
+        "max_area_frac": float(max_area_frac),
+        "selection_mode": selection_mode,
+        "selection_reason": selection_reason,
+        "roi_px": int(roi_px),
+        "candidate_px": int(cand_px),
+        "n_components": int(ncomp),
+        "component_sizes_sample": sizes[:20],  # debug only
+        "center_method": center_method,
+        "center_rc": [float(center_r), float(center_c)],
+        "selected_component_id": int(best_id),
+        "selected_component_px": int(best.get("px", 0)),
+        "selected_component_area_frac": float(best.get("area_frac", 0.0)),
+        "selected_component_centroid_rc": [float(best["centroid_rc"][0]), float(best["centroid_rc"][1])],
+        "selected_component_mean_slope": float(best.get("mean_slope", 0.0)),
+    }
+    if "dist_to_center_px" in best:
+        debug["selected_component_dist_to_center_px"] = float(best["dist_to_center_px"])
+        debug["selected_component_dist_to_center_norm"] = float(best.get("dist_to_center_norm", 0.0))
+    if "score" in best:
+        debug["selected_component_score"] = float(best["score"])
+
+    debug["contour_len"] = int(len(caldera_contour))
+
+    return caldera_contour, debug
 
 
 def caldera_volume_depth_integrated(
@@ -549,11 +861,11 @@ def _get_by_path(d: dict, path: str):
 
 def metrics_to_human_rows(metrics: dict):
     rows = []
-    for section, label, path, unit in HUMAN_FIELDS:
+    for section, label_txt, path, unit in HUMAN_FIELDS:
         v = _get_by_path(metrics, path)
         if isinstance(v, (list, dict)):
             v = json.dumps(v, ensure_ascii=False)
-        rows.append((section, label, v, unit))
+        rows.append((section, label_txt, v, unit))
     return rows
 
 
@@ -633,7 +945,26 @@ class VolumeAnalysisApp(QMainWindow):
         self.base_point1, self.base_point2 = find_opposite_base_points(self.base_contour)
 
         self.slope = calculate_slope(self.dem)
-        self.caldera_contour, self.caldera_level_m = find_caldera_contour(self.dem, level_ratio=0.8)
+
+        # ✅ NEW: caldera_contour morfologico (ROI + slope percentile + morfologia + componenti connesse)
+        # ✅ PATCH: component selection center-biased (evita l'anello esterno del fianco)
+        self.caldera_contour, self.caldera_debug = find_caldera_contour_morphological(
+            dem=self.dem,
+            base_contour=self.base_contour,
+            slope=self.slope,
+            nodata=nodata,
+            roi_dilate_px=6,
+            smooth_sigma=1.0,
+            slope_q=88.0,
+            min_component_px=500,
+            closing_iterations=2,
+            extra_dilate_px=0,
+            max_area_frac=0.35,
+            selection_mode="center_biased",
+        )
+        # Legacy caldera level non guida più la caldera
+        self.caldera_level_m = None
+
         self.max_slope_index1, self.max_slope_index2 = find_opposite_slope_points(self.slope, self.caldera_contour)
 
         # Distances (m)
@@ -900,7 +1231,12 @@ class VolumeAnalysisApp(QMainWindow):
                 "crs": str(crs) if crs is not None else None,
                 "res": list(res) if res is not None else None,
                 "nodata": nodata,
-                "params": {"base_elevation_ratio": 0.05, "caldera_level_ratio": 0.8}
+                "params": {
+                    "base_elevation_ratio": 0.05,
+                    # kept for backward readability; caldera is now slope/ROI-based
+                    "caldera_level_ratio": 0.8,
+                    "caldera_rim_detection": "morphological_slope_roi",
+                }
             },
             "nodata_stats": dem_nodata_stats(self.dem, nodata=nodata),
             "height_model": getattr(self, "height_model", None),
@@ -933,6 +1269,11 @@ class VolumeAnalysisApp(QMainWindow):
                 "V_effective_m3": V_eff_m3,
             },
         }
+
+        # Optional debug (doesn't change formulas/flow; just extra info)
+        if hasattr(self, "caldera_debug") and isinstance(self.caldera_debug, dict):
+            metrics["meta"]["caldera_debug"] = self.caldera_debug
+
         return metrics
 
     def _write_metrics_files(self):
@@ -947,8 +1288,8 @@ class VolumeAnalysisApp(QMainWindow):
         with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow(["section", "metric", "value", "unit"])
-            for section, label, value, unit in human_rows:
-                w.writerow([section, label, value, unit])
+            for section, label_txt, value, unit in human_rows:
+                w.writerow([section, label_txt, value, unit])
 
         print(f"[INFO] metrics written: {json_path}")
         print(f"[INFO] metrics written: {csv_path}")
@@ -1136,10 +1477,17 @@ if __name__ == "__main__":
     input_dem_path = sys.argv[1]
     process_id = _resolve_process_id()
 
-    # Usa working DEM se già esiste in outputs/<PID>/dem_working.tif
-    out_dir = _ensure_outputs_dir(process_id)
-    candidate = os.path.join(out_dir, "dem_working.tif")
-    dem_file_path = candidate if os.path.exists(candidate) else input_dem_path
+    # ✅ A) Manifest-first DEM selection (old behavior restored deterministically)
+    dem_choice = _resolve_dem_path_manifest_first(input_dem_path=input_dem_path, process_id=process_id)
+    dem_file_path = dem_choice["selected_path"]
+
+    print("[DEBUG] DEM selection (manifest-first):")
+    print(f"        process_id     = {process_id}")
+    print(f"        input_dem_path = {input_dem_path}")
+    if dem_choice.get("manifest_path"):
+        print(f"        manifest_path  = {dem_choice.get('manifest_path')}")
+    print(f"        selected_path  = {dem_file_path}")
+    print(f"        reason         = {dem_choice.get('reason')}")
 
     # Se ancora geografico, riproietta e salva dentro outputs/<PID>/dem_working.tif
     if os.path.exists(dem_file_path):
