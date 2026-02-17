@@ -19,6 +19,9 @@ app.use(express.json({ limit: '10mb' }));
 // ---------------------------
 const PORT = Number(process.env.PORT || 5000);
 
+// Python executable inside container (or local)
+const PYTHON_BIN = process.env.PYTHON_BIN || process.env.PYTHON_PATH || 'python3';
+
 // Use env dirs if provided (compose sets them), fallback to local dev defaults
 const uploadsDir = process.env.UPLOADS_DIR
   ? path.resolve(process.env.UPLOADS_DIR)
@@ -32,16 +35,13 @@ const outputsDir = process.env.OUTPUTS_DIR
 fs.mkdirSync(uploadsDir, { recursive: true });
 fs.mkdirSync(outputsDir, { recursive: true });
 
-// Serve outputs (PNG/PDF) as static
+// Serve outputs (PNG/PDF/JSON) as static
 app.use('/outputs', express.static(outputsDir));
-
-// Python executable (docker sets PYTHON_BIN=/opt/venv/bin/python)
-const pythonPath = process.env.PYTHON_BIN || 'python3';
 
 // Optional: log startup config once
 console.log('[SERVER] config:', {
   PORT,
-  pythonPath,
+  PYTHON_BIN,
   uploadsDir,
   outputsDir,
   FRONTEND_BUILD_DIR: process.env.FRONTEND_BUILD_DIR || '(not set)',
@@ -67,8 +67,19 @@ const processingStatus = {};
 // - In Docker/Linux do NOT force PROJ_LIB to pyproj. If PROJ_LIB/PROJ_DATA are set (e.g., from host),
 //   they can break rasterio/GDAL with "DATABASE.LAYOUT.VERSION.MINOR" mismatch.
 // - On Windows we keep them (some setups need pyproj PROJ db to override PostGIS/OSGeo clashes).
+// - Also set headless defaults (Agg/offscreen) for reproducible server runs.
+// ---------------------------
 function buildPyEnv(extraEnv = {}) {
-  const env = { ...process.env, ...extraEnv, PYTHONUNBUFFERED: '1' };
+  const env = {
+    ...process.env,
+    ...extraEnv,
+    PYTHONUNBUFFERED: '1',
+
+    // Headless flags (safe defaults)
+    HEADLESS: process.env.HEADLESS || '1',
+    MPLBACKEND: process.env.MPLBACKEND || 'Agg',
+    QT_QPA_PLATFORM: process.env.QT_QPA_PLATFORM || 'offscreen',
+  };
 
   if (process.platform !== 'win32') {
     if (env.PROJ_LIB) {
@@ -82,6 +93,18 @@ function buildPyEnv(extraEnv = {}) {
   }
 
   return env;
+}
+
+function spawnPython({ args, processId, extraEnv = {} }) {
+  return spawn(PYTHON_BIN, args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: buildPyEnv({
+      PROCESS_ID: processId || '',
+      OUTPUTS_DIR: outputsDir,
+      UPLOADS_DIR: uploadsDir,
+      ...extraEnv,
+    }),
+  });
 }
 
 // ---------------------------
@@ -106,39 +129,45 @@ function normalizeImages(processId, images) {
   });
 }
 
-function pickPdfPath(procDir, moduleKey) {
-  if (!fs.existsSync(procDir)) return null;
+// ====== Helper: write meta.json for report titles / traceability ======
+function writeProcessMeta(procDir, metaPatch) {
+  try {
+    fs.mkdirSync(procDir, { recursive: true });
 
-  const files = fs.readdirSync(procDir).filter((f) => f.toLowerCase().endsWith('.pdf'));
-
-  if (files.length === 0) return null;
-
-  // 1) se NON c'è moduleKey: preferisci report.pdf
-  if (!moduleKey) {
-    const reportPdf = files.find((f) => f.toLowerCase() === 'report.pdf');
-    if (reportPdf) return path.join(procDir, reportPdf);
-  }
-
-  // 2) se c'è moduleKey: preferisci report_{moduleKey}_*.pdf
-  if (moduleKey) {
-    const pref = `report_${String(moduleKey)}_`.toLowerCase();
-    const candidate = files.find((f) => f.toLowerCase().startsWith(pref));
-    if (candidate) return path.join(procDir, candidate);
-  }
-
-  // 3) fallback: ultimo PDF modificato
-  let best = null;
-  let bestMtime = -1;
-  for (const f of files) {
-    const full = path.join(procDir, f);
-    const st = fs.statSync(full);
-    if (st.mtimeMs > bestMtime) {
-      bestMtime = st.mtimeMs;
-      best = full;
+    const metaPath = path.join(procDir, 'meta.json');
+    let existing = {};
+    if (fs.existsSync(metaPath)) {
+      try {
+        existing = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+      } catch {
+        existing = {};
+      }
     }
+
+    const merged = { ...existing, ...metaPatch };
+    fs.writeFileSync(metaPath, JSON.stringify(merged, null, 2), 'utf-8');
+  } catch (e) {
+    console.warn('[WARN] Could not write meta.json:', e);
   }
-  return best;
 }
+
+// ====== Helper: derive moduleKey from request ======
+function deriveModuleKey(volumeType, approximationType) {
+  if (volumeType === 'circular') {
+    if (approximationType === 'approximation1') return 'circular_approx1';
+    if (approximationType === 'approximation2') return 'circular_approx2';
+  }
+  if (volumeType === 'elliptical') {
+    if (approximationType === 'approximation1') return 'elliptical_approx1';
+    if (approximationType === 'approximation2') return 'elliptical_approx2';
+  }
+  return '';
+}
+
+// ---------------------------
+// Optional: simple healthcheck endpoint (useful for Docker)
+// ---------------------------
+app.get('/health', (req, res) => res.json({ ok: true }));
 
 // ---------------------------
 // DEM preprocess (complete_dem_analysis)
@@ -164,10 +193,24 @@ app.post('/process', upload.single('demFile'), (req, res) => {
   const processId = uuidv4();
   processingStatus[processId] = { status: 'processing' };
 
+  // Write meta.json early (used by build_pdf_report.py for titles)
+  const procDir = path.join(outputsDir, processId);
+  const inputDemName = (file && file.originalname)
+    ? String(file.originalname)
+    : (originalFileNameRaw ? String(originalFileNameRaw) : `${processId}.tif`);
+
+  writeProcessMeta(procDir, {
+    input_dem_name: inputDemName,
+    original_file_stem: String(originalFileStem || ''),
+    processId: String(processId || ''),
+    step: 'complete_dem_analysis',
+    updated_at: new Date().toISOString(),
+  });
+
   const absFilePath = path.resolve(file.path);
 
   const child = spawn(
-    pythonPath,
+    PYTHON_BIN,
     [scriptPath, absFilePath, originalFileStem, processId],
     {
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -194,9 +237,13 @@ app.post('/process', upload.single('demFile'), (req, res) => {
   child.on('close', (code) => {
     const dt = (performance.now() - t0).toFixed(1);
     console.log(`[PY ${processId}] exited with code ${code} (server elapsed ${dt} ms)`);
+
+    if (code !== 0 && processingStatus[processId]) {
+      processingStatus[processId].status = 'failed';
+    }
   });
 
-  res.json({ message: 'Processing started', processId });
+  return res.json({ message: 'Processing started', processId });
 });
 
 // Status
@@ -243,7 +290,10 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
   // ✅ fondamentale: usa SEMPRE il processId che arriva dall’analisi, se c’è
   const processId = req.body.processId ? String(req.body.processId) : uuidv4();
 
-  let scriptPath;
+  // Derive moduleKey (used by meta.json + report title)
+  const moduleKey = deriveModuleKey(volumeType, approximationType);
+
+  let scriptPath = null;
   if (volumeType === 'circular') {
     if (approximationType === 'approximation1') {
       scriptPath = path.join(__dirname, 'scripts', 'CircularVolcano_Approx1.py');
@@ -262,10 +312,27 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
     return res.status(400).json({ error: 'Invalid volumeType or approximationType' });
   }
 
+  // Write meta.json (aligned with build_pdf_report.py expectations)
+  const procDir = path.join(outputsDir, processId);
+  const inputDemName = (file && file.originalname)
+    ? String(file.originalname)
+    : (originalFileNameRaw ? String(originalFileNameRaw) : `${processId}.tif`);
+
+  writeProcessMeta(procDir, {
+    input_dem_name: inputDemName,
+    original_file_stem: String(originalFileStem || ''),
+    processId: String(processId || ''),
+    moduleKey: String(moduleKey || ''), // IMPORTANT: build_pdf_report.py reads meta.moduleKey
+    volumeType: String(volumeType || ''),
+    approximationType: String(approximationType || ''),
+    step: 'calculate_volume',
+    updated_at: new Date().toISOString(),
+  });
+
   const absFilePath = path.resolve(file.path);
 
   const child = spawn(
-    pythonPath,
+    PYTHON_BIN,
     // keep argv schema: (path, stem) -> stem ignorabile se lo script non lo usa
     [scriptPath, absFilePath, originalFileStem],
     {
@@ -306,7 +373,7 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
       try {
         const parsed = JSON.parse(resultData);
 
-        // normalizza sempre processId + status + images.url (compat VolumeResultsViewer vecchio)
+        // normalizza sempre processId + status + images.url
         const normalized = {
           processId: parsed.processId || processId,
           status: parsed.status || 'completed',
@@ -315,7 +382,6 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
           ...parsed,
         };
 
-        // se parsed ha già result/images bene; altrimenti result diventa parsed
         if (!('result' in parsed)) normalized.result = parsed;
 
         return res.json(normalized);
@@ -324,64 +390,161 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
       }
     }
 
-    res.status(500).json({ error: 'Error calculating volume' });
+    return res.status(500).json({ error: 'Error calculating volume' });
   });
 });
 
 // ---------------------------
-// ✅ PDF Report endpoint (serve per VolumeResultsViewer vecchio)
-// GET /api/report/:processId?moduleKey=circular_approx1 (o simile)
+// ✅ PDF Report endpoint (STRICT when moduleKey is provided)
+// GET /api/report/:processId?moduleKey=circular_approx1
+//
+// Behavior:
+//  - if moduleKey provided: serve ONLY report_<moduleKey>_*.pdf (never report.pdf, never newest)
+//  - else: legacy -> report.pdf (if exists), otherwise newest pdf (optional) OR build -> report.pdf
+//  - if missing -> build with python -> then serve the best match (strict rules apply)
 // ---------------------------
 app.get('/api/report/:processId', (req, res) => {
+  const t0 = performance.now();
+
   const { processId } = req.params;
-  const moduleKey = req.query.moduleKey || req.query.module || '';
+  const moduleKey = req.query.moduleKey
+    ? String(req.query.moduleKey)
+    : (req.query.module ? String(req.query.module) : '');
 
-  const scriptPath = path.join(__dirname, 'scripts', 'build_pdf_report.py');
+  if (!processId) {
+    return res.status(400).json({ error: 'Missing processId' });
+  }
+
   const procDir = path.join(outputsDir, processId);
+  const safeModuleKey = (moduleKey || '').replace(/[^a-zA-Z0-9_-]/g, '');
 
-  // lancia python che genera il PDF dentro outputs/{processId}
-  const args = [scriptPath, processId];
-  if (moduleKey) args.push(String(moduleKey));
+  function pickReportPdfStrict() {
+    try {
+      if (!fs.existsSync(procDir)) return null;
+      const files = fs.readdirSync(procDir);
 
-  const child = spawn(pythonPath, args, {
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: buildPyEnv({
-      PROCESS_ID: processId,
-      OUTPUTS_DIR: outputsDir,
-      UPLOADS_DIR: uploadsDir,
-    }),
-  });
+      // STRICT: if moduleKey is provided, accept ONLY report_<moduleKey>_*.pdf
+      if (safeModuleKey) {
+        const pref = `report_${safeModuleKey}_`.toLowerCase();
+        const candidates = files
+          .filter((f) => f.toLowerCase().startsWith(pref) && f.toLowerCase().endsWith('.pdf'))
+          .map((f) => ({ f, p: path.join(procDir, f) }))
+          .filter((x) => fs.existsSync(x.p))
+          .sort((a, b) => fs.statSync(b.p).mtimeMs - fs.statSync(a.p).mtimeMs);
 
-  let stderr = '';
+        return candidates.length ? candidates[0].p : null;
+      }
+
+      // LEGACY: no moduleKey -> prefer report.pdf
+      const legacy = path.join(procDir, 'report.pdf');
+      if (fs.existsSync(legacy)) return legacy;
+
+      // Optional fallback (no moduleKey only): newest pdf
+      const pdfs = files
+        .filter((f) => f.toLowerCase().endsWith('.pdf'))
+        .map((f) => ({ f, p: path.join(procDir, f) }))
+        .filter((x) => fs.existsSync(x.p))
+        .sort((a, b) => fs.statSync(b.p).mtimeMs - fs.statSync(a.p).mtimeMs);
+
+      return pdfs.length ? pdfs[0].p : null;
+    } catch (e) {
+      console.warn('[WARN] Could not scan report PDFs:', e);
+      return null;
+    }
+  }
+
+  // If already exists, serve without rebuilding
+  let pdfPath = pickReportPdfStrict();
+  if (pdfPath && fs.existsSync(pdfPath)) {
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${path.basename(pdfPath)}"`);
+    return res.sendFile(pdfPath);
+  }
+
+  // Otherwise build it with python
+  const reportScriptPath = path.join(__dirname, 'scripts', 'build_pdf_report.py');
+
+  if (!fs.existsSync(reportScriptPath)) {
+    console.error(`[ERROR][SERVER] build_pdf_report.py not found at: ${reportScriptPath}`);
+    return res.status(500).json({
+      error: 'Report builder script not found',
+      expectedPath: reportScriptPath,
+      processId,
+    });
+  }
+
+  fs.mkdirSync(procDir, { recursive: true });
+
+  console.log(`[INFO][SERVER] report missing -> building (pid=${processId}, moduleKey=${safeModuleKey || 'N/A'})`);
+
+  const args = safeModuleKey
+    ? [reportScriptPath, processId, safeModuleKey]
+    : [reportScriptPath, processId];
+
+  const child = spawnPython({ processId, args });
+
+  let stderrData = '';
+  let stdoutData = '';
+
   child.stdout.on('data', (d) => {
-    const line = d.toString().trim();
-    if (line) console.log(`[PY REPORT ${processId}] ${line}`);
+    const s = d.toString();
+    stdoutData += s;
+    s.split(/\r?\n/).forEach((line) => {
+      if (line.trim()) console.log(`[PY PDF ${processId}] ${line.trim()}`);
+    });
   });
+
   child.stderr.on('data', (d) => {
-    const line = d.toString();
-    stderr += line;
-    const t = line.trim();
-    if (t) console.error(`[PY REPORT ${processId} ERR] ${t}`);
+    const s = d.toString();
+    stderrData += s;
+    s.split(/\r?\n/).forEach((line) => {
+      if (line.trim()) console.error(`[PY PDF ${processId} ERR] ${line.trim()}`);
+    });
   });
 
   child.on('close', (code) => {
+    const dt = (performance.now() - t0).toFixed(1);
+    console.log(`[TIMING][SERVER] /api/report build finished in ${dt} ms (pid=${processId}, code=${code})`);
+
     if (code !== 0) {
+      const stderrPreview = String(stderrData || '').trim().slice(0, 4000);
+      const stdoutPreview = String(stdoutData || '').trim().slice(0, 2000);
+
+      console.error(`[ERROR][SERVER] report build failed (pid=${processId}, code=${code})`);
+      if (stderrPreview) console.error(`[ERROR][SERVER] report stderr preview:\n${stderrPreview}`);
+      if (stdoutPreview) console.error(`[ERROR][SERVER] report stdout preview:\n${stdoutPreview}`);
+
       return res.status(500).json({
-        error: 'Error generating PDF report',
-        details: stderr ? String(stderr).slice(0, 2000) : `exit code ${code}`,
+        error: 'Failed to build report',
+        processId,
+        code,
+        stderr: stderrPreview || null,
+        stdout: stdoutPreview || null,
       });
     }
 
-    const pdfPath = pickPdfPath(procDir, moduleKey);
-    if (!pdfPath) {
-      return res.status(404).json({ error: 'PDF not found after generation' });
+    // Re-pick after build (STRICT rules apply)
+    pdfPath = pickReportPdfStrict();
+
+    if (!pdfPath || !fs.existsSync(pdfPath)) {
+      // If moduleKey was requested, be explicit: you asked for X but it doesn't exist
+      if (safeModuleKey) {
+        return res.status(404).json({
+          error: 'Module-specific PDF not found after generation',
+          processId,
+          moduleKey: safeModuleKey,
+          hint: `Expected a file starting with report_${safeModuleKey}_ in ${procDir}`,
+        });
+      }
+
+      return res.status(404).json({
+        error: 'PDF not found after generation',
+        processId,
+      });
     }
 
-    const filename = path.basename(pdfPath);
     res.setHeader('Content-Type', 'application/pdf');
-    // inline così si apre in tab; download se preferisci: attachment
-    res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
-
+    res.setHeader('Content-Disposition', `inline; filename="${path.basename(pdfPath)}"`);
     return res.sendFile(pdfPath);
   });
 });
@@ -396,9 +559,9 @@ app.post('/shadedRelief', upload.single('demFile'), (req, res) => {
   const scriptPath = path.join(__dirname, 'scripts', 'generate_shaded_relief.py');
   const absFilePath = path.resolve(file.path);
 
-  const child = spawn(pythonPath, [scriptPath, absFilePath], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: buildPyEnv({ OUTPUTS_DIR: outputsDir, UPLOADS_DIR: uploadsDir }),
+  const child = spawnPython({
+    processId: uuidv4(),
+    args: [scriptPath, absFilePath],
   });
 
   child.on('close', (code) => {
@@ -406,7 +569,7 @@ app.post('/shadedRelief', upload.single('demFile'), (req, res) => {
       fs.appendFile('error_log.txt', `Errore Shaded Relief. Exit: ${code}\n`, () => {});
       return res.status(500).json({ error: 'Errore durante la generazione dello Shaded Relief.' });
     }
-    res.json({ message: 'Shaded Relief generated successfully' });
+    return res.json({ message: 'Shaded Relief generated successfully' });
   });
 });
 
@@ -420,9 +583,9 @@ app.post('/calculateSlopes', upload.single('demFile'), (req, res) => {
   const scriptPath = path.join(__dirname, 'scripts', 'generate_slopes.py');
   const absFilePath = path.resolve(file.path);
 
-  const child = spawn(pythonPath, [scriptPath, absFilePath], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: buildPyEnv({ OUTPUTS_DIR: outputsDir, UPLOADS_DIR: uploadsDir }),
+  const child = spawnPython({
+    processId: uuidv4(),
+    args: [scriptPath, absFilePath],
   });
 
   child.on('close', (code) => {
@@ -430,7 +593,7 @@ app.post('/calculateSlopes', upload.single('demFile'), (req, res) => {
       fs.appendFile('error_log.txt', `Errore slopes. Exit: ${code}\n`, () => {});
       return res.status(500).json({ error: 'Errore durante la generazione delle due pendenze.' });
     }
-    res.json({ message: 'Slope calculation successful' });
+    return res.json({ message: 'Slope calculation successful' });
   });
 });
 
@@ -444,9 +607,9 @@ app.post('/calculateCurvatures', upload.single('demFile'), (req, res) => {
   const scriptPath = path.join(__dirname, 'scripts', 'calculate_curvatures.py');
   const absFilePath = path.resolve(file.path);
 
-  const child = spawn(pythonPath, [scriptPath, absFilePath], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: buildPyEnv({ OUTPUTS_DIR: outputsDir, UPLOADS_DIR: uploadsDir }),
+  const child = spawnPython({
+    processId: uuidv4(),
+    args: [scriptPath, absFilePath],
   });
 
   child.on('close', (code) => {
@@ -454,12 +617,12 @@ app.post('/calculateCurvatures', upload.single('demFile'), (req, res) => {
       fs.appendFile('error_log.txt', `Errore curvature. Exit: ${code}\n`, () => {});
       return res.status(500).json({ error: 'Errore durante la generazione delle curvature.' });
     }
-    res.json({ message: 'Curvature calcolate con successo' });
+    return res.json({ message: 'Curvature calcolate con successo' });
   });
 });
 
 // ---------------------------
-// Serve React build (Docker prod)
+// Serve React build (Docker prod) — aligned SPA fallback with exclusions
 // ---------------------------
 const frontendBuildDir = process.env.FRONTEND_BUILD_DIR
   ? path.resolve(process.env.FRONTEND_BUILD_DIR)
@@ -468,9 +631,24 @@ const frontendBuildDir = process.env.FRONTEND_BUILD_DIR
 if (frontendBuildDir && fs.existsSync(frontendBuildDir)) {
   app.use(express.static(frontendBuildDir));
 
-  // Catch-all -> index.html (for React Router or deep links)
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(frontendBuildDir, 'index.html'));
+  // Fallback SPA: qualsiasi rotta non-API torna index.html
+  app.get('*', (req, res, next) => {
+    if (
+      req.path.startsWith('/outputs') ||
+      req.path.startsWith('/process') ||
+      req.path.startsWith('/calculateVolume') ||
+      req.path.startsWith('/processStatus') ||
+      req.path.startsWith('/processComplete') ||
+      req.path.startsWith('/shadedRelief') ||
+      req.path.startsWith('/calculateSlopes') ||
+      req.path.startsWith('/calculateCurvatures') ||
+      req.path.startsWith('/analysis') ||
+      req.path.startsWith('/api/report') ||
+      req.path.startsWith('/health')
+    ) {
+      return next(); // <-- CHIAVE: non far mangiare queste rotte dalla SPA
+    }
+    return res.sendFile(path.join(frontendBuildDir, 'index.html'));
   });
 
   console.log('[SERVER] serving frontend build from:', frontendBuildDir);
@@ -480,4 +658,7 @@ if (frontendBuildDir && fs.existsSync(frontendBuildDir)) {
 
 app.listen(PORT, () => {
   console.log(`[SERVER] listening on http://localhost:${PORT}`);
+  console.log(`[SERVER] PYTHON_BIN=${PYTHON_BIN}`);
+  console.log(`[SERVER] UPLOADS_DIR=${uploadsDir}`);
+  console.log(`[SERVER] OUTPUTS_DIR=${outputsDir}`);
 });

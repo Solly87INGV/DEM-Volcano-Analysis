@@ -8,7 +8,7 @@ from reportlab.platypus import (
 )
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_JUSTIFY  # Importa l'enum per la giustificazione
+from reportlab.lib.enums import TA_JUSTIFY
 
 
 class ImageWithText(Flowable):
@@ -43,12 +43,22 @@ class ImageWithText(Flowable):
         self.canv.drawString(self.x, self.y, self.text)
 
 
+def _find_first_existing(paths):
+    for p in paths:
+        if p and os.path.exists(p):
+            return os.path.normpath(p)
+    return None
+
+
 def generate_pdf(file_path, results_list, title="Calculation Results",
                  image_paths=None, captions=None):
     """
     Genera un PDF con un'immagine di intestazione, un logo, una tabella di risultati,
     descrizioni dettagliate e (opzionale) un blocco di figure alla fine inserite
     una dopo l'altra (senza page break forzati).
+
+    IMPORTANT (Docker-safe):
+    - If header images are missing, DO NOT crash: fallback to a text header.
     """
     try:
         # Font sizes
@@ -59,21 +69,21 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
         HEADER_TITLE_FONT_SIZE = 10
 
         # Padding attorno alle immagini (in punti)
-        IMG_HPAD = 14           # padding orizzontale standard (doppiette)
-        IMG_HPAD_DEM = 22       # padding orizzontale extra per il DEM singolo
-        IMG_VPAD = 6            # padding verticale
+        IMG_HPAD = 14
+        IMG_HPAD_DEM = 22
+        IMG_VPAD = 6
 
-        # Fattori di larghezza (percentuale della larghezza utile del frame)
-        TARGET_W_ALL = 0.88     # doppiette
-        TARGET_W_DEM = 0.88     # DEM leggermente più stretto per compensare la colorbar nel PNG
+        # Fattori di larghezza
+        TARGET_W_ALL = 0.88
+        TARGET_W_DEM = 0.88
 
-        # Correzione visiva DEM: spazio vuoto a destra per "compensare" la colorbar
-        DEM_RIGHT_SPACER = 200  # punti
+        # Correzione visiva DEM
+        DEM_RIGHT_SPACER = 200
 
-        # Tripleta (3 pannelli) - SOLO per i file che contengono "triplet"
+        # Tripleta
         TARGET_W_TRIPLET = 1.00
         TRIPLET_HPAD     = 0
-        TRIPLET_MAX_HFR  = None   # nessun cap in altezza per le triplette
+        TRIPLET_MAX_HFR  = None
 
         # Documento
         doc = SimpleDocTemplate(
@@ -134,52 +144,73 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
             alignment=TA_JUSTIFY
         ))
 
-        # Percorsi immagini header
+        # ==========================
+        # HEADER (docker-safe)
+        # ==========================
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        header_image_path = os.path.join(script_dir, '..', '..', 'frontend', 'public', 'images', 'ingv_Etna.jpg')
-        logo_image_path = os.path.join(script_dir, '..', '..', 'frontend', 'public', 'images', 'logo-ingv.jpeg')
 
-        header_image_path = os.path.normpath(header_image_path)
-        logo_image_path = os.path.normpath(logo_image_path)
+        # Candidate directories where frontend/public/images might be found
+        candidates_dirs = [
+            os.path.normpath(os.path.join(script_dir, '..', '..', 'frontend', 'public', 'images')),  # repo layout
+            os.path.normpath(os.path.join(script_dir, '..', 'frontend', 'public', 'images')),
+            os.path.normpath('/app/frontend/public/images'),  # common docker layout
+            os.path.normpath('/frontend/public/images'),
+        ]
 
-        if not os.path.exists(header_image_path):
-            raise FileNotFoundError(f"Immagine di intestazione non trovata nel percorso: {header_image_path}")
-        if not os.path.exists(logo_image_path):
-            raise FileNotFoundError(f"Logo non trovato nel percorso: {logo_image_path}")
+        # Candidate paths for Etna header image
+        header_candidates = []
+        for d in candidates_dirs:
+            header_candidates.append(os.path.join(d, 'ingv_Etna.jpg'))
+            header_candidates.append(os.path.join(d, 'ingv_Etna.jpeg'))
+            header_candidates.append(os.path.join(d, 'ingv_Etna.png'))
 
-        # Logo + header image
-        logo = Image(logo_image_path)
-        logo_width = 80
-        logo_height = 80
-        logo.drawWidth = logo_width
-        logo.drawHeight = logo_height
+        # Candidate paths for logo
+        logo_candidates = []
+        for d in candidates_dirs:
+            logo_candidates.append(os.path.join(d, 'logo-ingv.jpg'))
+            logo_candidates.append(os.path.join(d, 'logo-ingv.jpeg'))
+            logo_candidates.append(os.path.join(d, 'logo-ingv.png'))
+
+        header_image_path = _find_first_existing(header_candidates)
+        logo_image_path = _find_first_existing(logo_candidates)
 
         header_title_text = "Interface for DEM processing"
-        etna_with_text = ImageWithText(
-            image_path=header_image_path,
-            text=header_title_text,
-            font_size=HEADER_TITLE_FONT_SIZE,
-            text_color=colors.white,
-            x=10,
-            y=10,
-            width=400,
-            height=100
-        )
 
-        header_table = Table([
-            [logo, etna_with_text]
-        ], colWidths=[logo_width + 20, 400 + 20])
+        # If both images exist, use the old header.
+        # Otherwise, do NOT crash: use a simple text header.
+        if header_image_path and logo_image_path:
+            logo = Image(logo_image_path)
+            logo_width = 80
+            logo_height = 80
+            logo.drawWidth = logo_width
+            logo.drawHeight = logo_height
 
-        header_table.setStyle(TableStyle([
-            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-            ('LEFTPADDING', (0, 0), (-1, -1), 10),
-            ('RIGHTPADDING', (0, 0), (-1, -1), 10),
-            ('TOPPADDING', (0, 0), (-1, -1), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
-        ]))
+            etna_with_text = ImageWithText(
+                image_path=header_image_path,
+                text=header_title_text,
+                font_size=HEADER_TITLE_FONT_SIZE,
+                text_color=colors.white,
+                x=10,
+                y=10,
+                width=400,
+                height=100
+            )
 
-        elements.append(header_table)
-        elements.append(Spacer(1, 12))
+            header_table = Table([[logo, etna_with_text]], colWidths=[logo_width + 20, 400 + 20])
+            header_table.setStyle(TableStyle([
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('LEFTPADDING', (0, 0), (-1, -1), 10),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 10),
+                ('TOPPADDING', (0, 0), (-1, -1), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+            ]))
+
+            elements.append(header_table)
+            elements.append(Spacer(1, 12))
+        else:
+            # Fallback header (no images available in container)
+            elements.append(Paragraph(header_title_text, styles['TitleSmall']))
+            elements.append(Spacer(1, 6))
 
         # Titolo
         elements.append(Paragraph(title, styles['TitleSmall']))
@@ -208,103 +239,69 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
         table.setStyle(style)
         elements.append(table)
 
-        # Recupera spazio per far stare 1+2 nella prima pagina
-        elements.append(Spacer(1, 12))  # (era 36)
+        elements.append(Spacer(1, 12))
 
-        # ====== DESCRIZIONI DETTAGLIATE (UPDATED, COERENTI CON I NUOVI SVILUPPI) ======
+        # ====== DESCRIZIONI DETTAGLIATE ======
         descriptions = [
             {
                 'title': '1. Base Area of the Volcano',
-                'description': (
-                    "The base area represents the planimetric surface enclosed by the volcano base contour, "
-                    "and provides a primary measure of the edifice footprint."
-                ),
+                'description': 'The base area of the volcano represents the total surface area bounded by the contour of the volcano\'s base. It is an essential measure for understanding the size and extent of the volcanic structure.',
                 'method': [
-                    "Identification of the Base Contour: the base contour is extracted at a threshold elevation "
-                    "defined as a fixed ratio (e.g., 5%) between the minimum and maximum DEM elevations.",
-                    "Area Calculation: the contour polygon is converted to map coordinates using the raster affine transform; "
-                    "the area is computed with the shoelace formula (m²) and then reported in km²."
+                    'Identification of the Base Contour: The base contour of the volcano is defined by identifying areas at a specific elevation, calculated as a fraction (e.g., 5%) between the minimum and maximum elevations of the Digital Elevation Model (DEM).',
+                    'Area Calculation: Using Gauss\'s formula, the area of the polygon defined by the base contour is calculated without approximations. The obtained value in pixels is then converted to square kilometers (km²) considering the pixel size in the DEM.'
                 ]
             },
             {
                 'title': '2. Base Width (Distance between Opposite Points of the Base)',
-                'description': (
-                    "The base width is measured as the distance between two opposite points on the base contour, "
-                    "providing a representative span of the edifice footprint."
-                ),
+                'description': 'The base width is the distance measured between two opposite points along the contour of the volcano\'s base. This measure provides an indication of the volcano\'s extended size in a specific direction.',
                 'method': [
-                    "Identification of Opposite Points: after defining the base contour, two opposite points are selected "
-                    "automatically along the contour geometry.",
-                    "Distance Calculation: pixel coordinates are converted to map coordinates via the affine transform and "
-                    "the Euclidean distance is computed in meters, then reported in kilometers (km)."
+                    'Identification of Opposite Points: After defining the base contour, two opposite points on the contour are automatically identified. These points are selected considering the contour\'s geometry to ensure an accurate representation of the width.',
+                    'Distance Calculation: The Euclidean distance between these two opposite points is calculated and converted from pixels to kilometers using the DEM scale.'
                 ]
             },
             {
                 'title': '3. Caldera Area of the Volcano',
-                'description': (
-                    "The caldera area represents the planimetric surface enclosed by the caldera contour, intended to describe "
-                    "the extent of the summit depression/feature."
-                ),
+                'description': 'The caldera area represents the surface bounded by the caldera contour, which is a typical depression present in the structure of many volcanoes.',
                 'method': [
-                    "Identification of the Caldera Contour: the caldera contour is extracted at a high-elevation level "
-                    "(e.g., 80% of the DEM maximum elevation).",
-                    "Area Calculation: as for the base, the contour is converted to map coordinates and its area is computed "
-                    "with the shoelace formula (m²), then reported in km²."
+                    'Identification of the Caldera Contour: The caldera contour is determined based on slope variation. A specific elevation level (e.g., 80% of the DEM\'s maximum elevation) is identified to trace the caldera\'s contour.',
+                    'Area Calculation: Similar to the base area calculation, Gauss\'s formula is applied to determine the area of the polygon defined by the caldera contour, converting the final result to square kilometers (km²).'
                 ]
             },
             {
                 'title': '4. Caldera Width (Distance between Opposite Points of the Caldera)',
-                'description': (
-                    "The caldera width is the distance between two opposite points along the caldera contour, providing a "
-                    "representative span of the summit feature."
-                ),
+                'description': 'The caldera width is the distance measured between two opposite points along the caldera\'s contour. This measure provides information about the central depression\'s dimensions of the volcano.',
                 'method': [
-                    "Identification of Opposite Points on the Caldera: a slope map derived from the DEM is used to identify a "
-                    "maximum-slope point along the caldera contour; the opposite point is then selected approximately halfway "
-                    "around the contour.",
-                    "Distance Calculation: the span is computed in map units using the affine transform (meters) and reported in km."
+                    'Identification of Opposite Points on the Caldera: Using the slope map derived from the DEM, points with the highest slopes on the caldera are identified. Subsequently, points opposite to these maximum slope points along the caldera contour are selected.',
+                    'Distance Calculation: The Euclidean distance between these two opposite points is calculated and converted from pixels to kilometers based on the DEM scale.'
                 ]
             },
             {
                 'title': '5. Total Volume of the Volcanic Edifice',
-                'description': (
-                    "The total edifice volume is estimated using a frustum-like model based on base and caldera spans "
-                    "and a robust DEM-derived height."
-                ),
+                'description': 'The total volume of the volcanic edifice represents the overall amount of material that constitutes the entire volcano structure, excluding the caldera. It is a crucial measure for assessing the volcano\'s immense mass.',
                 'method': [
-                    "Height Estimation: the edifice height is estimated robustly as P99–P05 of DEM elevations (typically within the "
-                    "base mask; fallback to valid DEM values if needed).",
-                    "Approximation Model (frustum-like): base and caldera radii are defined as R_base = D_base/2 and R_caldera = D_caldera/2; "
-                    "volume is computed as V = (π·h/3)·(R_base² + R_caldera² + R_base·R_caldera).",
-                    "Volume Conversion: the resulting volume is computed in m³ and reported in cubic kilometers (km³)."
+                    'Approximation Models: Two models have been developed to calculate the volume:',
+                    '1. Circular Truncated Cone: It is assumed that the volcano has a base and caldera of approximately circular shape. A truncated cone is used to approximate the volcano\'s shape, calculating the base radius (r2) and caldera radius (r1) from the distance between opposite points.',
+                    '2. Elliptical Truncated Cone: If the base and caldera have elongated (elliptical) shapes, the volcano is approximated with a truncated cone with elliptical bases, directly using the areas of the bases without calculating the semi-axes.',
+                    'Volume Conversion: The obtained volume is converted to cubic kilometers (km³).'
                 ]
             },
             {
                 'title': '6. Caldera Volume',
-                'description': (
-                    "The caldera volume represents the void associated with the summit depression and is treated as a mass-less "
-                    "portion when computing the effective edifice volume."
-                ),
+                'description': 'The caldera volume represents the space occupied by the volcano\'s central depression. This volume is considered as a "mass-less" portion in the total volcanic edifice.',
                 'method': [
-                    "Rim→DEM depth integration (DEM-based): a reference rim elevation is estimated from robust percentiles sampled around "
-                    "the caldera boundary (outer ring, with contour fallback if needed). The void volume is then computed by integrating "
-                    "over caldera pixels the positive depth (z_rim − z) multiplied by the pixel area.",
-                    "Quality control: if the caldera is classified as complex/non-depressive (e.g., rim below floor), the caldera volume "
-                    "may be reported as N/A according to the module output.",
-                    "Volume Conversion: the computed volume is in m³ and reported in km³."
+                    'Caldera Approximation Models: Two approaches are used to approximate the caldera volume:',
+                    '1. Semi-sphere or Cylinder: The caldera can be approximated as a semi-sphere or a cylinder, with the height (depth) set equal to the radius.',
+                    '2. Semi-ellipsoid of Rotation or Cylinder with Elliptical Bases: For calderas with more elongated shapes, an ellipsoidal or cylindrical model with elliptical bases is used. In this case, the semi-axes are not calculated, but the areas are directly used.',
+                    'Volume Conversion: The calculated volume is converted to cubic kilometers (km³).'
                 ]
             },
             {
                 'title': '7. Effective Volume of the Volcanic Edifice',
-                'description': (
-                    "The effective volume represents the amount of volcanic material after removing the caldera void, computed as the "
-                    "difference between total edifice volume and caldera volume."
-                ),
+                'description': 'The effective volume represents the actual amount of material that constitutes the volcanic edifice, obtained by subtracting the caldera volume from the total volcanic edifice volume. This value provides a more accurate estimate of the volcano\'s actual mass.',
                 'method': [
-                    "Where:",
-                    "- V_total is the total edifice volume estimated with the frustum-like model.",
-                    "- V_caldera is the caldera void volume estimated by the selected caldera method.",
-                    "Effective volume is computed as V_effective = V_total − V_caldera (consistent metric units)."
+                    'Where:',
+                    '- V_total is the total volume calculated using the truncated cone model.',
+                    '- V_caldera is the caldera volume calculated using one of the aforementioned approximation models.'
                 ]
             }
         ]
@@ -319,10 +316,19 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
 
             for method in item['method']:
                 if isinstance(method, str):
-                    if method.strip() and method.strip()[0].isdigit():
-                        block.append(Paragraph(method, styles['MethodBody']))
+                    m = method.strip()
+                    if not m:
+                        continue
+
+                    # Se la riga è già bullet "- ..." non aggiungere un altro "-"
+                    if m.startswith("-"):
+                        block.append(Paragraph(m, styles['MethodBody']))
                     else:
-                        block.append(Paragraph(f"- {method}", styles['MethodBody']))
+                        # lascia numerazioni "1." / "2." come sono, senza doppio "- -"
+                        if m[0].isdigit() and len(m) > 1 and m[1] == '.':
+                            block.append(Paragraph(m, styles['MethodBody']))
+                        else:
+                            block.append(Paragraph(f"- {m}", styles['MethodBody']))
 
             block.append(Spacer(1, 12))
             section_blocks.append(block)
@@ -340,16 +346,15 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
         if len(section_blocks) >= 3:
             elements.append(PageBreak())
 
-        # ---------- Dalla Sezione 3 in poi normalmente (ogni sezione come blocco unico) ----------
+        # ---------- Dalla Sezione 3 in poi normalmente ----------
         for blk in section_blocks[2:]:
-            elements.append(KeepTogether(blk))  # ⬅️ FIX: non appendere la lista pura!
+            elements.append(KeepTogether(blk))
 
-        # ====== BLOCCHI FIGURE (una dopo l'altra, senza PageBreak forzati) ======
+        # ====== BLOCCHI FIGURE ======
         if image_paths:
             if captions is None or len(captions) != len(image_paths):
                 captions = [None] * len(image_paths)
 
-            # Altezza max standard (solo per NON triplette)
             max_h_fraction = 0.34
 
             for img_path, cap in zip(image_paths, captions):
@@ -359,12 +364,10 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
                 img = Image(img_path)
                 base = os.path.basename(img_path).lower()
 
-                # Classificazioni
-                is_dem            = ('dem_overview' in base)    # DEM standalone
-                is_triplet        = ('triplet' in base)         # TRIPLETTE
+                is_dem            = ('dem_overview' in base)
+                is_triplet        = ('triplet' in base)
                 is_final_doublet  = base.startswith('final_doublet_') or ('final_doublet' in base)
 
-                # Larghezza target
                 if is_dem:
                     target_w_factor = TARGET_W_DEM
                 elif is_triplet:
@@ -376,31 +379,24 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
                 img.drawWidth = target_w
                 img.drawHeight = img.imageHeight * (img.drawWidth / float(img.imageWidth))
 
-                # Cap in altezza:
-                # - triplette: disattivato
-                # - doppiette/DEM: applicato
                 if (not is_triplet) and (max_h_fraction is not None):
                     max_draw_h = doc.height * max_h_fraction
 
                     if is_final_doublet:
-                        # Forza SEMPRE la doppietta finale a questa altezza per uniformità
                         if img.drawHeight > 0:
                             scale = max_draw_h / float(img.drawHeight)
                             img.drawWidth *= scale
                             img.drawHeight = max_draw_h
                     else:
-                        # comportamento standard per tutte le altre immagini
                         if img.drawHeight > max_draw_h:
                             scale = max_draw_h / float(img.drawHeight)
                             img.drawWidth *= scale
                             img.drawHeight *= scale
-                            target_w = img.drawWidth  # aggiorna se scalato
+                            target_w = img.drawWidth
 
-                # Spazio prima dell'immagine
                 elements.append(Spacer(1, 12))
 
                 if is_dem:
-                    # ---------- DEM standalone: "shift" visivo a sinistra ----------
                     dem_inner = Table(
                         [[img]],
                         colWidths=[doc.width - DEM_RIGHT_SPACER],
@@ -425,11 +421,9 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
                     elements.append(dem_wrapper)
 
                 elif is_triplet:
-                    # ---------- TRIPLETTE: niente Table → vera larghezza piena ----------
                     elements.append(img)
 
                 else:
-                    # ---------- Doppiette (incl. doppietta finale): centratura "pulita" ----------
                     img_container = Table(
                         [[img]],
                         colWidths=[doc.width],
@@ -445,15 +439,13 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
                     )
                     elements.append(img_container)
 
-                # didascalia (opzionale)
                 if cap:
                     elements.append(Spacer(1, 6))
                     elements.append(Paragraph(cap, styles['DescriptionBody']))
 
-            # piccolo spazio finale
             elements.append(Spacer(1, 18))
 
-        # Build
         doc.build(elements)
+
     except Exception as e:
         raise e

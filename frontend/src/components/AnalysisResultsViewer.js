@@ -256,21 +256,77 @@ export default function AnalysisResultsViewer({
         </Typography>
       </Box>
 
-      <Box sx={{ display: "flex", justifyContent: "flex-end", gap: 1, flexWrap: "wrap", mb: 2, alignItems: "center" }}>
-        {onBack ? (
-          <Button variant="outlined" onClick={onBack}>
-            Back
-          </Button>
-        ) : null}
+      {/* ✅ Top controls: Back/Continue allineati a Prev/Next, stesso "motivo" ma blu */}
+      <Box
+        sx={{
+          display: "flex",
+          justifyContent: "space-between",
+          gap: 1,
+          flexWrap: "wrap",
+          mb: 2,
+          alignItems: "center",
+        }}
+      >
+        <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
+          {onBack ? (
+            <Button
+              variant="outlined"
+              color="primary"
+              onClick={onBack}
+              sx={{
+                textTransform: "none",
+                borderWidth: 2,
+                "&:hover": { borderWidth: 2 },
+              }}
+            >
+              Back to upload
+            </Button>
+          ) : null}
 
-        {onContinue ? (
-          <Button variant="contained" onClick={onContinue} disabled={!canContinue}>
-            Continue
-          </Button>
-        ) : null}
+          {onContinue ? (
+            <Button
+              variant="outlined"
+              color="primary"
+              onClick={onContinue}
+              disabled={!canContinue}
+              sx={{
+                textTransform: "none",
+                borderWidth: 2,
+                "&:hover": { borderWidth: 2 },
+              }}
+            >
+              Continue
+            </Button>
+          ) : null}
+        </Box>
 
-        <Box sx={{ width: 28, height: 28, display: "flex", alignItems: "center", justifyContent: "center" }}>
-          {loading ? <CircularProgress size={20} /> : null}
+        <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
+          <Button
+            variant="outlined"
+            color="primary"
+            onClick={() => setSlideIdx((i) => Math.max(0, i - 1))}
+            disabled={prevDisabled}
+            sx={{ textTransform: "none", borderWidth: 2, "&:hover": { borderWidth: 2 } }}
+          >
+            Prev
+          </Button>
+          <Button
+            variant="outlined"
+            color="primary"
+            onClick={() => setSlideIdx((i) => Math.min(slides.length - 1, i + 1))}
+            disabled={nextDisabled}
+            sx={{ textTransform: "none", borderWidth: 2, "&:hover": { borderWidth: 2 } }}
+          >
+            Next
+          </Button>
+
+          <Typography variant="body2" sx={{ opacity: 0.7 }}>
+            {slides.length === 0 ? "0/0" : `${slideIdx + 1}/${slides.length}`}
+          </Typography>
+
+          <Box sx={{ width: 28, height: 28, display: "flex", alignItems: "center", justifyContent: "center" }}>
+            {loading ? <CircularProgress size={20} /> : null}
+          </Box>
         </Box>
       </Box>
 
@@ -286,18 +342,6 @@ export default function AnalysisResultsViewer({
             <Typography variant="subtitle2">
               {current.type === "overview" ? "Overview" : "Double panels"}
             </Typography>
-
-            <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
-              <Button variant="outlined" onClick={() => setSlideIdx((i) => Math.max(0, i - 1))} disabled={prevDisabled}>
-                Prev
-              </Button>
-              <Button variant="outlined" onClick={() => setSlideIdx((i) => Math.min(slides.length - 1, i + 1))} disabled={nextDisabled}>
-                Next
-              </Button>
-              <Typography variant="body2" sx={{ opacity: 0.7 }}>
-                {slides.length === 0 ? "0/0" : `${slideIdx + 1}/${slides.length}`}
-              </Typography>
-            </Box>
           </Box>
 
           {renderCurrentSlide()}
