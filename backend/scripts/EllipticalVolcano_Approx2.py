@@ -12,6 +12,17 @@
 #     * final_doublet_base_vs_caldera.png
 # - volume_results.json -> images contiene SOLO la final doublet (UI mostra la doppietta)
 #
+# ✅ CHANGE (requested, like Circular/Elliptical Approx1 “fixed”):
+# - Caldera rim detection is now ROI + slope + morphology (center-biased)
+#   to avoid grabbing the external flank ring when the level-based contour fails.
+# - VOLUME LOGICS REMAIN UNCHANGED.
+#
+# ✅ PATCH (ported from Elliptical Approx1 “fixed”):
+# - Improve rim component selection to avoid grabbing an outer flank ring:
+#   * build an "inner ROI" (eroded ROI)
+#   * prefer candidate component with smaller mean/p90 radius from center (peak-in-ROI)
+#   * optional bonus using inner ROI overlap
+#
 # GUI:
 # - mantiene UI e PDF, ma solo se NON headless
 
@@ -77,7 +88,15 @@ if HEADLESS:
     os.environ.setdefault("MPLBACKEND", "Agg")
 
 import rasterio
-from scipy.ndimage import sobel
+from scipy.ndimage import (
+    sobel,
+    gaussian_filter,
+    binary_dilation,
+    binary_closing,
+    binary_fill_holes,
+    binary_erosion,   # ✅ PATCH
+    label,
+)
 from skimage import measure
 
 # ---- PyQt5: import SOLO se NON headless ----
@@ -195,7 +214,12 @@ def _public_path(process_id: str, filename: str) -> str:
 # ------------------------------------------------------------
 # dem_working selector (come vuoi tu: non usare originale se manca)
 # ------------------------------------------------------------
-def _choose_working_dem(process_id: str) -> str | None:
+def _choose_working_dem(process_id: str):
+    """
+    Returns:
+      - path to dem_working.tif, or None if not found.
+    NOTE: no Python 3.10 union type here (compat with py<3.10).
+    """
     base_outputs = _outputs_base_dir()
     pid = os.environ.get("PROCESS_ID") or process_id
 
@@ -220,7 +244,7 @@ def _choose_working_dem(process_id: str) -> str | None:
 
     return None
 
-# ========== Analysis (invariato) ==========
+# ========== Analysis (EDIFICE invariato) ==========
 
 def find_lowest_base_contour(matrix, base_elevation_ratio=0.05):
     base_level = matrix.min() + (matrix.max() - matrix.min()) * base_elevation_ratio
@@ -267,13 +291,6 @@ def calculate_slope(matrix):
     dy = sobel(matrix, axis=0)
     return np.hypot(dx, dy)
 
-def find_caldera_contour(matrix, level_ratio=0.8):
-    contour_level = matrix.max() * level_ratio
-    contours = measure.find_contours(matrix, contour_level)
-    if len(contours) == 0:
-        raise ValueError("No contours found for the given level ratio.")
-    return max(contours, key=len)
-
 def find_opposite_slope_points(slope_matrix, contour):
     contour = np.round(contour).astype(int)
     contour = contour[
@@ -289,16 +306,7 @@ def find_opposite_slope_points(slope_matrix, contour):
     max_slope_index2 = tuple(contour[opposite_index])
     return max_slope_index1, max_slope_index2
 
-# ========== Caldera depth helpers (rim–floor from DEM) ==========
-
-def pixel_area_m2_from_transform(transform):
-    try:
-        return float(abs(transform.a * transform.e - transform.b * transform.d))
-    except Exception:
-        try:
-            return float(abs(transform.a * transform.e))
-        except Exception:
-            return 0.0
+# ========== Mask helpers (also used by caldera depth) ==========
 
 def contour_to_mask(contour, shape):
     from skimage.draw import polygon
@@ -314,8 +322,248 @@ def contour_to_mask(contour, shape):
     mask[pr, pc] = True
     return mask
 
+def _centroid_of_mask(mask: np.ndarray):
+    rr, cc = np.nonzero(mask)
+    if rr.size == 0:
+        return None
+    return (float(np.mean(rr)), float(np.mean(cc)))
+
+def _peak_in_roi(dem: np.ndarray, roi: np.ndarray):
+    """
+    Center estimator used for center-biased selection:
+    pick maximum elevation inside ROI; fallback to ROI centroid.
+    """
+    try:
+        vals = np.where(roi, dem.astype(float), -np.inf)
+        if not np.isfinite(vals).any():
+            return _centroid_of_mask(roi)
+        idx = int(np.nanargmax(vals))
+        r, c = np.unravel_index(idx, dem.shape)
+        return (float(r), float(c))
+    except Exception:
+        return _centroid_of_mask(roi)
+
+# ========== ✅ Caldera rim detection (robust: ROI+slope+morphology) ==========
+
+def find_caldera_contour_morphological(
+    dem: np.ndarray,
+    base_contour: np.ndarray,
+    slope: np.ndarray = None,
+    nodata=None,
+    roi_dilate_px: int = 6,
+    smooth_sigma: float = 1.0,
+    slope_q: float = 88.0,
+    min_component_px: int = 500,
+    closing_iterations: int = 2,
+    extra_dilate_px: int = 0,
+    selection_mode: str = "center_biased",
+    max_area_frac: float = 0.45,
+) -> tuple:
+    """
+    Detect caldera rim as a slope-defined ring inside an ROI derived from base contour.
+    Returns: (caldera_contour, debug_dict)
+    """
+    if dem is None or dem.size == 0:
+        raise ValueError("DEM is empty. Cannot detect caldera rim.")
+    if base_contour is None or len(base_contour) < 3:
+        raise ValueError("Base contour missing/too small. Cannot detect caldera rim.")
+
+    demf = dem.astype(float)
+
+    valid = np.isfinite(demf)
+    if nodata is not None:
+        try:
+            valid = valid & (demf != float(nodata))
+        except Exception:
+            pass
+
+    roi = contour_to_mask(base_contour, demf.shape)
+    roi_dilate_px = int(max(0, roi_dilate_px))
+    if roi_dilate_px > 0:
+        roi = binary_dilation(roi, iterations=roi_dilate_px)
+    roi = roi & valid
+
+    roi_px = int(np.sum(roi))
+    if roi_px < max(50, int(min_component_px * 0.5)):
+        raise ValueError(f"ROI too small after dilation/valid masking (roi_px={roi_px}).")
+
+    # ✅ PATCH: inner ROI (eroded) for overlap scoring
+    inner_buffer_px = 12  # tune 10-20 if needed
+    try:
+        roi_inner = binary_erosion(roi, iterations=int(inner_buffer_px)) if inner_buffer_px > 0 else roi
+        if int(np.sum(roi_inner)) < 100:
+            roi_inner = roi
+    except Exception:
+        roi_inner = roi
+
+    if slope is None:
+        slope = calculate_slope(demf)
+
+    slopef = slope.astype(float)
+    if smooth_sigma is not None and float(smooth_sigma) > 0:
+        slopef = gaussian_filter(slopef, sigma=float(smooth_sigma))
+
+    roi_slopes = slopef[roi]
+    roi_slopes = roi_slopes[np.isfinite(roi_slopes)]
+    if roi_slopes.size == 0:
+        raise ValueError("No finite slope values inside ROI.")
+
+    thr = float(np.percentile(roi_slopes, float(slope_q)))
+    candidates = (slopef >= thr) & roi
+
+    closing_iterations = int(max(0, closing_iterations))
+    if closing_iterations > 0:
+        candidates = binary_closing(candidates, iterations=closing_iterations)
+
+    candidates = binary_fill_holes(candidates)
+
+    extra_dilate_px = int(max(0, extra_dilate_px))
+    if extra_dilate_px > 0:
+        candidates = binary_dilation(candidates, iterations=extra_dilate_px)
+
+    candidates = candidates & roi
+
+    cand_px = int(np.sum(candidates))
+    if cand_px == 0:
+        raise ValueError("Candidate rim mask is empty after morphological steps.")
+
+    lbl, ncomp = label(candidates)
+    if ncomp <= 0:
+        raise ValueError("No connected components found in candidate mask.")
+
+    sizes = []
+    comp_ids = list(range(1, ncomp + 1))
+    for cid in comp_ids:
+        sizes.append(int(np.sum(lbl == cid)))
+
+    min_component_px = int(max(1, min_component_px))
+    eligible = []
+    max_area_frac = float(max_area_frac)
+    max_area_px = int(max_area_frac * roi_px) if (max_area_frac is not None and max_area_frac > 0) else None
+
+    for cid, sz in zip(comp_ids, sizes):
+        if sz < min_component_px:
+            continue
+        if max_area_px is not None and sz > max_area_px:
+            continue
+        eligible.append((cid, sz))
+
+    if not eligible:
+        raise ValueError(
+            "No connected component meets constraints (min_component_px / max_area_frac). "
+            f"ncomp={ncomp}, roi_px={roi_px}, sizes={sizes[:10]}{'...' if len(sizes)>10 else ''}"
+        )
+
+    selection_mode = str(selection_mode or "center_biased").strip().lower()
+    selected_component_id = None
+    selected_component_px = None
+    center_used = None
+
+    if selection_mode == "largest":
+        selected_component_id, selected_component_px = max(eligible, key=lambda t: t[1])
+    else:
+        center = _peak_in_roi(demf, roi)
+        if center is None:
+            center = _centroid_of_mask(roi)
+
+        if center is None:
+            selected_component_id, selected_component_px = max(eligible, key=lambda t: t[1])
+        else:
+            center_r, center_c = center
+            center_used = {"row": float(center_r), "col": float(center_c), "method": "peak_in_roi"}
+
+            # ✅ PATCH: prefer INNER ring by mean/p90 radius around center (+ inner ROI overlap bonus)
+            best = None
+            for cid, sz in eligible:
+                m = (lbl == cid)
+
+                rr, cc = np.nonzero(m)
+                if rr.size == 0:
+                    continue
+
+                rad = np.hypot(rr - center_r, cc - center_c)
+                mean_radius_px = float(np.mean(rad))
+                p90_radius_px = float(np.percentile(rad, 90))
+
+                # tie-break only
+                cent = _centroid_of_mask(m)
+                if cent is None:
+                    continue
+                dr = cent[0] - center_r
+                dc = cent[1] - center_c
+                d2 = float(dr * dr + dc * dc)
+
+                try:
+                    inner_overlap = float(np.sum(m & roi_inner)) / float(np.sum(m) + 1e-9)
+                except Exception:
+                    inner_overlap = 0.0
+
+                key = (
+                    mean_radius_px - 20.0 * inner_overlap,  # prefer inside
+                    p90_radius_px,
+                    d2,
+                    -sz
+                )
+
+                if best is None or key < best[0]:
+                    best = (key, cid, sz, cent, inner_overlap, mean_radius_px, p90_radius_px)
+
+            if best is None:
+                selected_component_id, selected_component_px = max(eligible, key=lambda t: t[1])
+            else:
+                selected_component_id = int(best[1])
+                selected_component_px = int(best[2])
+                center_used["selected_component_centroid"] = {"row": float(best[3][0]), "col": float(best[3][1])}
+                center_used["selected_component_inner_overlap"] = float(best[4])
+                center_used["selected_component_mean_radius_px"] = float(best[5])
+                center_used["selected_component_p90_radius_px"] = float(best[6])
+
+    best_mask = (lbl == selected_component_id)
+
+    contours = measure.find_contours(best_mask.astype(np.uint8), 0.5)
+    if not contours:
+        raise ValueError("Selected component exists, but contour extraction failed.")
+
+    caldera_contour = max(contours, key=len)
+
+    debug = {
+        "method": "morphological_slope_roi",
+        "selection_mode": selection_mode,
+        "max_area_frac": float(max_area_frac),
+        "roi_dilate_px": int(roi_dilate_px),
+        "smooth_sigma": float(smooth_sigma),
+        "slope_q": float(slope_q),
+        "slope_threshold": float(thr),
+        "closing_iterations": int(closing_iterations),
+        "extra_dilate_px": int(extra_dilate_px),
+        "min_component_px": int(min_component_px),
+        "roi_px": int(roi_px),
+        "inner_buffer_px": int(inner_buffer_px),
+        "inner_roi_px": int(np.sum(roi_inner)) if roi_inner is not None else None,
+        "candidate_px": int(cand_px),
+        "n_components": int(ncomp),
+        "all_component_sizes_px": sizes,
+        "eligible_component_sizes_px": [int(sz) for (_, sz) in eligible],
+        "selected_component_id": int(selected_component_id),
+        "selected_component_px": int(selected_component_px) if selected_component_px is not None else None,
+        "center": center_used,
+        "contour_len": int(len(caldera_contour)),
+    }
+
+    return caldera_contour, debug
+
+# ========== Caldera depth helpers (rim–floor from DEM) ==========
+
+def pixel_area_m2_from_transform(transform):
+    try:
+        return float(abs(transform.a * transform.e - transform.b * transform.d))
+    except Exception:
+        try:
+            return float(abs(transform.a * transform.e))
+        except Exception:
+            return 0.0
+
 def outside_ring_mask(mask: np.ndarray, offset_px: int = 1, width_px: int = 3) -> np.ndarray:
-    from scipy.ndimage import binary_dilation
     if mask is None or mask.size == 0:
         return np.zeros_like(mask, dtype=bool)
     if offset_px < 0:
@@ -679,7 +927,23 @@ class VolumeAnalysisApp(QMainWindow):
         self.distance_base_km = self.distance_meters_base * 1e-3
 
         self.slope = calculate_slope(self.dem)
-        self.caldera_contour = find_caldera_contour(self.dem, level_ratio=0.8)
+
+        # ✅ FIXED caldera rim (ROI + slope + morphology) — now with robust inner-ring selection
+        self.caldera_contour, self.caldera_debug = find_caldera_contour_morphological(
+            dem=self.dem,
+            base_contour=self.base_contour,
+            slope=self.slope,
+            nodata=nodata,
+            roi_dilate_px=6,
+            smooth_sigma=1.0,
+            slope_q=88.0,
+            min_component_px=500,
+            closing_iterations=2,
+            extra_dilate_px=0,
+            selection_mode="center_biased",
+            max_area_frac=0.45,
+        )
+
         self.max_slope_index1, self.max_slope_index2 = find_opposite_slope_points(self.slope, self.caldera_contour)
 
         self.distance_meters_caldera = distance_between_points(
@@ -693,9 +957,19 @@ class VolumeAnalysisApp(QMainWindow):
         self.area_base = calculate_area(self.base_contour, self.transform) * 1e-6
         self.area_caldera = calculate_area(self.caldera_contour, self.transform) * 1e-6
 
-        # edifice volume (invariato)
-        z = self.dem[np.isfinite(self.dem)]
-        self.h_max = float(np.percentile(z, 99) - np.percentile(z, 5))
+        # edifice volume (INVARIATO)
+        z = self.dem.astype(float)
+        valid = np.isfinite(z)
+        if nodata is not None:
+            try:
+                valid = valid & (z != float(nodata))
+            except Exception:
+                pass
+        z = z[valid]
+        if z.size == 0:
+            self.h_max = 0.0
+        else:
+            self.h_max = float(np.percentile(z, 99) - np.percentile(z, 5))
 
         self.R1 = self.distance_meters_base / 2.0
         self.R2 = self.distance_meters_caldera / 2.0
@@ -742,14 +1016,15 @@ class VolumeAnalysisApp(QMainWindow):
         self.caldera_reason = cd.get("reason", None)
         self.caldera_action = cd.get("action", None)
 
-        # Approx2 caldera volume: cylinder with elliptical base => V = A_caldera * depth
+        # Approx2 caldera volume: cylinder with elliptical base => V = A_caldera * depth (INVARIATO)
         A_caldera_m2 = float(self.area_caldera) * 1e6
         if self.caldera_status == "depressive" and depth_clamped > 0 and A_caldera_m2 > 0:
             V_caldera_m3 = float(A_caldera_m2 * depth_clamped)
         else:
             V_caldera_m3 = 0.0
 
-        V_effective_m3 = float(self.v - V_caldera_m3)
+        # ✅ clamp
+        V_effective_m3 = float(max(0.0, self.v - V_caldera_m3))
 
         self.v_caldera = float(V_caldera_m3) * 1e-9
         self.v_volcano = float(V_effective_m3) * 1e-9
@@ -833,7 +1108,6 @@ class VolumeAnalysisApp(QMainWindow):
         fig = plt.figure(figsize=(10.5, 7.2))
         ax = fig.add_subplot(1, 1, 1)
         im = ax.imshow(self.dem, cmap="terrain", origin="upper")
-        # overlays
         ax.plot(self.base_contour[:, 1], self.base_contour[:, 0], "w-", linewidth=1)
         ax.plot(self.caldera_contour[:, 1], self.caldera_contour[:, 0], "b-", linewidth=1)
         ax.set_title("Elliptical Approx2 Overview (DEM + Base/Caldera)", fontsize=12)
@@ -854,7 +1128,6 @@ class VolumeAnalysisApp(QMainWindow):
         fig = plt.figure(figsize=(FIG_W, FIG_H))
         gs = gridspec.GridSpec(1, 3, figure=fig, width_ratios=[1.0, 0.08, 1.0], wspace=0.15)
 
-        # Left: BASE
         ax1 = fig.add_subplot(gs[0, 0])
         im1 = ax1.imshow(self.dem, cmap='terrain', origin='upper', interpolation='nearest', resample=False)
         pc, = ax1.plot(self.base_contour[:, 1], self.base_contour[:, 0], 'w-', linewidth=1, label='Base Contour')
@@ -872,10 +1145,8 @@ class VolumeAnalysisApp(QMainWindow):
         leg1.get_frame().set_facecolor('white')
         leg1.get_frame().set_edgecolor('black')
 
-        # Spacer
         fig.add_subplot(gs[0, 1]).axis('off')
 
-        # Right: CALDERA
         ax2 = fig.add_subplot(gs[0, 2])
         im2 = ax2.imshow(self.dem, cmap='terrain', origin='upper', interpolation='nearest', resample=False)
         cc, = ax2.plot(self.caldera_contour[:, 1], self.caldera_contour[:, 0], 'b-', linewidth=1, label='Caldera Contour')
@@ -950,7 +1221,13 @@ class VolumeAnalysisApp(QMainWindow):
                 "nodata": nodata,
                 "params": {
                     "base_elevation_ratio": 0.05,
-                    "caldera_level_ratio": 0.8
+                    # ✅ caldera is slope/ROI-based with inner-ring selection
+                    "caldera_rim_detection": "morphological_slope_roi_center_biased_with_radius_and_inner_roi_overlap",
+                    "roi_dilate_px": 6,
+                    "smooth_sigma": 1.0,
+                    "slope_q": 88.0,
+                    "min_component_px": 500,
+                    "max_area_frac": 0.45,
                 }
             },
             "nodata_stats": dem_nodata_stats(self.dem, nodata=nodata),
@@ -1009,6 +1286,11 @@ class VolumeAnalysisApp(QMainWindow):
                 "ratio_vs_cone": cone_ratio,
             }
         }
+
+        # ✅ keep debug (does not change volumes)
+        if hasattr(self, "caldera_debug") and isinstance(self.caldera_debug, dict):
+            metrics["meta"]["caldera_debug"] = self.caldera_debug
+
         return metrics
 
     def _write_metrics_files(self, out_dir=None):
@@ -1068,7 +1350,6 @@ class VolumeAnalysisApp(QMainWindow):
                 "h_max_m": float(getattr(self, "h_max", 0.0)),
                 "pixel_size_m": pixel_size_m,
             },
-            # ✅ SOLO la final doublet
             "images": ["final_doublet_base_vs_caldera.png"],
             "links": {
                 "metrics_json": _public_path(self.process_id, f"{self.metrics_basename}.json"),
@@ -1096,7 +1377,6 @@ class VolumeAnalysisApp(QMainWindow):
             if HEADLESS:
                 self._save_overview_png_headless()
             else:
-                # già salvato in initUI, ma ripeto safe
                 self._save_overview_png_gui()
         except Exception as e:
             print(f"[PY VOL {self.process_id}] [WARN] Could not save overview: {e}")
@@ -1148,7 +1428,6 @@ class VolumeAnalysisApp(QMainWindow):
             orig_name = os.environ.get("ORIGINAL_FILE_NAME") or self.meta.get("original_file_name") or os.path.basename(self.meta.get("input_dem_path") or "")
             title = f"Calculation Results - Elliptical Base, Approximation Type 2\nInput DEM: {orig_name}"
 
-            # salva la doppietta accanto al PDF
             out_dir_for_pdf = os.path.dirname(file_path) if os.path.dirname(file_path) else os.getcwd()
             doublet_png = os.path.join(out_dir_for_pdf, "final_doublet_base_vs_caldera.png")
             self._save_final_doublet_png(doublet_png)

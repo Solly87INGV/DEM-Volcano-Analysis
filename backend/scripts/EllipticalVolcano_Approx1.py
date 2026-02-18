@@ -15,9 +15,22 @@
 # - volume_results.json -> images contains ONLY the final doublet (no complete_dem_analysis images)
 # - does NOT modify analysis_images.json
 #
-# GUI:
-# - still supports 3 panels + overview PNG (GUI-only)
-# - "Export Metrics (JSON + CSV)" button
+# IMPORTANT (caldera contour robustness):
+# - Caldera rim is detected with ROI+slope+morphology (center-biased) like the "fixed" circular modules,
+#   to avoid grabbing the external flank ring when the level-based contour fails.
+#
+# PATCH (requested now):
+# - Improve rim component selection to avoid grabbing an outer flank ring:
+#   use an "inner ROI" (eroded ROI) overlap score in the center-biased selection.
+#
+# DEM selection (manifest-first):
+# - If analysis_images.json exists in OUTPUTS_DIR/<PID>/, prefer dem_working.tif in that folder.
+# - Else prefer outputs/<PID>/dem_working.tif
+# - Else use CLI input DEM
+#
+# CRS:
+# - For elliptic modules we still refuse geographic CRS (degrees), because areas/volumes collapse.
+#   (Unlike circular approx2 where we reprojected automatically.)
 
 import sys
 import os
@@ -78,9 +91,22 @@ HEADLESS = _is_headless()
 
 if HEADLESS:
     os.environ.setdefault("MPLBACKEND", "Agg")
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+    except Exception:
+        pass
 
 import rasterio
-from scipy.ndimage import sobel
+from scipy.ndimage import (
+    sobel,
+    gaussian_filter,
+    binary_dilation,
+    binary_closing,
+    binary_fill_holes,
+    binary_erosion,  # ✅ PATCH: needed for inner ROI overlap scoring
+    label,
+)
 from skimage import measure
 
 # ---- PyQt5: import solo se NON headless ----
@@ -197,6 +223,45 @@ def _ensure_outputs_dir(process_id: str) -> str:
 def _public_path(process_id: str, filename: str) -> str:
     return f"/outputs/{process_id}/{filename}"
 
+def _resolve_dem_path_manifest_first(input_dem_path: str, process_id: str) -> dict:
+    """
+    Priorità:
+    1) Se esiste analysis_images.json in OUTPUTS_DIR/<PID>/, usa dem_working.tif nella stessa cartella.
+    2) Se non trovato, usa outputs/<PID>/dem_working.tif se esiste.
+    3) Altrimenti usa l’input DEM CLI.
+    """
+    out_dir = _ensure_outputs_dir(process_id)
+    manifest_path = os.path.join(out_dir, "analysis_images.json")
+
+    if os.path.exists(manifest_path):
+        manifest_dir = os.path.dirname(manifest_path)
+        manifest_dem = os.path.join(manifest_dir, "dem_working.tif")
+        if os.path.exists(manifest_dem):
+            return {
+                "selected_path": manifest_dem,
+                "reason": "manifest-first: analysis_images.json -> dem_working.tif in manifest dir",
+                "manifest_path": manifest_path,
+                "manifest_dir": manifest_dir,
+            }
+        else:
+            print(f"[WARN] analysis_images.json found but dem_working.tif not found in same folder: {manifest_dem}")
+
+    candidate = os.path.join(out_dir, "dem_working.tif")
+    if os.path.exists(candidate):
+        return {
+            "selected_path": candidate,
+            "reason": "outputs-working: outputs/<PID>/dem_working.tif exists",
+            "manifest_path": manifest_path if os.path.exists(manifest_path) else None,
+            "manifest_dir": os.path.dirname(manifest_path) if os.path.exists(manifest_path) else None,
+        }
+
+    return {
+        "selected_path": input_dem_path,
+        "reason": "fallback-input: using CLI input DEM",
+        "manifest_path": manifest_path if os.path.exists(manifest_path) else None,
+        "manifest_dir": os.path.dirname(manifest_path) if os.path.exists(manifest_path) else None,
+    }
+
 
 # ========== Analysis Functions ==========
 
@@ -255,13 +320,6 @@ def calculate_slope(matrix):
     dy = sobel(matrix, axis=0)
     return np.hypot(dx, dy)
 
-def find_caldera_contour(matrix, level_ratio=0.8):
-    contour_level = matrix.max() * level_ratio
-    contours = measure.find_contours(matrix, contour_level)
-    if len(contours) == 0:
-        raise ValueError("No contours found for the given level ratio.")
-    return max(contours, key=len)
-
 def find_opposite_slope_points(slope_matrix, contour):
     contour = np.round(contour).astype(int)
     contour = contour[
@@ -278,16 +336,7 @@ def find_opposite_slope_points(slope_matrix, contour):
     return max_slope_index1, max_slope_index2
 
 
-# ========== Caldera depth helpers (rim–floor from DEM) ==========
-
-def pixel_area_m2_from_transform(transform):
-    try:
-        return float(abs(transform.a * transform.e - transform.b * transform.d))
-    except Exception:
-        try:
-            return float(abs(transform.a * transform.e))
-        except Exception:
-            return 0.0
+# ========== Caldera rim detection (robust: ROI+slope+morphology) ==========
 
 def contour_to_mask(contour, shape):
     from skimage.draw import polygon
@@ -303,8 +352,252 @@ def contour_to_mask(contour, shape):
     mask[pr, pc] = True
     return mask
 
+def _centroid_of_mask(mask: np.ndarray):
+    rr, cc = np.nonzero(mask)
+    if rr.size == 0:
+        return None
+    return (float(np.mean(rr)), float(np.mean(cc)))
+
+def _peak_in_roi(dem: np.ndarray, roi: np.ndarray):
+    try:
+        vals = np.where(roi, dem.astype(float), -np.inf)
+        if not np.isfinite(vals).any():
+            return _centroid_of_mask(roi)
+        idx = int(np.nanargmax(vals))
+        r, c = np.unravel_index(idx, dem.shape)
+        return (float(r), float(c))
+    except Exception:
+        return _centroid_of_mask(roi)
+
+def find_caldera_contour_morphological(
+    dem: np.ndarray,
+    base_contour: np.ndarray,
+    slope: np.ndarray = None,
+    nodata=None,
+    roi_dilate_px: int = 6,
+    smooth_sigma: float = 1.0,
+    slope_q: float = 88.0,
+    min_component_px: int = 500,
+    closing_iterations: int = 2,
+    extra_dilate_px: int = 0,
+    selection_mode: str = "center_biased",
+    max_area_frac: float = 0.45,
+) -> tuple:
+    if dem is None or dem.size == 0:
+        raise ValueError("DEM is empty. Cannot detect caldera rim.")
+
+    if base_contour is None or len(base_contour) < 3:
+        raise ValueError("Base contour is missing/too small. Cannot build ROI for caldera rim detection.")
+
+    demf = dem.astype(float)
+
+    valid = np.isfinite(demf)
+    if nodata is not None:
+        valid = valid & (demf != float(nodata))
+
+    roi = contour_to_mask(base_contour, demf.shape)
+    roi_dilate_px = int(max(0, roi_dilate_px))
+    if roi_dilate_px > 0:
+        roi = binary_dilation(roi, iterations=roi_dilate_px)
+    roi = roi & valid
+
+    roi_px = int(np.sum(roi))
+    if roi_px < max(50, int(min_component_px * 0.5)):
+        raise ValueError(f"ROI too small after dilation/valid masking (roi_px={roi_px}).")
+
+    # ✅ PATCH: build an "inner ROI" (eroded ROI) to penalize rim candidates stuck near ROI border
+    inner_buffer_px = 12  # tune 10-20 if needed
+    try:
+        roi_inner = binary_erosion(roi, iterations=int(inner_buffer_px)) if inner_buffer_px > 0 else roi
+        if int(np.sum(roi_inner)) < 100:
+            roi_inner = roi  # fallback if erosion too aggressive
+    except Exception:
+        roi_inner = roi
+
+    if slope is None:
+        slope = calculate_slope(demf)
+
+    slopef = slope.astype(float)
+    if smooth_sigma is not None and float(smooth_sigma) > 0:
+        slopef = gaussian_filter(slopef, sigma=float(smooth_sigma))
+
+    roi_slopes = slopef[roi]
+    roi_slopes = roi_slopes[np.isfinite(roi_slopes)]
+    if roi_slopes.size == 0:
+        raise ValueError("No finite slope values inside ROI.")
+
+    slope_q = float(slope_q)
+    thr = float(np.percentile(roi_slopes, slope_q))
+    candidates = (slopef >= thr) & roi
+
+    closing_iterations = int(max(0, closing_iterations))
+    if closing_iterations > 0:
+        candidates = binary_closing(candidates, iterations=closing_iterations)
+
+    candidates = binary_fill_holes(candidates)
+
+    extra_dilate_px = int(max(0, extra_dilate_px))
+    if extra_dilate_px > 0:
+        candidates = binary_dilation(candidates, iterations=extra_dilate_px)
+
+    candidates = candidates & roi
+
+    cand_px = int(np.sum(candidates))
+    if cand_px == 0:
+        raise ValueError("Candidate rim mask is empty after morphological steps.")
+
+    lbl, ncomp = label(candidates)
+    if ncomp <= 0:
+        raise ValueError("No connected components found in candidate mask.")
+
+    sizes = []
+    comp_ids = list(range(1, ncomp + 1))
+    for cid in comp_ids:
+        sizes.append(int(np.sum(lbl == cid)))
+
+    min_component_px = int(max(1, min_component_px))
+    eligible = []
+    max_area_frac = float(max_area_frac)
+    max_area_px = int(max_area_frac * roi_px) if (max_area_frac is not None and max_area_frac > 0) else None
+
+    for cid, sz in zip(comp_ids, sizes):
+        if sz < min_component_px:
+            continue
+        if max_area_px is not None and sz > max_area_px:
+            continue
+        eligible.append((cid, sz))
+
+    if not eligible:
+        raise ValueError(
+            "No connected component meets constraints (min_component_px / max_area_frac). "
+            f"ncomp={ncomp}, roi_px={roi_px}, sizes={sizes[:10]}{'...' if len(sizes)>10 else ''}"
+        )
+
+    selection_mode = str(selection_mode or "center_biased").strip().lower()
+    selected_component_id = None
+    selected_component_px = None
+    center_used = None
+
+    if selection_mode == "largest":
+        selected_component_id, selected_component_px = max(eligible, key=lambda t: t[1])
+    else:
+        center = _peak_in_roi(demf, roi)
+        if center is None:
+            center = _centroid_of_mask(roi)
+
+        if center is None:
+            selected_component_id, selected_component_px = max(eligible, key=lambda t: t[1])
+        else:
+            center_r, center_c = center
+            center_used = {"row": float(center_r), "col": float(center_c), "method": "peak_in_roi"}
+
+            best = None
+            for cid, sz in eligible:
+                m = (lbl == cid)
+
+                rr, cc = np.nonzero(m)
+                if rr.size == 0:
+                    continue
+
+                # distanza "radiale" dal centro (in pixel) -> discriminante chiave tra anello interno vs esterno
+                rad = np.hypot(rr - center_r, cc - center_c)
+                mean_radius_px = float(np.mean(rad))
+                p90_radius_px = float(np.percentile(rad, 90))
+
+                # centroide (solo per tie-break)
+                cent = _centroid_of_mask(m)
+                if cent is None:
+                    continue
+                dr = cent[0] - center_r
+                dc = cent[1] - center_c
+                d2 = float(dr * dr + dc * dc)
+
+                # overlap con inner ROI (bonus, ma non più il criterio principale)
+                try:
+                    inner_overlap = float(np.sum(m & roi_inner)) / float(np.sum(m) + 1e-9)  # 0..1
+                except Exception:
+                    inner_overlap = 0.0
+
+                # ✅ criterio: preferisci l'anello più interno (mean_radius minimo)
+                # tie-break: p90 radius, poi centroide vicino, poi più grande
+                key = (
+                    mean_radius_px - 20.0 * inner_overlap,
+                    p90_radius_px,
+                    d2,
+                    -sz
+                )
+
+                if best is None or key < best[0]:
+                    best = (key, cid, sz, cent, inner_overlap, mean_radius_px, p90_radius_px)
+
+            if best is None:
+                selected_component_id, selected_component_px = max(eligible, key=lambda t: t[1])
+            else:
+                selected_component_id = int(best[1])
+                selected_component_px = int(best[2])
+                center_used["selected_component_centroid"] = {"row": float(best[3][0]), "col": float(best[3][1])}
+                center_used["selected_component_inner_overlap"] = float(best[4])
+                center_used["selected_component_mean_radius_px"] = float(best[5])
+                center_used["selected_component_p90_radius_px"] = float(best[6])
+
+                if best is None or key < best[0]:
+                    best = (key, cid, sz, cent, inner_overlap)
+
+            if best is None:
+                selected_component_id, selected_component_px = max(eligible, key=lambda t: t[1])
+            else:
+                selected_component_id = int(best[1])
+                selected_component_px = int(best[2])
+                center_used["selected_component_centroid"] = {"row": float(best[3][0]), "col": float(best[3][1])}
+                center_used["selected_component_inner_overlap"] = float(best[4])
+
+    best_mask = (lbl == selected_component_id)
+
+    contours = measure.find_contours(best_mask.astype(np.uint8), 0.5)
+    if not contours:
+        raise ValueError("Selected component exists, but contour extraction failed.")
+
+    caldera_contour = max(contours, key=len)
+
+    debug = {
+        "method": "morphological_slope_roi",
+        "selection_mode": selection_mode,
+        "max_area_frac": float(max_area_frac),
+        "roi_dilate_px": int(roi_dilate_px),
+        "smooth_sigma": float(smooth_sigma),
+        "slope_q": float(slope_q),
+        "slope_threshold": float(thr),
+        "closing_iterations": int(closing_iterations),
+        "extra_dilate_px": int(extra_dilate_px),
+        "min_component_px": int(min_component_px),
+        "roi_px": int(roi_px),
+        "candidate_px": int(cand_px),
+        "n_components": int(ncomp),
+        "all_component_sizes_px": sizes,
+        "eligible_component_sizes_px": [int(sz) for (_, sz) in eligible],
+        "selected_component_id": int(selected_component_id),
+        "selected_component_px": int(selected_component_px) if selected_component_px is not None else None,
+        "inner_buffer_px": int(inner_buffer_px),
+        "inner_roi_px": int(np.sum(roi_inner)) if roi_inner is not None else None,
+        "center": center_used,
+        "contour_len": int(len(caldera_contour)),
+    }
+
+    return caldera_contour, debug
+
+
+# ========== Caldera depth helpers (rim–floor from DEM) ==========
+
+def pixel_area_m2_from_transform(transform):
+    try:
+        return float(abs(transform.a * transform.e - transform.b * transform.d))
+    except Exception:
+        try:
+            return float(abs(transform.a * transform.e))
+        except Exception:
+            return 0.0
+
 def outside_ring_mask(mask: np.ndarray, offset_px: int = 1, width_px: int = 3) -> np.ndarray:
-    from scipy.ndimage import binary_dilation
     if mask is None or mask.size == 0:
         return np.zeros_like(mask, dtype=bool)
     if offset_px < 0:
@@ -548,11 +841,11 @@ HUMAN_FIELDS = [
 
 def metrics_to_human_rows(metrics: dict):
     rows = []
-    for section, label, path, unit in HUMAN_FIELDS:
+    for section, label_txt, path, unit in HUMAN_FIELDS:
         v = _get_by_path(metrics, path)
         if isinstance(v, (list, dict)):
             v = json.dumps(v, ensure_ascii=False)
-        rows.append((section, label, v, unit))
+        rows.append((section, label_txt, v, unit))
     return rows
 
 
@@ -721,9 +1014,22 @@ class VolumeAnalysisApp(QMainWindow):
         )
         self.distance_base_km = self.distance_meters_base * 1e-3
 
-        # Caldera
+        # Caldera (robust rim)
         self.slope = calculate_slope(self.dem)
-        self.caldera_contour = find_caldera_contour(self.dem, level_ratio=0.8)
+        self.caldera_contour, self.caldera_debug = find_caldera_contour_morphological(
+            dem=self.dem,
+            base_contour=self.base_contour,
+            slope=self.slope,
+            nodata=nodata,
+            roi_dilate_px=6,
+            smooth_sigma=1.0,
+            slope_q=88.0,
+            min_component_px=500,
+            closing_iterations=2,
+            extra_dilate_px=0,
+            selection_mode="center_biased",
+            max_area_frac=0.45,
+        )
         self.max_slope_index1, self.max_slope_index2 = find_opposite_slope_points(self.slope, self.caldera_contour)
 
         # Caldera span
@@ -896,9 +1202,9 @@ class VolumeAnalysisApp(QMainWindow):
         ax1 = fig.add_subplot(gs[0, 0])
         im1 = ax1.imshow(self.dem, cmap='terrain', origin='upper',
                          interpolation='nearest', resample=False)
-        pc, = ax1.plot(self.base_contour[:, 1], self.base_contour[:, 0], 'w-', linewidth=1, label='Base Contour')
-        p1, = ax1.plot(self.base_point1[1], self.base_point1[0], 'ro', markersize=8, label='Base 1')
-        p2, = ax1.plot(self.base_point2[1], self.base_point2[0], 'yo', markersize=8, label='Base 2')
+        ax1.plot(self.base_contour[:, 1], self.base_contour[:, 0], 'w-', linewidth=1, label='Base Contour')
+        ax1.plot(self.base_point1[1], self.base_point1[0], 'ro', markersize=8, label='Base 1')
+        ax1.plot(self.base_point2[1], self.base_point2[0], 'yo', markersize=8, label='Base 2')
         ax1.set_title("Opposite Points of the Volcano Base", pad=8, fontsize=12)
         ax1.set_aspect('equal', adjustable='box')
         div1 = make_axes_locatable(ax1)
@@ -913,9 +1219,9 @@ class VolumeAnalysisApp(QMainWindow):
         ax2 = fig.add_subplot(gs[0, 2])
         im2 = ax2.imshow(self.dem, cmap='terrain', origin='upper',
                          interpolation='nearest', resample=False)
-        cc, = ax2.plot(self.caldera_contour[:, 1], self.caldera_contour[:, 0], 'b-', linewidth=1, label='Caldera Contour')
-        s1, = ax2.plot(self.max_slope_index1[1], self.max_slope_index1[0], 'ro', markersize=8, label='Max Slope 1')
-        s2, = ax2.plot(self.max_slope_index2[1], self.max_slope_index2[0], 'yo', markersize=8, label='Max Slope 2')
+        ax2.plot(self.caldera_contour[:, 1], self.caldera_contour[:, 0], 'b-', linewidth=1, label='Caldera Contour')
+        ax2.plot(self.max_slope_index1[1], self.max_slope_index1[0], 'ro', markersize=8, label='Max Slope 1')
+        ax2.plot(self.max_slope_index2[1], self.max_slope_index2[0], 'yo', markersize=8, label='Max Slope 2')
         ax2.set_title("Opposite Maximum Slope Points on the Caldera", pad=8, fontsize=12)
         ax2.set_aspect('equal', adjustable='box')
         div2 = make_axes_locatable(ax2)
@@ -983,7 +1289,13 @@ class VolumeAnalysisApp(QMainWindow):
                 "nodata": nodata,
                 "params": {
                     "base_elevation_ratio": 0.05,
-                    "caldera_level_ratio": 0.8,
+                    # kept for backward readability; caldera is now slope/ROI-based
+                    "caldera_rim_detection": "morphological_slope_roi_center_biased_with_inner_roi_overlap",
+                    "roi_dilate_px": 6,
+                    "smooth_sigma": 1.0,
+                    "slope_q": 88.0,
+                    "min_component_px": 500,
+                    "max_area_frac": 0.45,
                     "height_method": "p99_minus_p05_inside_base",
                     "caldera_depth_method": "dem_rim_floor_percentiles",
                     "caldera_volume_model": "semi_ellipsoid_A_times_dem_depth"
@@ -1062,6 +1374,10 @@ class VolumeAnalysisApp(QMainWindow):
                 "ratio_vs_cone": cone_ratio,
             }
         }
+
+        if hasattr(self, "caldera_debug") and isinstance(self.caldera_debug, dict):
+            metrics["meta"]["caldera_debug"] = self.caldera_debug
+
         return metrics
 
     def _write_metrics_files(self, out_dir=None):
@@ -1086,8 +1402,8 @@ class VolumeAnalysisApp(QMainWindow):
         with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow(["section", "metric", "value", "unit"])
-            for section, label, value, unit in human_rows:
-                w.writerow([section, label, value, unit])
+            for section, label_txt, value, unit in human_rows:
+                w.writerow([section, label_txt, value, unit])
 
         print(f"[INFO] metrics written: {json_path}")
         print(f"[INFO] metrics written: {csv_path}")
@@ -1286,11 +1602,19 @@ if __name__ == '__main__':
     original_file_name = sys.argv[2] if len(sys.argv) > 2 else "Unknown"
 
     process_id = _resolve_process_id()
-    out_dir = _ensure_outputs_dir(process_id)
+    _ = _ensure_outputs_dir(process_id)
 
-    # Prefer working DEM from outputs/<PID>/dem_working.tif if present
-    candidate = os.path.join(out_dir, "dem_working.tif")
-    dem_file_path = candidate if os.path.exists(candidate) else input_dem_path
+    # ✅ Manifest-first DEM selection
+    dem_choice = _resolve_dem_path_manifest_first(input_dem_path=input_dem_path, process_id=process_id)
+    dem_file_path = dem_choice["selected_path"]
+
+    print("[DEBUG] DEM selection (manifest-first):")
+    print(f"        process_id     = {process_id}")
+    print(f"        input_dem_path = {input_dem_path}")
+    if dem_choice.get("manifest_path"):
+        print(f"        manifest_path  = {dem_choice.get('manifest_path')}")
+    print(f"        selected_path  = {dem_file_path}")
+    print(f"        reason         = {dem_choice.get('reason')}")
 
     if not os.path.exists(dem_file_path):
         print(f"Error: File '{dem_file_path}' does not exist.")

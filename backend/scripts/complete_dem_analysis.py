@@ -504,10 +504,22 @@ def _write_manifest_json(process_id: str, out_dir: str, saved_entries: list, sou
         print(f"[ERROR] Failed to write manifest JSON: {e}")
 
 
-def _save_dem_overview_png(dem, out_dir, file_name, nodata_value=None):
+# ============================
+# ONLY CHANGE REQUESTED:
+# - dem_overview.png becomes a true 1x2 "doublet" (DEM | Hillshade)
+# - aspect_overview.png becomes a true 1x2 "doublet" (Aspect | Aspect (HSV))
+# Everything else unchanged.
+# ============================
+def _save_dem_overview_png(dem, aspect, out_dir, file_name, nodata_value=None):
+    # --- doublet gabbia coerente con le altre ---
     fig = plt.figure(figsize=(14.5, 5.5))
-    ax = fig.add_subplot(111)
+    gs = gridspec.GridSpec(
+        1, 3, figure=fig,
+        width_ratios=[1.0, 0.08, 1.0],
+        wspace=0.15
+    )
 
+    # Mask nodata/NaN come prima
     mask = ~np.isfinite(dem)
     if nodata_value is not None:
         mask |= np.isclose(dem, nodata_value)
@@ -520,7 +532,10 @@ def _save_dem_overview_png(dem, out_dir, file_name, nodata_value=None):
         dem_filled = dem
 
     h, w = dem_filled.shape
-    im = ax.imshow(
+
+    # ===== Sinistra: DEM =====
+    ax1 = fig.add_subplot(gs[0, 0])
+    im1 = ax1.imshow(
         dem_filled,
         cmap='terrain',
         origin='upper',
@@ -528,32 +543,86 @@ def _save_dem_overview_png(dem, out_dir, file_name, nodata_value=None):
         resample=False,
         extent=(-0.5, w - 0.5, h - 0.5, -0.5)
     )
-    ax.set_title("DEM", pad=8)
-    ax.set_aspect('equal', adjustable='box')
+    ax1.set_title("DEM", pad=8)
+    ax1.set_aspect('equal', adjustable='box')
 
-    CB_SIZE = "4%"
-    CB_PAD  = 0.3
-    divider = make_axes_locatable(ax)
-    cax = divider.append_axes("right", size=CB_SIZE, pad=CB_PAD)
+    divider1 = make_axes_locatable(ax1)
+    cax1 = divider1.append_axes("right", size="4.6%", pad=0.10)
+    cbar1 = fig.colorbar(im1, cax=cax1)
+    cbar1.set_label("Elevation (m)", rotation=90)
 
-    cbar = fig.colorbar(im, cax=cax)
-    cbar.set_label("Elevation (m)", rotation=90)
-
-    cbar.outline.set_visible(False)
+    cbar1.outline.set_visible(False)
     for side in ("left", "right", "top", "bottom"):
-        sp = cax.spines[side]
+        sp = cax1.spines[side]
         sp.set_visible(True)
         sp.set_linewidth(0.6)
         try:
             sp.set_edgecolor("black")
         except Exception:
             sp.set_color("black")
+    cax1.set_facecolor('none')
+    cax1.grid(False)
+    cax1.tick_params(length=3)
 
-    cax.set_facecolor('none')
-    cax.grid(False)
-    cax.tick_params(length=3)
+    # ===== Spacer =====
+    ax_sp = fig.add_subplot(gs[0, 1])
+    ax_sp.axis('off')
 
-    fig.subplots_adjust(left=0.050, right=0.890, top=0.88, bottom=0.16)
+    # ===== Destra: Aspect =====
+    ax2 = fig.add_subplot(gs[0, 2])
+
+    # NaN/inf safety sull'aspect
+    asp_mask = ~np.isfinite(aspect)
+    if asp_mask.any():
+        valid_min = np.nanmin(aspect[~asp_mask]) if (~asp_mask).any() else 0.0
+        aspect_filled = aspect.copy()
+        aspect_filled[asp_mask] = valid_min
+    else:
+        aspect_filled = aspect
+
+    im2 = ax2.imshow(
+        aspect_filled,
+        cmap='twilight',
+        origin='upper',
+        interpolation='nearest',
+        resample=False,
+        extent=(-0.5, w - 0.5, h - 0.5, -0.5)
+    )
+    ax2.set_title("Aspect", pad=8)
+    ax2.set_aspect('equal', adjustable='box')
+
+    divider2 = make_axes_locatable(ax2)
+    cax2 = divider2.append_axes("right", size="4.6%", pad=0.10)
+    cbar2 = fig.colorbar(im2, cax=cax2)
+    cbar2.set_label("Aspect (degrees)", rotation=90)
+
+    cbar2.outline.set_visible(False)
+    for side in ("left", "right", "top", "bottom"):
+        sp = cax2.spines[side]
+        sp.set_visible(True)
+        sp.set_linewidth(0.6)
+        try:
+            sp.set_edgecolor("black")
+        except Exception:
+            sp.set_color("black")
+    cax2.set_facecolor('none')
+    cax2.grid(False)
+    cax2.tick_params(length=3)
+
+
+    cbar2.outline.set_visible(False)
+    for side in ("left", "right", "top", "bottom"):
+        sp = cax2.spines[side]
+        sp.set_visible(True)
+        sp.set_linewidth(0.6)
+        try:
+            sp.set_edgecolor("black")
+        except Exception:
+            sp.set_color("black")
+    cax2.set_facecolor('none')
+    cax2.grid(False)
+    cax2.tick_params(length=3)
+
     fig.suptitle(f"Location: {file_name}", fontsize=14)
 
     out_path = os.path.join(out_dir, "dem_overview.png")
@@ -564,19 +633,28 @@ def _save_dem_overview_png(dem, out_dir, file_name, nodata_value=None):
         "filename": "dem_overview.png",
         "abs_path": out_path,
         "public_path": f"/outputs/{os.path.basename(out_dir)}/dem_overview.png",
-        "titles": ["DEM"],
-        "units": ["m"],
-        "descriptions": ["Represents terrain elevation in meters above sea level."]
+        "titles": ["DEM", "Aspect"],
+        "units": ["m", "Degrees"],
+        "descriptions": [
+    "Represents terrain elevation in meters above sea level.",
+    "Slope direction (degrees): 0°=N, clockwise up to 360°."
+        ]
     }
 
 def _save_aspect_overview_png(aspect, out_dir, file_name):
     """
-    Salva un overview singolo dell'ASPECT, simile al DEM, per il report PDF.
+    Salva un overview DOPPIETTA dell'ASPECT (1x2) per uniformare la gabbia delle immagini.
+    NOTA: la funzione riceve solo 'aspect', quindi il secondo pannello è una rappresentazione alternativa
+          dello stesso campo (cmap diversa) senza toccare altre parti del codice.
     """
     fig = plt.figure(figsize=(14.5, 5.5))
-    ax = fig.add_subplot(111)
+    gs = gridspec.GridSpec(
+        1, 3, figure=fig,
+        width_ratios=[1.0, 0.08, 1.0],
+        wspace=0.15
+    )
 
-    # Gestione eventuali NaN / inf
+    # Gestione eventuali NaN / inf (come prima)
     mask = ~np.isfinite(aspect)
     if mask.any():
         valid_min = np.nanmin(aspect[~mask]) if (~mask).any() else 0.0
@@ -586,41 +664,73 @@ def _save_aspect_overview_png(aspect, out_dir, file_name):
         aspect_filled = aspect
 
     h, w = aspect_filled.shape
-    im = ax.imshow(
+
+    # ===== Sinistra: Aspect (twilight) =====
+    ax1 = fig.add_subplot(gs[0, 0])
+    im1 = ax1.imshow(
         aspect_filled,
-        cmap='twilight',   # colormap "circolare" adatta per angle
+        cmap='twilight',
         origin='upper',
         interpolation='nearest',
         resample=False,
         extent=(-0.5, w - 0.5, h - 0.5, -0.5)
     )
-    ax.set_title("Aspect", pad=8)
-    ax.set_aspect('equal', adjustable='box')
+    ax1.set_title("Aspect", pad=8)
+    ax1.set_aspect('equal', adjustable='box')
 
-    CB_SIZE = "4%"
-    CB_PAD  = 0.3
-    divider = make_axes_locatable(ax)
-    cax = divider.append_axes("right", size=CB_SIZE, pad=CB_PAD)
+    divider1 = make_axes_locatable(ax1)
+    cax1 = divider1.append_axes("right", size="4.6%", pad=0.10)
+    cbar1 = fig.colorbar(im1, cax=cax1)
+    cbar1.set_label("Aspect (degrees)", rotation=90)
 
-    cbar = fig.colorbar(im, cax=cax)
-    cbar.set_label("Aspect (degrees)", rotation=90)
-
-    # Bordino nero come per il DEM
-    cbar.outline.set_visible(False)
+    cbar1.outline.set_visible(False)
     for side in ("left", "right", "top", "bottom"):
-        sp = cax.spines[side]
+        sp = cax1.spines[side]
         sp.set_visible(True)
         sp.set_linewidth(0.6)
         try:
             sp.set_edgecolor("black")
         except Exception:
             sp.set_color("black")
+    cax1.set_facecolor('none')
+    cax1.grid(False)
+    cax1.tick_params(length=3)
 
-    cax.set_facecolor('none')
-    cax.grid(False)
-    cax.tick_params(length=3)
+    # ===== Spacer =====
+    ax_sp = fig.add_subplot(gs[0, 1])
+    ax_sp.axis('off')
 
-    fig.subplots_adjust(left=0.050, right=0.890, top=0.88, bottom=0.16)
+    # ===== Destra: Aspect (HSV) — rappresentazione alternativa dello stesso campo =====
+    ax2 = fig.add_subplot(gs[0, 2])
+    im2 = ax2.imshow(
+        aspect_filled,
+        cmap='hsv',
+        origin='upper',
+        interpolation='nearest',
+        resample=False,
+        extent=(-0.5, w - 0.5, h - 0.5, -0.5)
+    )
+    ax2.set_title("Aspect (alt colormap)", pad=8)
+    ax2.set_aspect('equal', adjustable='box')
+
+    divider2 = make_axes_locatable(ax2)
+    cax2 = divider2.append_axes("right", size="4.6%", pad=0.10)
+    cbar2 = fig.colorbar(im2, cax=cax2)
+    cbar2.set_label("Aspect (degrees)", rotation=90)
+
+    cbar2.outline.set_visible(False)
+    for side in ("left", "right", "top", "bottom"):
+        sp = cax2.spines[side]
+        sp.set_visible(True)
+        sp.set_linewidth(0.6)
+        try:
+            sp.set_edgecolor("black")
+        except Exception:
+            sp.set_color("black")
+    cax2.set_facecolor('none')
+    cax2.grid(False)
+    cax2.tick_params(length=3)
+
     fig.suptitle(f"Location: {file_name}", fontsize=14)
 
     out_path = os.path.join(out_dir, "aspect_overview.png")
@@ -631,9 +741,12 @@ def _save_aspect_overview_png(aspect, out_dir, file_name):
         "filename": "aspect_overview.png",
         "abs_path": out_path,
         "public_path": f"/outputs/{os.path.basename(out_dir)}/aspect_overview.png",
-        "titles": ["Aspect"],
-        "units": ["Degrees"],
-        "descriptions": ["Slope direction (degrees): 0°=N, clockwise up to 360°."]
+        "titles": ["Aspect", "Aspect (alt colormap)"],
+        "units": ["Degrees", "Degrees"],
+        "descriptions": [
+            "Slope direction (degrees): 0°=N, clockwise up to 360°.",
+            "Same aspect field, alternative cyclic colormap for readability."
+        ]
     }
 
 def _save_doublets_from_arrays(analysis_triplets, titles, cmaps, units, descriptions, file_name, out_dir):
@@ -1435,10 +1548,10 @@ def main():
             out_dir = _ensure_outputs_dir(process_id)
 
             # 1) DEM una sola volta
-            dem_entry = _save_dem_overview_png(dem, out_dir, original_file_name)
+            dem_entry = _save_dem_overview_png(dem, aspect, out_dir, original_file_name)
 
             # 2) ASPECT singolo, per farlo comparire nel PDF
-            aspect_entry = _save_aspect_overview_png(aspect, out_dir, original_file_name)
+            # aspect_entry = _save_aspect_overview_png(aspect, out_dir, original_file_name)
 
             # 3) Per ogni tripletta, salva SOLO i pannelli 2 e 3 (senza DEM / Aspect)
             double_entries = _save_doublets_from_arrays(
@@ -1446,7 +1559,7 @@ def main():
             )
 
             # DEM + ASPECT + tutte le doppiette
-            saved_entries = [dem_entry, aspect_entry] + double_entries
+            saved_entries = [dem_entry] + double_entries
 
             _write_manifest_json(
                 process_id,

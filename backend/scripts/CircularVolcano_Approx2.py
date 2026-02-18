@@ -79,7 +79,19 @@ if HEADLESS:
 
 import numpy as np
 import rasterio
-from scipy.ndimage import sobel
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+from rasterio.crs import CRS
+
+# ✅ allowed SciPy imports for morphological rim detection (SciPy already present)
+from scipy.ndimage import (
+    sobel,
+    binary_dilation,
+    binary_closing,
+    binary_fill_holes,
+    gaussian_filter,
+    label,
+)
+
 from skimage import measure
 
 # ---- PyQt5: import solo se NON headless ----
@@ -98,6 +110,9 @@ else:
 
     class QMainWindow:  # pragma: no cover
         def __init__(self, *args, **kwargs): pass
+        def setWindowTitle(self, *args, **kwargs): pass
+        def setCentralWidget(self, *args, **kwargs): pass
+        def showMaximized(self): pass
 
     class QWidget:  # pragma: no cover
         pass
@@ -195,8 +210,7 @@ def _public_path(process_id: str, filename: str) -> str:
 
 def _find_manifest_path(process_id: str) -> str:
     out_dir = _ensure_outputs_dir(process_id)
-    mp = os.path.join(out_dir, "analysis_images.json")
-    return mp if os.path.exists(mp) else mp  # return path even if not exists (caller handles)
+    return os.path.join(out_dir, "analysis_images.json")
 
 def _load_manifest_public_images(manifest_path: str):
     try:
@@ -220,6 +234,106 @@ def _load_manifest_public_images(manifest_path: str):
     except Exception as e:
         print(f"[WARN] Could not read manifest '{manifest_path}': {e}")
         return []
+
+# -------------------- DEM selection (manifest-first) --------------------
+
+def _resolve_dem_path_manifest_first(input_dem_path: str, process_id: str) -> dict:
+    """
+    Priorità obbligatoria:
+    1) Se esiste analysis_images.json (manifest complete_dem_analysis), usa dem_working.tif nella stessa cartella.
+    2) Se non trovato, usa outputs/<PROCESS_ID>/dem_working.tif se esiste.
+    3) Altrimenti usa l’input DEM passato a riga di comando.
+    """
+    out_dir = _ensure_outputs_dir(process_id)
+
+    manifest_path = os.path.join(out_dir, "analysis_images.json")
+    if os.path.exists(manifest_path):
+        manifest_dir = os.path.dirname(manifest_path)
+        manifest_dem = os.path.join(manifest_dir, "dem_working.tif")
+        if os.path.exists(manifest_dem):
+            return {
+                "selected_path": manifest_dem,
+                "reason": "manifest-first: analysis_images.json -> dem_working.tif in manifest dir",
+                "manifest_path": manifest_path,
+                "manifest_dir": manifest_dir,
+            }
+        else:
+            print(f"[WARN] analysis_images.json found but dem_working.tif not found in same folder: {manifest_dem}")
+
+    candidate = os.path.join(out_dir, "dem_working.tif")
+    if os.path.exists(candidate):
+        return {
+            "selected_path": candidate,
+            "reason": "outputs-working: outputs/<PID>/dem_working.tif exists",
+            "manifest_path": manifest_path if os.path.exists(manifest_path) else None,
+            "manifest_dir": os.path.dirname(manifest_path) if os.path.exists(manifest_path) else None,
+        }
+
+    return {
+        "selected_path": input_dem_path,
+        "reason": "fallback-input: using CLI input DEM",
+        "manifest_path": manifest_path if os.path.exists(manifest_path) else None,
+        "manifest_dir": os.path.dirname(manifest_path) if os.path.exists(manifest_path) else None,
+    }
+
+# -------------------- Reprojection helper (come Approx1) --------------------
+
+def _utm_epsg_from_lonlat(lon: float, lat: float) -> int:
+    zone = int((lon + 180) // 6) + 1
+    return (32600 + zone) if lat >= 0 else (32700 + zone)
+
+def ensure_metric_dem(dem_path: str, process_id: str) -> str:
+    """
+    Se il DEM è geografico (gradi), riproietta in UTM locale e salva outputs/<PID>/dem_working.tif.
+    Se è già metrico, ritorna dem_path.
+    """
+    with rasterio.open(dem_path) as src:
+        src_crs = src.crs
+        if src_crs is None:
+            raise RuntimeError("Input DEM has no CRS. Please define CRS before running volume modules.")
+
+        if not src_crs.is_geographic:
+            return dem_path
+
+        b = src.bounds
+        lon_c = (b.left + b.right) / 2.0
+        lat_c = (b.bottom + b.top) / 2.0
+        epsg = _utm_epsg_from_lonlat(lon_c, lat_c)
+        dst_crs = CRS.from_epsg(epsg)
+
+        out_dir = _ensure_outputs_dir(process_id)
+        working_path = os.path.join(out_dir, "dem_working.tif")
+
+        dst_transform, dst_width, dst_height = calculate_default_transform(
+            src_crs, dst_crs, src.width, src.height, *src.bounds
+        )
+
+        dst_profile = src.profile.copy()
+        dst_profile.update(
+            crs=dst_crs,
+            transform=dst_transform,
+            width=dst_width,
+            height=dst_height
+        )
+
+        resampling = Resampling.bilinear if str(src.dtypes[0]).startswith("float") else Resampling.nearest
+        dst_arr = np.empty((dst_height, dst_width), dtype=src.dtypes[0])
+
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=dst_arr,
+            src_transform=src.transform,
+            src_crs=src_crs,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            resampling=resampling
+        )
+
+        with rasterio.open(working_path, "w", **dst_profile) as dst:
+            dst.write(dst_arr, 1)
+
+        print(f"[DEBUG] Input DEM is geographic ({src_crs}). Reprojected to {dst_crs} -> {working_path}")
+        return working_path
 
 # -------------------- ANALYSIS FUNCTIONS (calcoli invariati) --------------------
 
@@ -266,6 +380,9 @@ def calculate_slope(matrix):
     return np.hypot(dx, dy)
 
 def find_caldera_contour(matrix, level_ratio=0.8):
+    """
+    Legacy method (quota-based). Usato come fallback se la morfologica fallisce.
+    """
     contour_level = matrix.max() * level_ratio
     contours = measure.find_contours(matrix, contour_level)
     if len(contours) == 0:
@@ -299,32 +416,271 @@ def pixel_area_m2_from_transform(transform):
             return 0.0
 
 def contour_to_mask(contour, shape):
+    """
+    Rasterize a contour (row/col coordinates) into a filled boolean mask.
+    """
     from skimage.draw import polygon
-    mask = np.zeros(shape, dtype=bool)
-    if contour is None:
-        return mask
-    c = np.asarray(contour, dtype=float)
-    if c.size == 0:
-        return mask
-    rr = c[:, 0]
-    cc = c[:, 1]
-    pr, pc = polygon(rr, cc, shape)
-    mask[pr, pc] = True
-    return mask
+    c = np.asarray(contour, dtype=float) if contour is not None else np.zeros((0, 2), dtype=float)
+    if c.shape[0] < 3:
+        return np.zeros(shape, dtype=bool)
+    rr, cc = polygon(c[:, 0], c[:, 1], shape)
+    m = np.zeros(shape, dtype=bool)
+    m[rr, cc] = True
+    return m
+
 
 def outside_ring_mask(mask: np.ndarray, offset_px: int = 1, width_px: int = 3) -> np.ndarray:
-    from scipy.ndimage import binary_dilation
-    if mask is None or mask.size == 0:
-        return np.zeros_like(mask, dtype=bool)
-    if offset_px < 0:
-        offset_px = 0
-    if width_px < 1:
-        width_px = 1
+    """
+    Build a ring *outside* a binary mask.
+    Used to sample rim elevations around the caldera boundary.
+    """
+    if mask is None or getattr(mask, 'size', 0) == 0:
+        return np.zeros_like(mask, dtype=bool) if mask is not None else None
+    offset_px = int(max(0, offset_px))
+    width_px  = int(max(1, width_px))
     inner = binary_dilation(mask, iterations=offset_px) if offset_px > 0 else mask
     outer = binary_dilation(mask, iterations=offset_px + width_px)
-    ring = outer & (~inner)
-    return ring
+    return outer & (~inner)
 
+
+# -------------------- Center helper (peak-in-ROI or centroid) --------------------
+
+def _center_from_roi_peak_or_centroid(demf: np.ndarray, roi: np.ndarray) -> tuple:
+    """
+    Center strategy:
+    1) Peak (argmax elevation) within ROI (robust "summit" proxy)
+    2) Fallback: centroid of ROI mask
+    Returns: (center_row, center_col, method_str)
+    """
+    try:
+        vals = demf[roi]
+        if vals.size > 0 and np.any(np.isfinite(vals)):
+            tmp = np.full(demf.shape, -np.inf, dtype=float)
+            tmp[roi] = demf[roi]
+            r, c = np.unravel_index(int(np.nanargmax(tmp)), tmp.shape)
+            return float(r), float(c), "peak_in_roi"
+    except Exception:
+        pass
+
+    rr, cc = np.where(roi)
+    if rr.size == 0:
+        return float(demf.shape[0] / 2.0), float(demf.shape[1] / 2.0), "fallback_image_center"
+    return float(np.mean(rr)), float(np.mean(cc)), "roi_centroid"
+
+
+# -------------------- Caldera rim detection (ROI + slope + morphology) --------------------
+
+def find_caldera_contour_morphological(
+    dem: np.ndarray,
+    base_contour: np.ndarray,
+    slope: np.ndarray = None,
+    nodata=None,
+    roi_dilate_px: int = 6,
+    smooth_sigma: float = 1.0,
+    slope_q: float = 88.0,
+    min_component_px: int = 500,
+    closing_iterations: int = 2,
+    extra_dilate_px: int = 0,
+    # ✅ selection knobs (match Approx1 behavior)
+    max_area_frac: float = 0.35,
+    selection_mode: str = "center_biased",  # "center_biased" | "largest"
+) -> tuple:
+    """
+    Rim detection “morfologica” (same approach as Circular Approx1):
+    - ROI = interno della base (base_contour -> mask) + dilatazione opzionale
+    - slope map (Sobel) -> threshold robusto su percentile SOLO dentro ROI
+    - candidati rim = slope alta dentro ROI
+    - morfologia: closing + fill_holes (+ eventuale dilatazione)
+    - componenti connesse: seleziona la "giusta" (default: center-biased per evitare l'anello esterno del fianco)
+    - contorno finale: find_contours(mask, 0.5) -> quello più lungo
+
+    Ritorna: (caldera_contour, debug_dict)
+    """
+    if dem is None or dem.size == 0:
+        raise ValueError("DEM is empty. Cannot detect caldera rim.")
+
+    if base_contour is None or len(base_contour) < 3:
+        raise ValueError("Base contour is missing/too small. Cannot build ROI for caldera rim detection.")
+
+    demf = dem.astype(float)
+
+    valid = np.isfinite(demf)
+    if nodata is not None:
+        valid = valid & (demf != float(nodata))
+
+    roi = contour_to_mask(base_contour, demf.shape)
+    roi_dilate_px = int(max(0, roi_dilate_px))
+    if roi_dilate_px > 0:
+        roi = binary_dilation(roi, iterations=roi_dilate_px)
+
+    roi = roi & valid
+    roi_px = int(np.sum(roi))
+    if roi_px < max(50, int(min_component_px * 0.5)):
+        raise ValueError(
+            f"ROI too small after dilation/valid masking (roi_px={roi_px}). "
+            "Cannot perform morphological rim detection."
+        )
+
+    if slope is None:
+        slope = calculate_slope(demf)
+
+    slopef = slope.astype(float)
+    if smooth_sigma is not None and float(smooth_sigma) > 0:
+        slopef = gaussian_filter(slopef, sigma=float(smooth_sigma))
+
+    roi_slopes = slopef[roi]
+    roi_slopes = roi_slopes[np.isfinite(roi_slopes)]
+    if roi_slopes.size == 0:
+        raise ValueError("No finite slope values inside ROI. Cannot detect rim.")
+
+    slope_q = float(slope_q)
+    if slope_q <= 0.0 or slope_q >= 100.0:
+        raise ValueError(f"slope_q must be in (0,100). Got {slope_q}")
+
+    thr = float(np.percentile(roi_slopes, slope_q))
+    candidates = (slopef >= thr) & roi
+
+    closing_iterations = int(max(0, closing_iterations))
+    if closing_iterations > 0:
+        candidates = binary_closing(candidates, iterations=closing_iterations)
+
+    candidates = binary_fill_holes(candidates)
+
+    extra_dilate_px = int(max(0, extra_dilate_px))
+    if extra_dilate_px > 0:
+        candidates = binary_dilation(candidates, iterations=extra_dilate_px)
+
+    # Ensure still inside ROI
+    candidates = candidates & roi
+
+    cand_px = int(np.sum(candidates))
+    if cand_px == 0:
+        raise ValueError(
+            "Morphological rim detection produced empty candidate mask. "
+            f"(slope_q={slope_q}, thr={thr}, roi_px={roi_px})"
+        )
+
+    lbl, ncomp = label(candidates)
+    if ncomp <= 0:
+        raise ValueError("Morphological rim detection found no connected components after labeling.")
+
+    # Component stats + constraints
+    min_component_px = int(max(1, min_component_px))
+    max_area_frac = float(max(0.0, max_area_frac))
+    if max_area_frac <= 0.0 or max_area_frac > 1.0:
+        raise ValueError(f"max_area_frac must be in (0,1]. Got {max_area_frac}")
+
+    comps = []
+    sizes = []
+    for comp_id in range(1, ncomp + 1):
+        mask_i = (lbl == comp_id)
+        sz = int(np.sum(mask_i))
+        sizes.append(sz)
+        if sz < min_component_px:
+            continue
+
+        area_frac = float(sz / float(max(1, roi_px)))
+        if area_frac > max_area_frac:
+            continue
+
+        rr, cc = np.where(mask_i)
+        if rr.size == 0:
+            continue
+
+        cr = float(np.mean(rr))
+        cc_ = float(np.mean(cc))
+        mean_s = float(np.mean(slopef[mask_i])) if np.any(mask_i) else 0.0
+        comps.append({
+            "id": int(comp_id),
+            "px": int(sz),
+            "area_frac": float(area_frac),
+            "centroid_rc": (cr, cc_),
+            "mean_slope": float(mean_s),
+        })
+
+    if not comps:
+        raise ValueError(
+            "No connected component meets min_component_px AND max_area_frac constraints. "
+            f"ncomp={ncomp}, roi_px={roi_px}, sizes(sample)={sizes[:10]}{'...' if len(sizes)>10 else ''}, "
+            f"min_component_px={min_component_px}, max_area_frac={max_area_frac}"
+        )
+
+    # Center-biased selection (avoid outer flank ring)
+    center_r, center_c, center_method = _center_from_roi_peak_or_centroid(demf, roi)
+
+    selection_mode = str(selection_mode or "center_biased").strip().lower()
+    if selection_mode not in ("center_biased", "largest"):
+        raise ValueError(f"Invalid selection_mode='{selection_mode}'. Use 'center_biased' or 'largest'.")
+
+    if selection_mode == "largest":
+        best = max(comps, key=lambda d: d["px"])
+        selection_reason = "largest_component_within_constraints"
+    else:
+        dist_norm_denom = float(max(1.0, math.sqrt(roi_px)))
+        for d in comps:
+            cr, cc_ = d["centroid_rc"]
+            dist = float(np.hypot(cr - center_r, cc_ - center_c))
+            d["dist_to_center_px"] = dist
+            d["dist_to_center_norm"] = float(dist / dist_norm_denom)
+
+        ms = [d["mean_slope"] for d in comps]
+        ms_min = float(min(ms))
+        ms_max = float(max(ms))
+        ms_rng = float(ms_max - ms_min) if (ms_max - ms_min) > 0 else 1.0
+
+        for d in comps:
+            mean_s_norm = float((d["mean_slope"] - ms_min) / ms_rng)
+            d["mean_slope_norm"] = mean_s_norm
+            d["score"] = float(
+                (-1.0 * d["dist_to_center_norm"]) +
+                (0.15 * mean_s_norm) +
+                (-0.30 * d["area_frac"])
+            )
+
+        best = max(comps, key=lambda d: d["score"])
+        selection_reason = "center_biased_score"
+
+    best_id = int(best["id"])
+    best_mask = (lbl == best_id)
+
+    contours = measure.find_contours(best_mask.astype(np.uint8), 0.5)
+    if not contours:
+        raise ValueError("Connected component selected, but no contour could be extracted (find_contours returned empty).")
+
+    caldera_contour = max(contours, key=len)
+
+    debug = {
+        "method": "morphological_slope_roi",
+        "roi_dilate_px": int(roi_dilate_px),
+        "smooth_sigma": float(smooth_sigma),
+        "slope_q": float(slope_q),
+        "slope_threshold": float(thr),
+        "closing_iterations": int(closing_iterations),
+        "extra_dilate_px": int(extra_dilate_px),
+        "min_component_px": int(min_component_px),
+        "max_area_frac": float(max_area_frac),
+        "selection_mode": selection_mode,
+        "selection_reason": selection_reason,
+        "roi_px": int(roi_px),
+        "candidate_px": int(cand_px),
+        "n_components": int(ncomp),
+        "component_sizes_sample": sizes[:20],
+        "center_method": center_method,
+        "center_rc": [float(center_r), float(center_c)],
+        "selected_component_id": int(best_id),
+        "selected_component_px": int(best.get("px", 0)),
+        "selected_component_area_frac": float(best.get("area_frac", 0.0)),
+        "selected_component_centroid_rc": [float(best["centroid_rc"][0]), float(best["centroid_rc"][1])],
+        "selected_component_mean_slope": float(best.get("mean_slope", 0.0)),
+        "contour_len": int(len(caldera_contour)),
+    }
+    if "dist_to_center_px" in best:
+        debug["selected_component_dist_to_center_px"] = float(best["dist_to_center_px"])
+        debug["selected_component_dist_to_center_norm"] = float(best.get("dist_to_center_norm", 0.0))
+    if "score" in best:
+        debug["selected_component_score"] = float(best["score"])
+
+    return caldera_contour, debug
 def caldera_volume_depth_integrated(
     dem: np.ndarray,
     caldera_contour: np.ndarray,
@@ -504,11 +860,11 @@ HUMAN_FIELDS = [
 
 def metrics_to_human_rows(metrics: dict):
     rows = []
-    for section, label, path, unit in HUMAN_FIELDS:
+    for section, label_txt, path, unit in HUMAN_FIELDS:
         v = _get_by_path(metrics, path)
         if isinstance(v, (list, dict)):
             v = json.dumps(v, ensure_ascii=False)
-        rows.append((section, label, v, unit))
+        rows.append((section, label_txt, v, unit))
     return rows
 
 # ===================== Main App =====================
@@ -527,7 +883,7 @@ class VolumeAnalysisApp(QMainWindow):
         self.process_id = self.meta.get("process_id") or _resolve_process_id()
         self.out_dir = _ensure_outputs_dir(self.process_id)
 
-        # ✅ calcoli invariati
+        # ✅ calcoli invariati (volumi ecc.) — cambia SOLO rim detection/contorno
         self.calculate_results()
 
         # GUI only if not headless
@@ -543,11 +899,12 @@ class VolumeAnalysisApp(QMainWindow):
         # ✅ artifacts come Approx1 (sempre)
         self._write_all_artifacts()
 
-        # ✅ stdout payload (server.js lo può parsare)
-        try:
-            self._emit_stdout_payload()
-        except Exception as e:
-            print(f"[WARN] stdout payload failed: {e}")
+        # ✅ stdout payload: UNA SOLA VOLTA, coerente con volume_results.json
+        if HEADLESS:
+            try:
+                self._emit_stdout_payload_single()
+            except Exception as e:
+                print(f"[WARN] stdout payload failed: {e}")
 
     def initUI(self):
         central_widget = QWidget()
@@ -579,6 +936,58 @@ class VolumeAnalysisApp(QMainWindow):
 
         self.update_display()
 
+    def _detect_caldera_contour_robust(self, nodata):
+        """
+        Wrapper robusto:
+        - prova morfologica con slope_q decrescente + min_component_px adattivo
+        - se fallisce, fallback a quota-based (level_ratio)
+        """
+        slope_q_try = [92.0, 90.0, 88.0, 86.0, 84.0, 82.0]
+        roi_px_est = int(np.sum(contour_to_mask(self.base_contour, self.dem.shape)))
+        roi_px_est = max(1, roi_px_est)
+
+        # min_component proporzionale alla ROI (ma con floor per DEM piccoli)
+        base_min = max(200, int(0.0015 * roi_px_est))
+        base_min = min(base_min, max(200, int(0.03 * roi_px_est)))  # clamp upper a 3% ROI
+
+        last_err = None
+        for q in slope_q_try:
+            for factor in (1.0, 0.7, 0.5, 0.35):
+                min_px = max(120, int(base_min * factor))
+                try:
+                    contour, dbg = find_caldera_contour_morphological(
+                        dem=self.dem,
+                        base_contour=self.base_contour,
+                        slope=self.slope,
+                        nodata=nodata,
+                        roi_dilate_px=6,
+                        smooth_sigma=1.0,
+                        slope_q=float(q),
+                        min_component_px=int(min_px),
+                        closing_iterations=2,
+                        extra_dilate_px=0,
+                        selection_mode="center_biased",
+                        max_area_frac=0.45,
+                    )
+                    dbg = dbg or {}
+                    dbg["robust_try"] = {"slope_q": float(q), "min_component_px": int(min_px)}
+                    return contour, dbg
+                except Exception as e:
+                    last_err = e
+                    continue
+
+        # fallback legacy quota
+        try:
+            contour = find_caldera_contour(self.dem, level_ratio=0.8)
+            dbg = {
+                "method": "legacy_level_ratio_fallback",
+                "level_ratio": 0.8,
+                "previous_error": str(last_err) if last_err is not None else None,
+            }
+            return contour, dbg
+        except Exception as e:
+            raise RuntimeError(f"Caldera contour detection failed (morphological + fallback). Last errors: {last_err} / {e}")
+
     def calculate_results(self):
         # ======= TUOI CALCOLI (INVARIATI) =======
         nodata = self.meta.get("nodata", None)
@@ -594,7 +1003,25 @@ class VolumeAnalysisApp(QMainWindow):
         self.distance_base_km = self.distance_meters_base * 1e-3
 
         self.slope = calculate_slope(self.dem)
-        self.caldera_contour = find_caldera_contour(self.dem, level_ratio=0.8)
+
+        # ✅ Caldera contour detection (match Circular Approx1 behavior)
+        self.caldera_contour, self.caldera_debug = find_caldera_contour_morphological(
+            dem=self.dem,
+            base_contour=self.base_contour,
+            slope=self.slope,
+            nodata=nodata,
+            roi_dilate_px=6,
+            smooth_sigma=1.0,
+            slope_q=88.0,
+            min_component_px=500,
+            closing_iterations=2,
+            extra_dilate_px=0,
+            max_area_frac=0.35,
+            selection_mode="center_biased",
+        )
+
+        self.caldera_level_m = None
+
         self.max_slope_index1, self.max_slope_index2 = find_opposite_slope_points(self.slope, self.caldera_contour)
 
         self.distance_meters_caldera = distance_between_points(
@@ -815,7 +1242,11 @@ class VolumeAnalysisApp(QMainWindow):
                 "crs": str(crs) if crs is not None else None,
                 "res": list(res) if res is not None else None,
                 "nodata": nodata,
-                "params": {"base_elevation_ratio": 0.05, "caldera_level_ratio": 0.8}
+                "params": {
+                    "base_elevation_ratio": 0.05,
+                    "caldera_level_ratio": 0.8,
+                    "caldera_rim_detection": "morphological_slope_roi_center_biased_robust",
+                },
             },
             "nodata_stats": dem_nodata_stats(self.dem, nodata=nodata),
             "morphometrics": {
@@ -837,6 +1268,10 @@ class VolumeAnalysisApp(QMainWindow):
                 "V_effective_m3": V_eff_m3,
             },
         }
+
+        if hasattr(self, "caldera_debug") and isinstance(self.caldera_debug, dict):
+            metrics["meta"]["caldera_debug"] = self.caldera_debug
+
         return metrics
 
     def _write_metrics_files(self):
@@ -851,8 +1286,8 @@ class VolumeAnalysisApp(QMainWindow):
         with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow(["section", "metric", "value", "unit"])
-            for section, label, value, unit in human_rows:
-                w.writerow([section, label, value, unit])
+            for section, label_txt, value, unit in human_rows:
+                w.writerow([section, label_txt, value, unit])
 
         print(f"[INFO] metrics written: {json_path}")
         print(f"[INFO] metrics written: {csv_path}")
@@ -901,7 +1336,6 @@ class VolumeAnalysisApp(QMainWindow):
         print(f"[INFO] analysis_images.json updated (doublet appended): {mp}")
 
     def _write_volume_results_json(self):
-        # km/ km²/ km³
         distance_base_km = float(self.distance_meters_base) * 1e-3
         distance_caldera_km = float(self.distance_meters_caldera) * 1e-3
         area_base_km2 = float(self.area_base_m2) * 1e-6
@@ -925,7 +1359,7 @@ class VolumeAnalysisApp(QMainWindow):
                 "h_max_m": float(self.h_max),
                 "pixel_size_m": float(self.meta.get("res")[0]) if self.meta.get("res") else None,
             },
-            # ✅ per il viewer: nomi file (server normalizza a /outputs/<pid>/...)
+            # ✅ SOLO la doublet per UI (come richiesto)
             "images": [
                 "final_doublet_base_vs_caldera.png"
             ],
@@ -943,18 +1377,9 @@ class VolumeAnalysisApp(QMainWindow):
 
         print(f"[INFO] volume_results written: {out_path}")
 
-        if HEADLESS:
-            # utile se server.js fa JSON.parse(stdout)
-            try:
-                print(json.dumps(payload, ensure_ascii=False), flush=True)
-            except Exception:
-                pass
-
     def _write_all_artifacts(self):
-        # 1) metrics
         self._write_metrics_files()
 
-        # 2) final doublet (sempre)
         doublet_path = os.path.join(self.out_dir, "final_doublet_base_vs_caldera.png")
         try:
             self._save_final_doublet_png(doublet_path)
@@ -962,7 +1387,6 @@ class VolumeAnalysisApp(QMainWindow):
         except Exception as e:
             print(f"[WARN] Could not save/append final doublet: {e}")
 
-        # 3) volume_results.json (sempre)
         self._write_volume_results_json()
 
     # ----- overview png (solo GUI) -----
@@ -971,37 +1395,23 @@ class VolumeAnalysisApp(QMainWindow):
         self.figure.savefig(out_png, dpi=150)
         print(f"[PY VOL {self.process_id}] saved {out_png}")
 
-    # ----- stdout payload -----
-    def _emit_stdout_payload(self):
-        # includi anche immagini del manifest (prima UX) + la doppietta
-        mp = os.path.join(self.out_dir, "analysis_images.json")
-        manifest_imgs = _load_manifest_public_images(mp)
-
-        images = []
-        # normalizza: se sono già /outputs/... ok, se sono filename li lasciamo (server normalizza)
-        for it in manifest_imgs:
-            images.append(it)
-
-        # aggiungi sempre la doppietta finale (filename)
-        images.append("final_doublet_base_vs_caldera.png")
-
-        payload = {
-            "processId": self.process_id,
-            "status": "completed",
-            "moduleKey": "circular_approx2",
-            "result": {
-                "base_area_km2": float(self.area_base_m2) * 1e-6,
-                "base_width_km": float(self.distance_meters_base) * 1e-3,
-                "caldera_area_km2": float(self.area_caldera_m2) * 1e-6,
-                "caldera_width_km": float(self.distance_meters_caldera) * 1e-3,
-                "total_volume_km3": float(self.v) * 1e-9,
-                "caldera_volume_km3": float(self.v_caldera) if self.v_caldera is not None else None,
-                "effective_volume_km3": float(self.v_volcano),
-                "h_max_m": float(self.h_max),
-                "pixel_size_m": float(self.meta.get("res")[0]) if self.meta.get("res") else None,
-            },
-            "images": images
-        }
+    # ----- stdout payload: single JSON (headless) -----
+    def _emit_stdout_payload_single(self):
+        """
+        Stampa UNA SOLA riga JSON in stdout in headless, coerente con volume_results.json.
+        (Niente doppioni, niente manifest images qui.)
+        """
+        out_path = os.path.join(self.out_dir, "volume_results.json")
+        try:
+            with open(out_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception:
+            payload = {
+                "processId": self.process_id,
+                "status": "completed",
+                "moduleKey": "circular_approx2",
+                "images": ["final_doublet_base_vs_caldera.png"],
+            }
         print(json.dumps(payload, ensure_ascii=False), flush=True)
 
     # ---- GUI-only actions ----
@@ -1040,7 +1450,6 @@ class VolumeAnalysisApp(QMainWindow):
                     for it in (data.get("images") or []):
                         p = it.get("abs_path")
                         if p and os.path.exists(p):
-                            # rimuovi solo triplet_
                             if "triplet_" not in os.path.basename(p).lower():
                                 image_paths.append(p)
                 except Exception:
@@ -1120,11 +1529,23 @@ if __name__ == '__main__':
     original_file_name = sys.argv[2] if len(sys.argv) > 2 else "Unknown"
 
     process_id = _resolve_process_id()
-    out_dir = _ensure_outputs_dir(process_id)
+    _ = _ensure_outputs_dir(process_id)
 
-    # Prefer working dem if exists
-    candidate = os.path.join(out_dir, "dem_working.tif")
-    dem_file_path = candidate if os.path.exists(candidate) else input_dem_path
+    # ✅ Manifest-first deterministic DEM selection (come Approx1 patchato)
+    dem_choice = _resolve_dem_path_manifest_first(input_dem_path=input_dem_path, process_id=process_id)
+    dem_file_path = dem_choice["selected_path"]
+
+    print("[DEBUG] DEM selection (manifest-first):")
+    print(f"        process_id     = {process_id}")
+    print(f"        input_dem_path = {input_dem_path}")
+    if dem_choice.get("manifest_path"):
+        print(f"        manifest_path  = {dem_choice.get('manifest_path')}")
+    print(f"        selected_path  = {dem_file_path}")
+    print(f"        reason         = {dem_choice.get('reason')}")
+
+    # ✅ Se geografico, riproietta in UTM locale e salva outputs/<PID>/dem_working.tif
+    if os.path.exists(dem_file_path):
+        dem_file_path = ensure_metric_dem(dem_file_path, process_id=process_id)
 
     if not os.path.exists(dem_file_path):
         print(f"Error: File '{dem_file_path}' does not exist.")

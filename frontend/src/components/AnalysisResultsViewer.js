@@ -195,17 +195,16 @@ export default function AnalysisResultsViewer({
 
   const renderCurrentSlide = () => {
     if (current.type === "overview") {
+      // ✅ Niente box “vuoto”: se asp non c’è, la griglia diventa 1 colonna e il blocco aspect non viene renderizzato.
       return (
-        <FramePaper title="Overview (DEM + Aspect)">
+        <FramePaper title="Overview">
           <Box
             sx={{
               width: "100%",
-              // ✅ più largo su desktop per “far respirare” le due colonne
               maxWidth: { xs: "100%", md: 1500 },
               mx: "auto",
               display: "grid",
-              // ✅ affiancate su desktop
-              gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" },
+              gridTemplateColumns: { xs: "1fr", md: asp ? "1fr 1fr" : "1fr" },
               gap: 2,
               alignItems: "center",
             }}
@@ -219,24 +218,20 @@ export default function AnalysisResultsViewer({
                 />
               ) : (
                 <Typography sx={{ opacity: 0.85, color: "#eaeaea", py: 2 }}>
-                  DEM not available yet.
+                  DEM overview not available yet.
                 </Typography>
               )}
             </Box>
 
-            <Box sx={{ width: "100%", display: "flex", justifyContent: "center" }}>
-              {asp ? (
+            {asp ? (
+              <Box sx={{ width: "100%", display: "flex", justifyContent: "center" }}>
                 <img
                   alt="aspect_overview"
                   src={imgSrc(asp, asp?.filename)}
                   style={{ ...IMG_STYLE, maxHeight: IMG_MAX_H_OVERVIEW }}
                 />
-              ) : (
-                <Typography sx={{ opacity: 0.85, color: "#eaeaea", py: 2 }}>
-                  Aspect not available yet.
-                </Typography>
-              )}
-            </Box>
+              </Box>
+            ) : null}
           </Box>
         </FramePaper>
       );
