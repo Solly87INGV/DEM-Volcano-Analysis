@@ -40,12 +40,17 @@
   }
 }
 
-/* Nuovo contenitore per disporre la descrizione e il modulo di upload fianco a fianco */
+/* Contenitore principale delle pagine/step (sopra al footer fixed) */
 .content-container {
   display: flex;
   flex: 1; /* Occupa tutto lo spazio verticale disponibile sopra il footer */
   justify-content: center;
   align-items: flex-start;
   margin-top: -20px;
-}
 
+  /* ✅ FIX: evita che il footer fixed copra l'ultima parte della pagina */
+  padding-bottom: calc(var(--app-footer-height) + 16px);
+
+  width: 100%;
+  box-sizing: border-box;
+}

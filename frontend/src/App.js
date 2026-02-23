@@ -141,7 +141,7 @@ function App() {
         )}
 
         {step === "analysisResults" && (
-          <div style={{ maxWidth: 1200, margin: "0 auto", width: "100%", paddingBottom: 80 }}>
+          <div style={{ maxWidth: 1200, margin: "0 auto", width: "100%" }}>
             <h2 style={{ marginTop: 0 }}>Complete DEM Analysis — Results</h2>
 
             {!processId ? (
@@ -163,7 +163,7 @@ function App() {
             processId={processId}
             // torna ai risultati DEM
             onBack={() => setStep("analysisResults")}
-            // compat: se la tua vecchia VolumeSelection usa "setStep('results')"
+            // compat: se la tua VolumeSelection usa "setStep('results')"
             setStep={(s) => {
               if (s === "results") setStep("volumeResults");
               if (s === "selection") setStep("volumeSelection");
