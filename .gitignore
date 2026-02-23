@@ -1,0 +1,29 @@
+cat > .gitignore << 'EOF'
+# --- Global ignores for DEM-Volcano-Analysis ---
+
+# dependencies (all subprojects)
+**/node_modules/
+
+# env files
+**/.env
+
+# python cache
+**/__pycache__/
+**/*.pyc
+
+# runtime / outputs
+backend/outputs/
+outputs/
+uploads/
+backend/output_statistics.json
+backend/statistiche_output.json
+
+# frontend build
+frontend/build/
+
+# misc
+.DS_Store
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+EOF
