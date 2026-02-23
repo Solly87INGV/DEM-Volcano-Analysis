@@ -1,4 +1,4 @@
-// server.js (docker-ready: env paths + serve React build + python path via env)
+// server.js (docker-ready: env paths + serve React build + python cmd via env/launcher)
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
@@ -7,6 +7,15 @@ const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const { performance } = require('perf_hooks');
+
+// ✅ Load backend/.env reliably (DEV)
+try {
+  // Only load if dotenv is installed; safe for Docker too
+  // Make sure you run: npm i dotenv  (in backend/)
+  require('dotenv').config({ path: path.join(__dirname, '.env') });
+} catch (e) {
+  // If dotenv is not installed, continue (env vars may come from shell/Docker)
+}
 
 const app = express();
 app.use(cors());
@@ -20,7 +29,8 @@ app.use(express.json({ limit: '10mb' }));
 const PORT = Number(process.env.PORT || 5000);
 
 // Python executable inside container (or local)
-const PYTHON_BIN = process.env.PYTHON_BIN || process.env.PYTHON_PATH || 'python3';
+// NOTE: On Windows we prefer the launcher "py -3" unless a full PYTHON_BIN path is provided.
+const PYTHON_BIN_RAW = (process.env.PYTHON_BIN || process.env.PYTHON_PATH || '').trim();
 
 // Use env dirs if provided (compose sets them), fallback to local dev defaults
 const uploadsDir = process.env.UPLOADS_DIR
@@ -38,10 +48,52 @@ fs.mkdirSync(outputsDir, { recursive: true });
 // Serve outputs (PNG/PDF/JSON) as static
 app.use('/outputs', express.static(outputsDir));
 
+// ---------------------------
+// Python command resolution
+// - If PYTHON_BIN is set to an absolute path -> use it.
+// - If PYTHON_BIN is set to a single token (e.g., "python") -> use it.
+// - If PYTHON_BIN is set to something with spaces (e.g., "py -3") -> split safely.
+// - If not set:
+//    - Windows: use "py -3" (most reliable; does NOT depend on PATH alias weirdness)
+//    - Non-Windows: use "python3"
+// ---------------------------
+function resolvePythonCommand() {
+  const isWin = process.platform === 'win32';
+
+  if (PYTHON_BIN_RAW) {
+    // Allow either:
+    // 1) absolute path: C:\...\python.exe
+    // 2) token command: python / python3 / py
+    // 3) command + args: "py -3"
+    // Split on spaces only if it looks like multiple tokens AND not a quoted path.
+    const trimmed = PYTHON_BIN_RAW;
+
+    // If it starts with a quote, treat as full cmd (strip quotes) and no prefix args.
+    if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+      return { cmd: trimmed.slice(1, -1), prefix: [] };
+    }
+
+    // If it contains spaces, interpret first token as cmd and rest as prefix args.
+    if (trimmed.includes(' ')) {
+      const parts = trimmed.split(/\s+/).filter(Boolean);
+      return { cmd: parts[0], prefix: parts.slice(1) };
+    }
+
+    return { cmd: trimmed, prefix: [] };
+  }
+
+  if (isWin) return { cmd: 'py', prefix: ['-3'] };
+  return { cmd: 'python3', prefix: [] };
+}
+
+const PY = resolvePythonCommand();
+
 // Optional: log startup config once
 console.log('[SERVER] config:', {
   PORT,
-  PYTHON_BIN,
+  PYTHON_BIN_RAW: PYTHON_BIN_RAW || '(not set)',
+  PYTHON_CMD: PY.cmd,
+  PYTHON_PREFIX: PY.prefix,
   uploadsDir,
   outputsDir,
   FRONTEND_BUILD_DIR: process.env.FRONTEND_BUILD_DIR || '(not set)',
@@ -96,7 +148,12 @@ function buildPyEnv(extraEnv = {}) {
 }
 
 function spawnPython({ args, processId, extraEnv = {} }) {
-  return spawn(PYTHON_BIN, args, {
+  const fullArgs = [...PY.prefix, ...args];
+
+  // Log once per spawn (first tokens only)
+  console.log(`[SERVER] spawnPython pid=${processId || '-'} ->`, PY.cmd, fullArgs.slice(0, 6).join(' '), '...');
+
+  return spawn(PY.cmd, fullArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: buildPyEnv({
       PROCESS_ID: processId || '',
@@ -104,6 +161,7 @@ function spawnPython({ args, processId, extraEnv = {} }) {
       UPLOADS_DIR: uploadsDir,
       ...extraEnv,
     }),
+    shell: false,
   });
 }
 
@@ -260,20 +318,16 @@ app.post('/process', upload.single('demFile'), (req, res) => {
 
   const absFilePath = path.resolve(file.path);
 
-  const child = spawn(
-    PYTHON_BIN,
-    [scriptPath, absFilePath, originalFileStem, processId],
-    {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: buildPyEnv({
-        PROCESS_ID: processId,
-        ORIGINAL_FILE_NAME: originalFileNameRaw,
-        ORIGINAL_FILE_STEM: originalFileStem,
-        UPLOADS_DIR: uploadsDir,
-        OUTPUTS_DIR: outputsDir,
-      }),
-    }
-  );
+  const child = spawnPython({
+    processId,
+    args: [scriptPath, absFilePath, originalFileStem, processId],
+    extraEnv: {
+      ORIGINAL_FILE_NAME: originalFileNameRaw,
+      ORIGINAL_FILE_STEM: originalFileStem,
+      UPLOADS_DIR: uploadsDir,
+      OUTPUTS_DIR: outputsDir,
+    },
+  });
 
   child.stdout.on('data', (d) => {
     const line = d.toString().trim();
@@ -382,21 +436,17 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
 
   const absFilePath = path.resolve(file.path);
 
-  const child = spawn(
-    PYTHON_BIN,
+  const child = spawnPython({
+    processId,
     // keep argv schema: (path, stem) -> stem ignorabile se lo script non lo usa
-    [scriptPath, absFilePath, originalFileStem],
-    {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: buildPyEnv({
-        PROCESS_ID: processId,
-        ORIGINAL_FILE_NAME: originalFileNameRaw,
-        ORIGINAL_FILE_STEM: originalFileStem,
-        UPLOADS_DIR: uploadsDir,
-        OUTPUTS_DIR: outputsDir,
-      }),
-    }
-  );
+    args: [scriptPath, absFilePath, originalFileStem],
+    extraEnv: {
+      ORIGINAL_FILE_NAME: originalFileNameRaw,
+      ORIGINAL_FILE_STEM: originalFileStem,
+      UPLOADS_DIR: uploadsDir,
+      OUTPUTS_DIR: outputsDir,
+    },
+  });
 
   let resultData = '';
 
@@ -448,8 +498,6 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
 // ---------------------------
 // ✅ NEW: Metrics export endpoint
 // GET /api/metrics/:processId?moduleKey=elliptical_approx2&format=json|csv
-// - picks the best metrics file in outputs/<pid>/
-// - sends it as attachment
 // ---------------------------
 app.get('/api/metrics/:processId', (req, res) => {
   const { processId } = req.params;
@@ -482,7 +530,7 @@ app.get('/api/metrics/:processId', (req, res) => {
 });
 
 // ---------------------------
-// ✅ PDF Report endpoint (aligned behavior with old app)
+// ✅ PDF Report endpoint
 // GET /api/report/:processId?moduleKey=circular_approx1
 // ---------------------------
 app.get('/api/report/:processId', (req, res) => {
@@ -707,7 +755,7 @@ if (frontendBuildDir && fs.existsSync(frontendBuildDir)) {
       req.path.startsWith('/calculateCurvatures') ||
       req.path.startsWith('/analysis') ||
       req.path.startsWith('/api/report') ||
-      req.path.startsWith('/api/metrics') || // ✅ NEW: non farla mangiare dalla SPA
+      req.path.startsWith('/api/metrics') ||
       req.path.startsWith('/health')
     ) {
       return next();
@@ -722,7 +770,7 @@ if (frontendBuildDir && fs.existsSync(frontendBuildDir)) {
 
 app.listen(PORT, () => {
   console.log(`[SERVER] listening on http://localhost:${PORT}`);
-  console.log(`[SERVER] PYTHON_BIN=${PYTHON_BIN}`);
+  console.log(`[SERVER] PYTHON_CMD=${PY.cmd} PREFIX=${JSON.stringify(PY.prefix)}`);
   console.log(`[SERVER] UPLOADS_DIR=${uploadsDir}`);
   console.log(`[SERVER] OUTPUTS_DIR=${outputsDir}`);
 });
