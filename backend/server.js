@@ -10,11 +10,9 @@ const { performance } = require('perf_hooks');
 
 // ✅ Load backend/.env reliably (DEV)
 try {
-  // Only load if dotenv is installed; safe for Docker too
-  // Make sure you run: npm i dotenv  (in backend/)
   require('dotenv').config({ path: path.join(__dirname, '.env') });
 } catch (e) {
-  // If dotenv is not installed, continue (env vars may come from shell/Docker)
+  // dotenv not installed or not wanted -> ok
 }
 
 const app = express();
@@ -27,12 +25,12 @@ app.use(express.json({ limit: '10mb' }));
 // Env / Paths (docker-friendly)
 // ---------------------------
 const PORT = Number(process.env.PORT || 5000);
+const DEBUG_CALC = String(process.env.DEBUG_CALC || '').trim() === '1';
 
 // Python executable inside container (or local)
 // NOTE: On Windows we prefer the launcher "py -3" unless a full PYTHON_BIN path is provided.
 const PYTHON_BIN_RAW = (process.env.PYTHON_BIN || process.env.PYTHON_PATH || '').trim();
 
-// Use env dirs if provided (compose sets them), fallback to local dev defaults
 const uploadsDir = process.env.UPLOADS_DIR
   ? path.resolve(process.env.UPLOADS_DIR)
   : path.join(__dirname, 'uploads');
@@ -41,7 +39,6 @@ const outputsDir = process.env.OUTPUTS_DIR
   ? path.resolve(process.env.OUTPUTS_DIR)
   : path.join(__dirname, 'outputs');
 
-// Ensure dirs exist
 fs.mkdirSync(uploadsDir, { recursive: true });
 fs.mkdirSync(outputsDir, { recursive: true });
 
@@ -50,30 +47,20 @@ app.use('/outputs', express.static(outputsDir));
 
 // ---------------------------
 // Python command resolution
-// - If PYTHON_BIN is set to an absolute path -> use it.
-// - If PYTHON_BIN is set to a single token (e.g., "python") -> use it.
-// - If PYTHON_BIN is set to something with spaces (e.g., "py -3") -> split safely.
-// - If not set:
-//    - Windows: use "py -3" (most reliable; does NOT depend on PATH alias weirdness)
-//    - Non-Windows: use "python3"
 // ---------------------------
 function resolvePythonCommand() {
   const isWin = process.platform === 'win32';
 
   if (PYTHON_BIN_RAW) {
-    // Allow either:
-    // 1) absolute path: C:\...\python.exe
-    // 2) token command: python / python3 / py
-    // 3) command + args: "py -3"
-    // Split on spaces only if it looks like multiple tokens AND not a quoted path.
     const trimmed = PYTHON_BIN_RAW;
 
-    // If it starts with a quote, treat as full cmd (strip quotes) and no prefix args.
-    if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+    if (
+      (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      (trimmed.startsWith("'") && trimmed.endsWith("'"))
+    ) {
       return { cmd: trimmed.slice(1, -1), prefix: [] };
     }
 
-    // If it contains spaces, interpret first token as cmd and rest as prefix args.
     if (trimmed.includes(' ')) {
       const parts = trimmed.split(/\s+/).filter(Boolean);
       return { cmd: parts[0], prefix: parts.slice(1) };
@@ -88,7 +75,6 @@ function resolvePythonCommand() {
 
 const PY = resolvePythonCommand();
 
-// Optional: log startup config once
 console.log('[SERVER] config:', {
   PORT,
   PYTHON_BIN_RAW: PYTHON_BIN_RAW || '(not set)',
@@ -100,6 +86,7 @@ console.log('[SERVER] config:', {
   HEADLESS: process.env.HEADLESS,
   PROJ_LIB: process.env.PROJ_LIB,
   PROJ_DATA: process.env.PROJ_DATA,
+  DEBUG_CALC,
 });
 
 // ---------------------------
@@ -116,10 +103,6 @@ const processingStatus = {};
 
 // ---------------------------
 // Python env helper
-// - In Docker/Linux do NOT force PROJ_LIB to pyproj. If PROJ_LIB/PROJ_DATA are set (e.g., from host),
-//   they can break rasterio/GDAL with "DATABASE.LAYOUT.VERSION.MINOR" mismatch.
-// - On Windows we keep them (some setups need pyproj PROJ db to override PostGIS/OSGeo clashes).
-// - Also set headless defaults (Agg/offscreen) for reproducible server runs.
 // ---------------------------
 function buildPyEnv(extraEnv = {}) {
   const env = {
@@ -127,12 +110,13 @@ function buildPyEnv(extraEnv = {}) {
     ...extraEnv,
     PYTHONUNBUFFERED: '1',
 
-    // Headless flags (safe defaults)
+    // Headless defaults
     HEADLESS: process.env.HEADLESS || '1',
     MPLBACKEND: process.env.MPLBACKEND || 'Agg',
     QT_QPA_PLATFORM: process.env.QT_QPA_PLATFORM || 'offscreen',
   };
 
+  // Linux/Docker: avoid host PROJ mismatch
   if (process.platform !== 'win32') {
     if (env.PROJ_LIB) {
       console.log(`[SERVER] clearing PROJ_LIB for non-Windows run (was: ${env.PROJ_LIB})`);
@@ -150,8 +134,12 @@ function buildPyEnv(extraEnv = {}) {
 function spawnPython({ args, processId, extraEnv = {} }) {
   const fullArgs = [...PY.prefix, ...args];
 
-  // Log once per spawn (first tokens only)
-  console.log(`[SERVER] spawnPython pid=${processId || '-'} ->`, PY.cmd, fullArgs.slice(0, 6).join(' '), '...');
+  console.log(
+    `[SERVER] spawnPython pid=${processId || '-'} ->`,
+    PY.cmd,
+    fullArgs.slice(0, 6).join(' '),
+    '...'
+  );
 
   return spawn(PY.cmd, fullArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -171,7 +159,6 @@ function spawnPython({ args, processId, extraEnv = {} }) {
 function normalizeImages(processId, images) {
   if (!Array.isArray(images)) return [];
   return images.map((img) => {
-    // se è stringa, la trasformo
     if (typeof img === 'string') {
       const filename = img;
       return { filename, url: `/outputs/${processId}/${filename}` };
@@ -209,17 +196,64 @@ function writeProcessMeta(procDir, metaPatch) {
   }
 }
 
-// ====== Helper: derive moduleKey from request ======
+// ====== Helper: normalize approximationType ======
+function normalizeApproximationType(v) {
+  const s = String(v || '').trim().toLowerCase();
+  if (!s) return '';
+  if (s === 'approximation1') return 'approx1';
+  if (s === 'approximation2') return 'approx2';
+  if (s === 'approx1' || s === 'approx2') return s;
+  return s; // leave unknowns as-is (or return '' if you prefer strict)
+}
+
+// ====== Helper: derive legacy moduleKey (approx-based) ======
+// (legacy keys used only if you still need them somewhere)
 function deriveModuleKey(volumeType, approximationType) {
-  if (volumeType === 'circular') {
-    if (approximationType === 'approximation1') return 'circular_approx1';
-    if (approximationType === 'approximation2') return 'circular_approx2';
+  const vt = String(volumeType || '').trim().toLowerCase();
+  const ap = normalizeApproximationType(approximationType);
+
+  if (vt === 'circular') {
+    if (ap === 'approx1') return 'circular_approx1';
+    if (ap === 'approx2') return 'circular_approx2';
   }
-  if (volumeType === 'elliptical') {
-    if (approximationType === 'approximation1') return 'elliptical_approx1';
-    if (approximationType === 'approximation2') return 'elliptical_approx2';
+  if (vt === 'elliptical') {
+    if (ap === 'approx1') return 'elliptical_approx1';
+    if (ap === 'approx2') return 'elliptical_approx2';
   }
   return '';
+}
+
+// ====== Helper: derive NEW moduleKey from request (Geometry + Base profile) ======
+function deriveModuleKeyV2(volumeType, baseProfile) {
+  const vt = String(volumeType || '').trim().toLowerCase();
+  const bp = String(baseProfile || '').trim().toLowerCase();
+
+  if (!vt) return '';
+  if (bp !== 'island' && bp !== 'continental') return vt; // fallback clean
+  return `${vt}_${bp}`;
+}
+
+// ✅ Patch file written by legacy python so it doesn't keep old moduleKey forever
+function patchVolumeResultsFile(procDir, moduleKey, baseProfile) {
+  try {
+    const p = path.join(procDir, 'volume_results.json');
+    if (!fs.existsSync(p)) return;
+
+    const raw = fs.readFileSync(p, 'utf-8');
+    let obj = null;
+    try {
+      obj = JSON.parse(raw);
+    } catch {
+      return;
+    }
+
+    obj.moduleKey = moduleKey;
+    obj.baseProfile = baseProfile || '';
+
+    fs.writeFileSync(p, JSON.stringify(obj, null, 2), 'utf-8');
+  } catch (e) {
+    console.warn('[WARN] patchVolumeResultsFile failed:', e);
+  }
 }
 
 // ✅ NEW: map moduleKey -> metrics tag naming (per match dei file legacy)
@@ -242,7 +276,7 @@ function pickMetricsPath(procDir, moduleKey, ext /* 'csv'|'json' */) {
 
     const candidates = files
       .filter((f) => f.toLowerCase().endsWith('.' + wantedExt))
-      .filter((f) => f.toLowerCase().includes('metrics')) // keep only metrics*
+      .filter((f) => f.toLowerCase().includes('metrics'))
       .map((f) => ({ f, p: path.join(procDir, f) }))
       .filter((x) => fs.existsSync(x.p));
 
@@ -250,21 +284,18 @@ function pickMetricsPath(procDir, moduleKey, ext /* 'csv'|'json' */) {
 
     const tag = moduleKeyToMetricsTag(moduleKey);
     if (tag) {
-      // prefer metrics_<tag>*.<ext> (es: metrics_circ_a2.json)
       const pref = `metrics_${tag}`.toLowerCase();
       const tagged = candidates
         .filter((x) => x.f.toLowerCase().startsWith(pref))
         .sort((a, b) => fs.statSync(b.p).mtimeMs - fs.statSync(a.p).mtimeMs);
       if (tagged.length) return tagged[0].p;
 
-      // secondary: any file that contains tag
       const contains = candidates
         .filter((x) => x.f.toLowerCase().includes(tag))
         .sort((a, b) => fs.statSync(b.p).mtimeMs - fs.statSync(a.p).mtimeMs);
       if (contains.length) return contains[0].p;
     }
 
-    // fallback: newest metrics*.ext
     candidates.sort((a, b) => fs.statSync(b.p).mtimeMs - fs.statSync(a.p).mtimeMs);
     return candidates[0].p;
   } catch (e) {
@@ -274,7 +305,7 @@ function pickMetricsPath(procDir, moduleKey, ext /* 'csv'|'json' */) {
 }
 
 // ---------------------------
-// Optional: simple healthcheck endpoint (useful for Docker)
+// Healthcheck
 // ---------------------------
 app.get('/health', (req, res) => res.json({ ok: true }));
 
@@ -302,7 +333,6 @@ app.post('/process', upload.single('demFile'), (req, res) => {
   const processId = uuidv4();
   processingStatus[processId] = { status: 'processing' };
 
-  // Write meta.json early (used by build_pdf_report.py for titles)
   const procDir = path.join(outputsDir, processId);
   const inputDemName = (file && file.originalname)
     ? String(file.originalname)
@@ -379,6 +409,11 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
   const file = req.file;
   const volumeType = req.body.volumeType;
   const approximationType = req.body.approximationType;
+  const baseProfile = req.body.baseProfile; // island | continental (new UI model)
+
+  if (DEBUG_CALC) {
+    console.log('[SERVER] /calculateVolume req:', { volumeType, approximationType, baseProfile });
+  }
 
   if (!file || !volumeType || !approximationType) {
     console.error('[ERROR] Missing required fields.');
@@ -392,12 +427,13 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
 
   const originalFileStem = path.parse(originalFileNameRaw).name || 'Unknown';
 
-  // ✅ fondamentale: usa SEMPRE il processId che arriva dall’analisi, se c’è
+  // ✅ usa SEMPRE il processId che arriva dall’analisi, se c’è
   const processId = req.body.processId ? String(req.body.processId) : uuidv4();
 
-  // Derive moduleKey (used by meta.json + report title)
-  const moduleKey = deriveModuleKey(volumeType, approximationType);
+  // ✅ moduleKey nuovo (geometry+profile) con fallback legacy
+  const moduleKey = deriveModuleKeyV2(volumeType, baseProfile) || deriveModuleKey(volumeType, approximationType);
 
+  // bridge: per ora scegli ancora lo script con approx
   let scriptPath = null;
   if (volumeType === 'circular') {
     if (approximationType === 'approximation1') {
@@ -417,7 +453,7 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
     return res.status(400).json({ error: 'Invalid volumeType or approximationType' });
   }
 
-  // Write meta.json (aligned with build_pdf_report.py expectations)
+  // meta.json (per report/trace)
   const procDir = path.join(outputsDir, processId);
   const inputDemName = (file && file.originalname)
     ? String(file.originalname)
@@ -427,9 +463,10 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
     input_dem_name: inputDemName,
     original_file_stem: String(originalFileStem || ''),
     processId: String(processId || ''),
-    moduleKey: String(moduleKey || ''), // IMPORTANT: build_pdf_report.py reads meta.moduleKey
+    moduleKey: String(moduleKey || ''),
     volumeType: String(volumeType || ''),
     approximationType: String(approximationType || ''),
+    baseProfile: String(baseProfile || ''),
     step: 'calculate_volume',
     updated_at: new Date().toISOString(),
   });
@@ -438,13 +475,18 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
 
   const child = spawnPython({
     processId,
-    // keep argv schema: (path, stem) -> stem ignorabile se lo script non lo usa
     args: [scriptPath, absFilePath, originalFileStem],
     extraEnv: {
       ORIGINAL_FILE_NAME: originalFileNameRaw,
       ORIGINAL_FILE_STEM: originalFileStem,
       UPLOADS_DIR: uploadsDir,
       OUTPUTS_DIR: outputsDir,
+
+      // ✅ prepare refactor: python can read these later
+      MODULE_KEY: moduleKey,
+      BASE_PROFILE: baseProfile || '',
+      VOLUME_TYPE: volumeType,
+      APPROXIMATION_TYPE: approximationType,
     },
   });
 
@@ -465,39 +507,69 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
     });
   });
 
-  child.on('close', (code) => {
+    child.on('close', (code) => {
     const dt = (performance.now() - t0).toFixed(1);
     console.log(`[TIMING][SERVER] /calculateVolume finished in ${dt} ms (code=${code})`);
 
-    if (code === 0) {
-      // ✅ prova JSON, altrimenti fallback
-      try {
-        const parsed = JSON.parse(resultData);
-
-        // normalizza sempre processId + status + images.url
-        const normalized = {
-          processId: parsed.processId || processId,
-          status: parsed.status || 'completed',
-          result: parsed.result ?? parsed,
-          images: normalizeImages(parsed.processId || processId, parsed.images || []),
-          ...parsed,
-        };
-
-        if (!('result' in parsed)) normalized.result = parsed;
-
-        return res.json(normalized);
-      } catch (e) {
-        return res.json({ processId, status: 'completed', result: resultData, images: [] });
-      }
+    if (code !== 0) {
+      return res.status(500).json({ error: 'Error calculating volume' });
     }
 
-    return res.status(500).json({ error: 'Error calculating volume' });
+    // ✅ SEMPRE patchare il file scritto da python (non dipende dallo stdout)
+    patchVolumeResultsFile(procDir, moduleKey, baseProfile);
+
+    // ✅ PRIMA scelta: se python ha stampato JSON pulito, ok
+    try {
+      const parsed = JSON.parse(resultData);
+
+      const normalized = {
+        processId: parsed.processId || processId,
+        status: parsed.status || 'completed',
+        result: parsed.result ?? parsed,
+        images: normalizeImages(parsed.processId || processId, parsed.images || []),
+
+        // keep everything from python (legacy), then override app-model fields
+        ...parsed,
+        moduleKey: moduleKey,
+        baseProfile: baseProfile || '',
+      };
+
+      if (!('result' in parsed)) normalized.result = parsed;
+
+      return res.json(normalized);
+    } catch (e) {
+      // ✅ Fallback serio: leggi il JSON dal disco (quello vero)
+      try {
+        const vrPath = path.join(procDir, 'volume_results.json');
+        if (fs.existsSync(vrPath)) {
+          const vr = JSON.parse(fs.readFileSync(vrPath, 'utf-8'));
+
+          // riallinea comunque (doppia sicurezza)
+          vr.moduleKey = moduleKey;
+          vr.baseProfile = baseProfile || '';
+
+          return res.json(vr);
+        }
+      } catch {
+        // ignore
+      }
+
+      // fallback finale: non ideale, ma consistente
+      return res.json({
+        processId,
+        status: 'completed',
+        moduleKey,
+        baseProfile: baseProfile || '',
+        result: resultData,
+        images: [],
+      });
+    }
   });
 });
 
 // ---------------------------
-// ✅ NEW: Metrics export endpoint
-// GET /api/metrics/:processId?moduleKey=elliptical_approx2&format=json|csv
+// ✅ Metrics export endpoint
+// GET /api/metrics/:processId?moduleKey=...&format=json|csv
 // ---------------------------
 app.get('/api/metrics/:processId', (req, res) => {
   const { processId } = req.params;
@@ -531,21 +603,23 @@ app.get('/api/metrics/:processId', (req, res) => {
 
 // ---------------------------
 // ✅ PDF Report endpoint
-// GET /api/report/:processId?moduleKey=circular_approx1
+// GET /api/report/:processId?moduleKey=...
 // ---------------------------
 app.get('/api/report/:processId', (req, res) => {
   const t0 = performance.now();
 
   const { processId } = req.params;
-  const moduleKey = req.query.moduleKey ? String(req.query.moduleKey) : (req.query.module ? String(req.query.module) : '');
+  const moduleKey = req.query.moduleKey
+    ? String(req.query.moduleKey)
+    : (req.query.module ? String(req.query.module) : '');
 
   if (!processId) {
     return res.status(400).json({ error: 'Missing processId' });
   }
 
   const procDir = path.join(outputsDir, processId);
-
   const safeModuleKey = (moduleKey || 'circular_approx1').replace(/[^a-zA-Z0-9_-]/g, '');
+
   const pickLatestReportPdf = () => {
     try {
       if (!fs.existsSync(procDir)) return null;
@@ -742,7 +816,6 @@ const frontendBuildDir = process.env.FRONTEND_BUILD_DIR
 if (frontendBuildDir && fs.existsSync(frontendBuildDir)) {
   app.use(express.static(frontendBuildDir));
 
-  // Fallback SPA: qualsiasi rotta non-API torna index.html
   app.get('*', (req, res, next) => {
     if (
       req.path.startsWith('/outputs') ||

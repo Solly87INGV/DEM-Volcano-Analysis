@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 # EllipticalVolcano_Approx2.py
 # ——————————————————————————————————————————————————————————
 # Approx2 (ellittico): calcoli invariati per l’EDIFICIO.
@@ -7,7 +10,7 @@
 # - artifacts:
 #     * metrics_ellip_a2.json
 #     * metrics_ellip_a2.csv
-#     * volume_results.json  (UI-ready)
+#     * volume_results.json  (UI-ready + V2 meta)
 #     * elliptical_approx2_overview.png
 #     * final_doublet_base_vs_caldera.png
 # - volume_results.json -> images contiene SOLO la final doublet (UI mostra la doppietta)
@@ -86,6 +89,11 @@ HEADLESS = _is_headless()
 
 if HEADLESS:
     os.environ.setdefault("MPLBACKEND", "Agg")
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+    except Exception:
+        pass
 
 import rasterio
 from scipy.ndimage import (
@@ -180,6 +188,42 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 import pdf_generator
 
 METRICS_BASENAME = "metrics_ellip_a2"
+
+# ========== helpers: env meta V2 ==========
+
+def _env_str(name: str, default=None):
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    v = str(v).strip()
+    return v if v != "" else default
+
+def _normalize_approx_type(v: str) -> str:
+    v = (v or "").strip().lower()
+    if v in ("approximation1", "approx1", "a1", "1"):
+        return "approx1"
+    if v in ("approximation2", "approx2", "a2", "2"):
+        return "approx2"
+    return v or "approx2"
+
+def _v2_meta_from_env(default_module_key: str):
+    """
+    Standard V2 meta fields (aligned with other modules):
+      - moduleKey
+      - baseProfile
+      - volumeType
+      - approximationType
+    """
+    module_key = _env_str("MODULE_KEY", default_module_key)
+    base_profile = _env_str("BASE_PROFILE", None)
+    volume_type = _env_str("VOLUME_TYPE", "elliptical")
+    approximation_type = _normalize_approx_type(_env_str("APPROXIMATION_TYPE", "approx2"))
+    return {
+        "moduleKey": module_key,
+        "baseProfile": base_profile,
+        "volumeType": volume_type,
+        "approximationType": approximation_type,
+    }
 
 # ========== helpers: outputs ==========
 
@@ -485,7 +529,6 @@ def find_caldera_contour_morphological(
                 mean_radius_px = float(np.mean(rad))
                 p90_radius_px = float(np.percentile(rad, 90))
 
-                # tie-break only
                 cent = _centroid_of_mask(m)
                 if cent is None:
                     continue
@@ -499,7 +542,7 @@ def find_caldera_contour_morphological(
                     inner_overlap = 0.0
 
                 key = (
-                    mean_radius_px - 20.0 * inner_overlap,  # prefer inside
+                    mean_radius_px - 20.0 * inner_overlap,
                     p90_radius_px,
                     d2,
                     -sz
@@ -726,6 +769,11 @@ def _get_by_path(d: dict, path: str):
 HUMAN_FIELDS = [
     ("meta.timestamp_utc", "Run timestamp (UTC)"),
     ("meta.process_id", "Run ID (process_id)"),
+    ("meta.moduleKey", "moduleKey"),
+    ("meta.baseProfile", "baseProfile"),
+    ("meta.volumeType", "volumeType"),
+    ("meta.approximationType", "approximationType"),
+
     ("meta.original_file_name", "Original input filename"),
     ("meta.original_file_stem", "Original input filename (stem)"),
     ("meta.input_dem_path", "Input DEM path"),
@@ -1178,6 +1226,8 @@ class VolumeAnalysisApp(QMainWindow):
         res = self.meta.get("res")
         nodata = self.meta.get("nodata")
 
+        v2 = _v2_meta_from_env(default_module_key="elliptical_approx2")
+
         A_base_m2 = float(self.area_base) * 1e6
         A_caldera_m2 = float(self.area_caldera) * 1e6
 
@@ -1212,6 +1262,13 @@ class VolumeAnalysisApp(QMainWindow):
             "meta": {
                 "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
                 "process_id": self.process_id,
+
+                # ✅ V2 meta
+                "moduleKey": v2["moduleKey"],
+                "baseProfile": v2["baseProfile"],
+                "volumeType": v2["volumeType"],
+                "approximationType": v2["approximationType"],
+
                 "original_file_name": os.environ.get("ORIGINAL_FILE_NAME") or self.meta.get("original_file_name"),
                 "original_file_stem": os.environ.get("ORIGINAL_FILE_STEM") or self.meta.get("original_file_stem"),
                 "input_dem_path": self.meta.get("input_dem_path"),
@@ -1221,13 +1278,13 @@ class VolumeAnalysisApp(QMainWindow):
                 "nodata": nodata,
                 "params": {
                     "base_elevation_ratio": 0.05,
-                    # ✅ caldera is slope/ROI-based with inner-ring selection
                     "caldera_rim_detection": "morphological_slope_roi_center_biased_with_radius_and_inner_roi_overlap",
                     "roi_dilate_px": 6,
                     "smooth_sigma": 1.0,
                     "slope_q": 88.0,
                     "min_component_px": 500,
                     "max_area_frac": 0.45,
+                    "caldera_depth_method": "dem_rim_floor_percentiles_with_fallback",
                 }
             },
             "nodata_stats": dem_nodata_stats(self.dem, nodata=nodata),
@@ -1324,6 +1381,8 @@ class VolumeAnalysisApp(QMainWindow):
 
         images: SOLO la final doublet (UI mostra la doppietta).
         """
+        v2 = _v2_meta_from_env(default_module_key="elliptical_approx2")
+
         pixel_size_m = None
         res = self.meta.get("res")
         try:
@@ -1337,7 +1396,13 @@ class VolumeAnalysisApp(QMainWindow):
         payload = {
             "processId": self.process_id,
             "status": "completed",
-            "moduleKey": "elliptical_approx2",
+
+            # ✅ V2 fields
+            "moduleKey": v2["moduleKey"],
+            "baseProfile": v2["baseProfile"],
+            "volumeType": v2["volumeType"],
+            "approximationType": v2["approximationType"],
+
             "summaryText": self.results_text,
             "result": {
                 "base_area_km2": float(self.area_base),
@@ -1485,6 +1550,7 @@ class VolumeAnalysisApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"An error occurred while exporting metrics: {e}")
 
+
 # ========== Entry Point ==========
 
 if __name__ == '__main__':
@@ -1496,7 +1562,7 @@ if __name__ == '__main__':
     original_file_name = sys.argv[2] if len(sys.argv) > 2 else "Unknown"
 
     process_id = _resolve_process_id()
-    out_dir = _ensure_outputs_dir(process_id)
+    _ = _ensure_outputs_dir(process_id)
 
     chosen = _choose_working_dem(process_id)
     if chosen is None:

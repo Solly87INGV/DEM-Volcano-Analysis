@@ -115,6 +115,7 @@ const VolumeSelection = ({
     formData.append('demFile', demFile);
     formData.append('volumeType', volumeType);
     formData.append('approximationType', approximationType);
+    formData.append('baseProfile', baseScenario);
 
     // ⚠️ NOTE: baseScenario is UI-only for this step (no backend changes yet).
     // When we do the backend bridge, we'll append:
@@ -175,7 +176,7 @@ const VolumeSelection = ({
       const run = {
         processId: pid,
         status: vr?.status || response?.data?.status || 'completed',
-        moduleKey: vr?.moduleKey || response?.data?.moduleKey || `${volumeType}_${approximationType}`,
+        moduleKey: response?.data?.moduleKey || vr?.moduleKey || `${volumeType}_${baseScenario}`,
         // VolumeResultsViewer gestisce result sia come "result" che come "root object"
         result: vr?.result || vr?.numbers || response?.data?.result || null,
         images: vr?.images || response?.data?.images || [],

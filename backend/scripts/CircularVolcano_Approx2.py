@@ -21,6 +21,45 @@ import datetime
 import math
 import json
 
+# --- V2 meta (from env) -------------------------------------------------------
+def read_v2_meta_from_env():
+    """
+    Reads module identity from env vars set by Node backend.
+    Keeps defaults empty if not provided (legacy-safe).
+    """
+    return {
+        "moduleKey": os.getenv("MODULE_KEY", "") or "",
+        "baseProfile": os.getenv("BASE_PROFILE", "") or "",
+        "volumeType": os.getenv("VOLUME_TYPE", "") or "",
+        "approximationType": os.getenv("APPROXIMATION_TYPE", "") or "",
+    }
+
+def apply_v2_meta(payload: dict, meta: dict) -> dict:
+    """
+    Ensures payload contains the V2 fields at top-level.
+    Does not remove legacy keys; just overlays.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    for k, v in (meta or {}).items():
+        if v != "":
+            payload[k] = v
+    return payload
+
+def apply_v2_meta_to_metrics(metrics: dict, meta: dict) -> dict:
+    """
+    Ensures metrics['meta'] exists and contains V2 fields.
+    """
+    if not isinstance(metrics, dict):
+        return metrics
+    metrics.setdefault("meta", {})
+    if isinstance(metrics["meta"], dict):
+        for k, v in (meta or {}).items():
+            if v != "":
+                metrics["meta"][k] = v
+    return metrics
+# ------------------------------------------------------------------------------
+
 # ================= PROJ / EPSG FIX (Windows + PostGIS conflicts) =================
 def _fix_proj_env():
     """
@@ -428,7 +467,6 @@ def contour_to_mask(contour, shape):
     m[rr, cc] = True
     return m
 
-
 def outside_ring_mask(mask: np.ndarray, offset_px: int = 1, width_px: int = 3) -> np.ndarray:
     """
     Build a ring *outside* a binary mask.
@@ -441,7 +479,6 @@ def outside_ring_mask(mask: np.ndarray, offset_px: int = 1, width_px: int = 3) -
     inner = binary_dilation(mask, iterations=offset_px) if offset_px > 0 else mask
     outer = binary_dilation(mask, iterations=offset_px + width_px)
     return outer & (~inner)
-
 
 # -------------------- Center helper (peak-in-ROI or centroid) --------------------
 
@@ -466,7 +503,6 @@ def _center_from_roi_peak_or_centroid(demf: np.ndarray, roi: np.ndarray) -> tupl
     if rr.size == 0:
         return float(demf.shape[0] / 2.0), float(demf.shape[1] / 2.0), "fallback_image_center"
     return float(np.mean(rr)), float(np.mean(cc)), "roi_centroid"
-
 
 # -------------------- Caldera rim detection (ROI + slope + morphology) --------------------
 
@@ -681,6 +717,7 @@ def find_caldera_contour_morphological(
         debug["selected_component_score"] = float(best["score"])
 
     return caldera_contour, debug
+
 def caldera_volume_depth_integrated(
     dem: np.ndarray,
     caldera_contour: np.ndarray,
@@ -879,6 +916,9 @@ class VolumeAnalysisApp(QMainWindow):
         self.transform = transform
         self.original_file_name = original_file_name
         self.meta = meta or {}
+
+        # ✅ V2 meta from env
+        self.v2_meta = read_v2_meta_from_env()
 
         self.process_id = self.meta.get("process_id") or _resolve_process_id()
         self.out_dir = _ensure_outputs_dir(self.process_id)
@@ -1272,6 +1312,9 @@ class VolumeAnalysisApp(QMainWindow):
         if hasattr(self, "caldera_debug") and isinstance(self.caldera_debug, dict):
             metrics["meta"]["caldera_debug"] = self.caldera_debug
 
+        # ✅ Inject V2 meta into metrics.meta (future-ready)
+        metrics = apply_v2_meta_to_metrics(metrics, getattr(self, "v2_meta", None))
+
         return metrics
 
     def _write_metrics_files(self):
@@ -1371,6 +1414,9 @@ class VolumeAnalysisApp(QMainWindow):
             }
         }
 
+        # ✅ Inject V2 meta into volume_results.json (top-level)
+        payload = apply_v2_meta(payload, getattr(self, "v2_meta", None))
+
         out_path = os.path.join(self.out_dir, "volume_results.json")
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
@@ -1412,6 +1458,7 @@ class VolumeAnalysisApp(QMainWindow):
                 "moduleKey": "circular_approx2",
                 "images": ["final_doublet_base_vs_caldera.png"],
             }
+            payload = apply_v2_meta(payload, getattr(self, "v2_meta", None))
         print(json.dumps(payload, ensure_ascii=False), flush=True)
 
     # ---- GUI-only actions ----

@@ -70,6 +70,23 @@ def _is_headless() -> bool:
 
 HEADLESS = _is_headless()
 
+# -------------------- Module identity (from server.js env) --------------------
+# server.js passes these via spawnPython extraEnv:
+#   MODULE_KEY, BASE_PROFILE, VOLUME_TYPE, APPROXIMATION_TYPE
+MODULE_KEY = (os.environ.get("MODULE_KEY") or "circular_approx1").strip() or "circular_approx1"
+BASE_PROFILE = (os.environ.get("BASE_PROFILE") or "").strip()
+VOLUME_TYPE = (os.environ.get("VOLUME_TYPE") or "circular").strip()
+APPROXIMATION_TYPE = (os.environ.get("APPROXIMATION_TYPE") or "approximation1").strip()
+
+def _normalize_approx_type(v: str) -> str:
+    v = (v or "").strip().lower()
+    if v in ("approximation1", "approx1", "a1", "1"):
+        return "approx1"
+    if v in ("approximation2", "approx2", "a2", "2"):
+        return "approx2"
+    return v or "approx1"
+
+APPROXIMATION_TYPE = _normalize_approx_type(APPROXIMATION_TYPE)
 if HEADLESS:
     os.environ.setdefault("MPLBACKEND", "Agg")
 
@@ -1224,6 +1241,11 @@ class VolumeAnalysisApp(QMainWindow):
             "meta": {
                 "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
                 "process_id": self.process_id,
+                "moduleKey": MODULE_KEY,
+                "baseProfile": BASE_PROFILE,
+                "volumeType": VOLUME_TYPE,
+                "approximationType": APPROXIMATION_TYPE,
+
                 "original_file_name": os.environ.get("ORIGINAL_FILE_NAME") or self.meta.get("original_file_name"),
                 "original_file_stem": os.environ.get("ORIGINAL_FILE_STEM") or self.meta.get("original_file_stem"),
                 "input_dem_path": self.meta.get("input_dem_path"),
@@ -1325,7 +1347,10 @@ class VolumeAnalysisApp(QMainWindow):
         payload = {
             "processId": self.process_id,
             "status": "completed",
-            "moduleKey": "circular_approx1",
+            "moduleKey": MODULE_KEY,
+            "baseProfile": BASE_PROFILE,
+            "volumeType": VOLUME_TYPE,
+            "approximationType": APPROXIMATION_TYPE,
             "summaryText": self.results_text,
 
             "result": {
