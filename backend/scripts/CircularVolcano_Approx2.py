@@ -25,13 +25,20 @@ import json
 def read_v2_meta_from_env():
     """
     Reads module identity from env vars set by Node backend.
-    Keeps defaults empty if not provided (legacy-safe).
+
+    For V2 UI payloads we always expose:
+      - moduleKey
+      - baseProfile
+      - volumeType
+      - approximationType
+
+    Defaults are aligned with the module (circular_approx2 / approx2 / circular).
     """
     return {
-        "moduleKey": os.getenv("MODULE_KEY", "") or "",
-        "baseProfile": os.getenv("BASE_PROFILE", "") or "",
-        "volumeType": os.getenv("VOLUME_TYPE", "") or "",
-        "approximationType": os.getenv("APPROXIMATION_TYPE", "") or "",
+        "moduleKey": MODULE_KEY,
+        "baseProfile": BASE_PROFILE,
+        "volumeType": VOLUME_TYPE,
+        "approximationType": APPROXIMATION_TYPE,
     }
 
 def apply_v2_meta(payload: dict, meta: dict) -> dict:
@@ -106,6 +113,23 @@ def _is_headless() -> bool:
     return v in ("1", "true", "yes", "y", "on")
 
 HEADLESS = _is_headless()
+
+# -------------------- Module identity (from server.js env) --------------------
+# server.js passes these via spawnPython extraEnv:
+#   MODULE_KEY, BASE_PROFILE, VOLUME_TYPE, APPROXIMATION_TYPE
+MODULE_KEY = (os.environ.get("MODULE_KEY") or "circular_approx2").strip() or "circular_approx2"
+BASE_PROFILE = (os.environ.get("BASE_PROFILE") or "").strip()
+VOLUME_TYPE = (os.environ.get("VOLUME_TYPE") or "circular").strip()
+
+def _normalize_approx_type(v: str) -> str:
+    v = (v or "").strip().lower()
+    if v in ("approximation1", "approx1", "a1", "1"):
+        return "approx1"
+    if v in ("approximation2", "approx2", "a2", "2"):
+        return "approx2"
+    return v or "approx2"
+
+APPROXIMATION_TYPE = _normalize_approx_type(os.environ.get("APPROXIMATION_TYPE") or "approximation2")
 
 # Matplotlib backend for headless
 if HEADLESS:
@@ -1285,7 +1309,7 @@ class VolumeAnalysisApp(QMainWindow):
                 "params": {
                     "base_elevation_ratio": 0.05,
                     "caldera_level_ratio": 0.8,
-                    "caldera_rim_detection": "morphological_slope_roi_center_biased_robust",
+                    "caldera_rim_detection": "morphological_slope_roi_center_biased",
                 },
             },
             "nodata_stats": dem_nodata_stats(self.dem, nodata=nodata),
@@ -1390,7 +1414,10 @@ class VolumeAnalysisApp(QMainWindow):
         payload = {
             "processId": self.process_id,
             "status": "completed",
-            "moduleKey": "circular_approx2",
+            "moduleKey": MODULE_KEY,
+            "baseProfile": BASE_PROFILE,
+            "volumeType": VOLUME_TYPE,
+            "approximationType": APPROXIMATION_TYPE,
             "result": {
                 "base_area_km2": area_base_km2,
                 "base_width_km": distance_base_km,
@@ -1455,7 +1482,10 @@ class VolumeAnalysisApp(QMainWindow):
             payload = {
                 "processId": self.process_id,
                 "status": "completed",
-                "moduleKey": "circular_approx2",
+                "moduleKey": MODULE_KEY,
+                "baseProfile": BASE_PROFILE,
+                "volumeType": VOLUME_TYPE,
+                "approximationType": APPROXIMATION_TYPE,
                 "images": ["final_doublet_base_vs_caldera.png"],
             }
             payload = apply_v2_meta(payload, getattr(self, "v2_meta", None))

@@ -193,25 +193,20 @@ METRICS_BASENAME = "metrics_ellip_a1"
 
 # ===================== V2 META (ENV) =====================
 
-def _normalize_approx_type(s: str) -> str:
-    """
-    Keep compatibility with different strings that might come from UI/backend.
-    Preferred short form: approx1 / approx2
-    """
-    s = str(s or "").strip().lower()
-    if not s:
-        return s
-    # common variants -> short
-    if s in ("approximation1", "approximation_1", "approx-1", "approx 1"):
-        return "approx1"
-    if s in ("approximation2", "approximation_2", "approx-2", "approx 2"):
-        return "approx2"
-    return s
-
 ENV_MODULE_KEY = (os.environ.get("MODULE_KEY") or "").strip() or "elliptical_approx1"
 ENV_BASE_PROFILE = (os.environ.get("BASE_PROFILE") or "").strip() or None
 ENV_VOLUME_TYPE = (os.environ.get("VOLUME_TYPE") or "").strip() or "elliptical"
-ENV_APPROXIMATION_TYPE = _normalize_approx_type(os.environ.get("APPROXIMATION_TYPE") or "approx1")
+ENV_APPROXIMATION_TYPE = (os.environ.get("APPROXIMATION_TYPE") or "approx1").strip()
+
+def _normalize_approx_type(v: str) -> str:
+    v = (v or "").strip().lower()
+    if v in ("approximation1", "approx1", "a1", "1"):
+        return "approx1"
+    if v in ("approximation2", "approx2", "a2", "2"):
+        return "approx2"
+    return v or "approx1"
+
+ENV_APPROXIMATION_TYPE = _normalize_approx_type(ENV_APPROXIMATION_TYPE)
 
 # ========== helpers: outputs ==========
 
