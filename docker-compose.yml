@@ -13,6 +13,7 @@ services:
       UPLOADS_DIR: "/app/backend/uploads"
       OUTPUTS_DIR: "/app/backend/outputs"
       FRONTEND_BUILD_DIR: "/app/frontend/build"
+      USE_VOLUME_UNIFIED: "1"
     volumes:
       - ./backend/uploads:/app/backend/uploads
       - ./backend/outputs:/app/backend/outputs

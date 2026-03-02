@@ -1,4 +1,4 @@
-// server.js (docker-ready: env paths + serve React build + python cmd via env/launcher)
+// server.js (MorphoVolc 2.0 — unified-only)
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
@@ -17,8 +17,6 @@ try {
 
 const app = express();
 app.use(cors());
-
-// ✅ utile per callback/endpoint futuri che leggono JSON
 app.use(express.json({ limit: '10mb' }));
 
 // ---------------------------
@@ -27,8 +25,6 @@ app.use(express.json({ limit: '10mb' }));
 const PORT = Number(process.env.PORT || 5000);
 const DEBUG_CALC = String(process.env.DEBUG_CALC || '').trim() === '1';
 
-// Python executable inside container (or local)
-// NOTE: On Windows we prefer the launcher "py -3" unless a full PYTHON_BIN path is provided.
 const PYTHON_BIN_RAW = (process.env.PYTHON_BIN || process.env.PYTHON_PATH || '').trim();
 
 const uploadsDir = process.env.UPLOADS_DIR
@@ -156,25 +152,20 @@ function spawnPython({ args, processId, extraEnv = {} }) {
 // ---------------------------
 // Helpers
 // ---------------------------
-function normalizeImages(processId, images) {
-  if (!Array.isArray(images)) return [];
-  return images.map((img) => {
-    if (typeof img === 'string') {
-      const filename = img;
-      return { filename, url: `/outputs/${processId}/${filename}` };
-    }
-
-    const filename = img.filename || img.file || img.name;
-    const url =
-      img.url ||
-      img.public_path ||
-      (filename ? `/outputs/${processId}/${filename}` : undefined);
-
-    return { ...img, filename, url };
-  });
+function normalizeBaseProfile(v) {
+  const s = String(v || '').trim().toLowerCase();
+  if (s === 'island' || s === 'simple' || s === 'simple_base') return 'island';
+  if (s === 'continental' || s === 'complex' || s === 'complex_base') return 'continental';
+  return s;
 }
 
-// ====== Helper: write meta.json for report titles / traceability ======
+function deriveUnifiedModuleKey(baseProfile) {
+  const bp = normalizeBaseProfile(baseProfile);
+  if (bp === 'island' || bp === 'continental') return `unified_${bp}`;
+  return 'unified';
+}
+
+// write meta.json (report titles / traceability)
 function writeProcessMeta(procDir, metaPatch) {
   try {
     fs.mkdirSync(procDir, { recursive: true });
@@ -196,44 +187,6 @@ function writeProcessMeta(procDir, metaPatch) {
   }
 }
 
-// ====== Helper: normalize approximationType ======
-function normalizeApproximationType(v) {
-  const s = String(v || '').trim().toLowerCase();
-  if (!s) return '';
-  if (s === 'approximation1') return 'approx1';
-  if (s === 'approximation2') return 'approx2';
-  if (s === 'approx1' || s === 'approx2') return s;
-  return s; // leave unknowns as-is (or return '' if you prefer strict)
-}
-
-// ====== Helper: derive legacy moduleKey (approx-based) ======
-// (legacy keys used only if you still need them somewhere)
-function deriveModuleKey(volumeType, approximationType) {
-  const vt = String(volumeType || '').trim().toLowerCase();
-  const ap = normalizeApproximationType(approximationType);
-
-  if (vt === 'circular') {
-    if (ap === 'approx1') return 'circular_approx1';
-    if (ap === 'approx2') return 'circular_approx2';
-  }
-  if (vt === 'elliptical') {
-    if (ap === 'approx1') return 'elliptical_approx1';
-    if (ap === 'approx2') return 'elliptical_approx2';
-  }
-  return '';
-}
-
-// ====== Helper: derive NEW moduleKey from request (Geometry + Base profile) ======
-function deriveModuleKeyV2(volumeType, baseProfile) {
-  const vt = String(volumeType || '').trim().toLowerCase();
-  const bp = String(baseProfile || '').trim().toLowerCase();
-
-  if (!vt) return '';
-  if (bp !== 'island' && bp !== 'continental') return vt; // fallback clean
-  return `${vt}_${bp}`;
-}
-
-// ✅ Patch file written by legacy python so it doesn't keep old moduleKey forever
 function patchVolumeResultsFile(procDir, moduleKey, baseProfile) {
   try {
     const p = path.join(procDir, 'volume_results.json');
@@ -256,50 +209,13 @@ function patchVolumeResultsFile(procDir, moduleKey, baseProfile) {
   }
 }
 
-// ✅ NEW: map moduleKey -> metrics tag naming (per match dei file legacy)
-function moduleKeyToMetricsTag(moduleKey) {
-  const mk = String(moduleKey || '').toLowerCase().trim();
-  if (mk === 'circular_approx1') return 'circ_a1';
-  if (mk === 'circular_approx2') return 'circ_a2';
-  if (mk === 'elliptical_approx1') return 'ell_a1';
-  if (mk === 'elliptical_approx2') return 'ell_a2';
-  return '';
-}
-
-// ✅ NEW: pick best metrics file in procDir for (moduleKey, ext)
-function pickMetricsPath(procDir, moduleKey, ext /* 'csv'|'json' */) {
+// metrics picker (unified: canonical names)
+function pickMetricsPath(procDir, ext /* 'csv'|'json' */) {
   try {
-    if (!fs.existsSync(procDir)) return null;
-
     const wantedExt = String(ext || '').toLowerCase();
-    const files = fs.readdirSync(procDir);
-
-    const candidates = files
-      .filter((f) => f.toLowerCase().endsWith('.' + wantedExt))
-      .filter((f) => f.toLowerCase().includes('metrics'))
-      .map((f) => ({ f, p: path.join(procDir, f) }))
-      .filter((x) => fs.existsSync(x.p));
-
-    if (!candidates.length) return null;
-
-    const tag = moduleKeyToMetricsTag(moduleKey);
-    if (tag) {
-      const pref = `metrics_${tag}`.toLowerCase();
-      const tagged = candidates
-        .filter((x) => x.f.toLowerCase().startsWith(pref))
-        .sort((a, b) => fs.statSync(b.p).mtimeMs - fs.statSync(a.p).mtimeMs);
-      if (tagged.length) return tagged[0].p;
-
-      const contains = candidates
-        .filter((x) => x.f.toLowerCase().includes(tag))
-        .sort((a, b) => fs.statSync(b.p).mtimeMs - fs.statSync(a.p).mtimeMs);
-      if (contains.length) return contains[0].p;
-    }
-
-    candidates.sort((a, b) => fs.statSync(b.p).mtimeMs - fs.statSync(a.p).mtimeMs);
-    return candidates[0].p;
-  } catch (e) {
-    console.warn('[WARN] pickMetricsPath failed:', e);
+    const p = path.join(procDir, wantedExt === 'csv' ? 'metrics.csv' : 'metrics.json');
+    return fs.existsSync(p) ? p : null;
+  } catch {
     return null;
   }
 }
@@ -334,9 +250,7 @@ app.post('/process', upload.single('demFile'), (req, res) => {
   processingStatus[processId] = { status: 'processing' };
 
   const procDir = path.join(outputsDir, processId);
-  const inputDemName = (file && file.originalname)
-    ? String(file.originalname)
-    : (originalFileNameRaw ? String(originalFileNameRaw) : `${processId}.tif`);
+  const inputDemName = file?.originalname ? String(file.originalname) : (originalFileNameRaw || `${processId}.tif`);
 
   writeProcessMeta(procDir, {
     input_dem_name: inputDemName,
@@ -372,10 +286,7 @@ app.post('/process', upload.single('demFile'), (req, res) => {
   child.on('close', (code) => {
     const dt = (performance.now() - t0).toFixed(1);
     console.log(`[PY ${processId}] exited with code ${code} (server elapsed ${dt} ms)`);
-
-    if (code !== 0 && processingStatus[processId]) {
-      processingStatus[processId].status = 'failed';
-    }
+    if (code !== 0 && processingStatus[processId]) processingStatus[processId].status = 'failed';
   });
 
   return res.json({ message: 'Processing started', processId });
@@ -401,92 +312,94 @@ app.post('/processComplete/:processId', (req, res) => {
 });
 
 // ---------------------------
-// Volume
+// Volume (Unified ONLY)
 // ---------------------------
 app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
   const t0 = performance.now();
 
   const file = req.file;
-  const volumeType = req.body.volumeType;
-  const approximationType = req.body.approximationType;
-  const baseProfile = req.body.baseProfile; // island | continental (new UI model)
+  const baseProfileRaw = req.body.baseProfile;
+  const baseProfile = normalizeBaseProfile(baseProfileRaw);
 
   if (DEBUG_CALC) {
-    console.log('[SERVER] /calculateVolume req:', { volumeType, approximationType, baseProfile });
+    console.log('[SERVER] /calculateVolume req:', {
+      baseProfileRaw,
+      baseProfile,
+      processId: req.body.processId,
+      hasFile: !!file,
+    });
   }
 
-  if (!file || !volumeType || !approximationType) {
-    console.error('[ERROR] Missing required fields.');
-    return res.status(400).json({ error: 'Missing required fields.' });
+  if (!baseProfile || (baseProfile !== 'island' && baseProfile !== 'continental')) {
+    return res.status(400).json({ error: 'Missing required field: baseProfile (island|continental).' });
   }
 
   const originalFileNameRaw =
     (req.body.originalFileName && String(req.body.originalFileName).trim())
       ? String(req.body.originalFileName).trim()
-      : file.originalname;
+      : (file ? file.originalname : '');
 
-  const originalFileStem = path.parse(originalFileNameRaw).name || 'Unknown';
+  const originalFileStem = (originalFileNameRaw && path.parse(originalFileNameRaw).name)
+    ? path.parse(originalFileNameRaw).name
+    : 'Unknown';
 
-  // ✅ usa SEMPRE il processId che arriva dall’analisi, se c’è
+  // Use processId from step1 if present
   const processId = req.body.processId ? String(req.body.processId) : uuidv4();
 
-  // ✅ moduleKey nuovo (geometry+profile) con fallback legacy
-  const moduleKey = deriveModuleKeyV2(volumeType, baseProfile) || deriveModuleKey(volumeType, approximationType);
-
-  // bridge: per ora scegli ancora lo script con approx
-  let scriptPath = null;
-  if (volumeType === 'circular') {
-    if (approximationType === 'approximation1') {
-      scriptPath = path.join(__dirname, 'scripts', 'CircularVolcano_Approx1.py');
-    } else if (approximationType === 'approximation2') {
-      scriptPath = path.join(__dirname, 'scripts', 'CircularVolcano_Approx2.py');
-    }
-  } else if (volumeType === 'elliptical') {
-    if (approximationType === 'approximation1') {
-      scriptPath = path.join(__dirname, 'scripts', 'EllipticalVolcano_Approx1.py');
-    } else if (approximationType === 'approximation2') {
-      scriptPath = path.join(__dirname, 'scripts', 'EllipticalVolcano_Approx2.py');
-    }
-  }
-
-  if (!scriptPath) {
-    return res.status(400).json({ error: 'Invalid volumeType or approximationType' });
-  }
-
-  // meta.json (per report/trace)
   const procDir = path.join(outputsDir, processId);
-  const inputDemName = (file && file.originalname)
-    ? String(file.originalname)
-    : (originalFileNameRaw ? String(originalFileNameRaw) : `${processId}.tif`);
+  fs.mkdirSync(procDir, { recursive: true });
+
+  // Manifest-first DEM selection
+  const demWorkingPath = path.join(procDir, 'dem_working.tif');
+  let demInputPath = null;
+
+  if (fs.existsSync(demWorkingPath)) demInputPath = demWorkingPath;
+  else if (file && file.path) demInputPath = path.resolve(file.path);
+
+  if (!demInputPath) {
+    return res.status(400).json({
+      error: 'Missing DEM input. Provide processId with dem_working.tif or upload a DEM file.',
+      processId,
+    });
+  }
+
+  const moduleKey = deriveUnifiedModuleKey(baseProfile);
 
   writeProcessMeta(procDir, {
-    input_dem_name: inputDemName,
+    input_dem_name: (demInputPath === demWorkingPath) ? 'dem_working.tif' : (file?.originalname || originalFileNameRaw || `${processId}.tif`),
     original_file_stem: String(originalFileStem || ''),
     processId: String(processId || ''),
     moduleKey: String(moduleKey || ''),
-    volumeType: String(volumeType || ''),
-    approximationType: String(approximationType || ''),
     baseProfile: String(baseProfile || ''),
+    volumeType: 'unified',
+    approximationType: 'unified',
+    dem_input_path: demInputPath ? String(demInputPath) : '',
     step: 'calculate_volume',
     updated_at: new Date().toISOString(),
   });
 
-  const absFilePath = path.resolve(file.path);
+  const scriptPath = path.join(__dirname, 'scripts', 'volume_unified.py');
+  if (!fs.existsSync(scriptPath)) {
+    return res.status(500).json({
+      error: 'volume_unified.py not found',
+      expectedPath: scriptPath,
+    });
+  }
 
   const child = spawnPython({
     processId,
-    args: [scriptPath, absFilePath, originalFileStem],
+    args: [scriptPath, demInputPath, originalFileStem],
     extraEnv: {
       ORIGINAL_FILE_NAME: originalFileNameRaw,
       ORIGINAL_FILE_STEM: originalFileStem,
       UPLOADS_DIR: uploadsDir,
       OUTPUTS_DIR: outputsDir,
 
-      // ✅ prepare refactor: python can read these later
       MODULE_KEY: moduleKey,
-      BASE_PROFILE: baseProfile || '',
-      VOLUME_TYPE: volumeType,
-      APPROXIMATION_TYPE: approximationType,
+      BASE_PROFILE: baseProfile,
+      VOLUME_TYPE: 'unified',
+      APPROXIMATION_TYPE: 'unified',
+      DEM_INPUT: demInputPath,
     },
   });
 
@@ -507,7 +420,7 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
     });
   });
 
-    child.on('close', (code) => {
+  child.on('close', (code) => {
     const dt = (performance.now() - t0).toFixed(1);
     console.log(`[TIMING][SERVER] /calculateVolume finished in ${dt} ms (code=${code})`);
 
@@ -515,51 +428,33 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
       return res.status(500).json({ error: 'Error calculating volume' });
     }
 
-    // ✅ SEMPRE patchare il file scritto da python (non dipende dallo stdout)
     patchVolumeResultsFile(procDir, moduleKey, baseProfile);
 
-    // ✅ PRIMA scelta: se python ha stampato JSON pulito, ok
+    // Preferred: serve the on-disk truth
+    try {
+      const vrPath = path.join(procDir, 'volume_results.json');
+      if (fs.existsSync(vrPath)) {
+        const vr = JSON.parse(fs.readFileSync(vrPath, 'utf-8'));
+        vr.moduleKey = moduleKey;
+        vr.baseProfile = baseProfile || '';
+        return res.json(vr);
+      }
+    } catch (e) {
+      console.warn('[WARN] Could not read volume_results.json:', e);
+    }
+
+    // Last fallback: parse stdout if it was clean JSON
     try {
       const parsed = JSON.parse(resultData);
-
-      const normalized = {
-        processId: parsed.processId || processId,
-        status: parsed.status || 'completed',
-        result: parsed.result ?? parsed,
-        images: normalizeImages(parsed.processId || processId, parsed.images || []),
-
-        // keep everything from python (legacy), then override app-model fields
-        ...parsed,
-        moduleKey: moduleKey,
-        baseProfile: baseProfile || '',
-      };
-
-      if (!('result' in parsed)) normalized.result = parsed;
-
-      return res.json(normalized);
-    } catch (e) {
-      // ✅ Fallback serio: leggi il JSON dal disco (quello vero)
-      try {
-        const vrPath = path.join(procDir, 'volume_results.json');
-        if (fs.existsSync(vrPath)) {
-          const vr = JSON.parse(fs.readFileSync(vrPath, 'utf-8'));
-
-          // riallinea comunque (doppia sicurezza)
-          vr.moduleKey = moduleKey;
-          vr.baseProfile = baseProfile || '';
-
-          return res.json(vr);
-        }
-      } catch {
-        // ignore
-      }
-
-      // fallback finale: non ideale, ma consistente
+      parsed.moduleKey = moduleKey;
+      parsed.baseProfile = baseProfile || '';
+      return res.json(parsed);
+    } catch {
       return res.json({
         processId,
         status: 'completed',
         moduleKey,
-        baseProfile: baseProfile || '',
+        baseProfile,
         result: resultData,
         images: [],
       });
@@ -568,12 +463,11 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
 });
 
 // ---------------------------
-// ✅ Metrics export endpoint
-// GET /api/metrics/:processId?moduleKey=...&format=json|csv
+// Metrics export
+// GET /api/metrics/:processId?format=json|csv
 // ---------------------------
 app.get('/api/metrics/:processId', (req, res) => {
   const { processId } = req.params;
-  const moduleKey = req.query.moduleKey ? String(req.query.moduleKey) : '';
   const format = (req.query.format ? String(req.query.format) : 'json').toLowerCase();
 
   if (!processId) return res.status(400).json({ error: 'Missing processId' });
@@ -582,15 +476,10 @@ app.get('/api/metrics/:processId', (req, res) => {
   }
 
   const procDir = path.join(outputsDir, processId);
-  const metricsPath = pickMetricsPath(procDir, moduleKey, format);
+  const metricsPath = pickMetricsPath(procDir, format);
 
   if (!metricsPath) {
-    return res.status(404).json({
-      error: 'Metrics file not found',
-      processId,
-      moduleKey: moduleKey || null,
-      format,
-    });
+    return res.status(404).json({ error: 'Metrics file not found', processId, format });
   }
 
   const filename = path.basename(metricsPath);
@@ -602,23 +491,19 @@ app.get('/api/metrics/:processId', (req, res) => {
 });
 
 // ---------------------------
-// ✅ PDF Report endpoint
+// PDF Report endpoint
 // GET /api/report/:processId?moduleKey=...
 // ---------------------------
 app.get('/api/report/:processId', (req, res) => {
   const t0 = performance.now();
 
   const { processId } = req.params;
-  const moduleKey = req.query.moduleKey
-    ? String(req.query.moduleKey)
-    : (req.query.module ? String(req.query.module) : '');
+  const moduleKey = req.query.moduleKey ? String(req.query.moduleKey) : '';
 
-  if (!processId) {
-    return res.status(400).json({ error: 'Missing processId' });
-  }
+  if (!processId) return res.status(400).json({ error: 'Missing processId' });
 
   const procDir = path.join(outputsDir, processId);
-  const safeModuleKey = (moduleKey || 'circular_approx1').replace(/[^a-zA-Z0-9_-]/g, '');
+  const safeModuleKey = (moduleKey || 'unified').replace(/[^a-zA-Z0-9_-]/g, '');
 
   const pickLatestReportPdf = () => {
     try {
@@ -635,12 +520,6 @@ app.get('/api/report/:processId', (req, res) => {
           .filter((x) => x.f.toLowerCase().startsWith(pref))
           .sort((a, b) => fs.statSync(b.p).mtimeMs - fs.statSync(a.p).mtimeMs);
         if (mod.length) return mod[0].p;
-
-        const legacy = path.join(procDir, 'report.pdf');
-        if (fs.existsSync(legacy)) return legacy;
-      } else {
-        const legacy = path.join(procDir, 'report.pdf');
-        if (fs.existsSync(legacy)) return legacy;
       }
 
       candidates.sort((a, b) => fs.statSync(b.p).mtimeMs - fs.statSync(a.p).mtimeMs);
@@ -658,9 +537,7 @@ app.get('/api/report/:processId', (req, res) => {
   }
 
   const reportScriptPath = path.join(__dirname, 'scripts', 'build_pdf_report.py');
-
   if (!fs.existsSync(reportScriptPath)) {
-    console.error(`[ERROR][SERVER] build_pdf_report.py not found at: ${reportScriptPath}`);
     return res.status(500).json({
       error: 'Report builder script not found',
       expectedPath: reportScriptPath,
@@ -669,13 +546,9 @@ app.get('/api/report/:processId', (req, res) => {
   }
 
   fs.mkdirSync(procDir, { recursive: true });
-
   console.log(`[INFO][SERVER] report missing -> building (pid=${processId}, moduleKey=${moduleKey || 'N/A'})`);
 
-  const args = moduleKey
-    ? [reportScriptPath, processId, moduleKey]
-    : [reportScriptPath, processId];
-
+  const args = moduleKey ? [reportScriptPath, processId, moduleKey] : [reportScriptPath, processId];
   const child = spawnPython({ processId, args });
 
   let stderrData = '';
@@ -702,26 +575,17 @@ app.get('/api/report/:processId', (req, res) => {
     console.log(`[TIMING][SERVER] /api/report build finished in ${dt} ms (pid=${processId}, code=${code})`);
 
     if (code !== 0) {
-      const stderrPreview = String(stderrData || '').trim().slice(0, 4000);
-      const stdoutPreview = String(stdoutData || '').trim().slice(0, 2000);
-
-      console.error(`[ERROR][SERVER] report build failed (pid=${processId}, code=${code})`);
-      if (stderrPreview) console.error(`[ERROR][SERVER] report stderr preview:\n${stderrPreview}`);
-      if (stdoutPreview) console.error(`[ERROR][SERVER] report stdout preview:\n${stdoutPreview}`);
-
       return res.status(500).json({
         error: 'Failed to build report',
         processId,
         code,
-        stderr: stderrPreview || null,
-        stdout: stdoutPreview || null,
+        stderr: String(stderrData || '').trim().slice(0, 4000) || null,
+        stdout: String(stdoutData || '').trim().slice(0, 2000) || null,
       });
     }
 
     pdfPath = pickLatestReportPdf();
-
     if (!pdfPath || !fs.existsSync(pdfPath)) {
-      console.error(`[ERROR][SERVER] build finished but PDF not found (pid=${processId})`);
       return res.status(500).json({
         error: 'Report build completed but PDF is missing',
         processId,
@@ -735,7 +599,7 @@ app.get('/api/report/:processId', (req, res) => {
 });
 
 // ---------------------------
-// Shaded Relief
+// Other legacy endpoints (kept)
 // ---------------------------
 app.post('/shadedRelief', upload.single('demFile'), (req, res) => {
   const file = req.file;
@@ -744,23 +608,14 @@ app.post('/shadedRelief', upload.single('demFile'), (req, res) => {
   const scriptPath = path.join(__dirname, 'scripts', 'generate_shaded_relief.py');
   const absFilePath = path.resolve(file.path);
 
-  const child = spawnPython({
-    processId: uuidv4(),
-    args: [scriptPath, absFilePath],
-  });
+  const child = spawnPython({ processId: uuidv4(), args: [scriptPath, absFilePath] });
 
   child.on('close', (code) => {
-    if (code !== 0) {
-      fs.appendFile('error_log.txt', `Errore Shaded Relief. Exit: ${code}\n`, () => {});
-      return res.status(500).json({ error: 'Errore durante la generazione dello Shaded Relief.' });
-    }
+    if (code !== 0) return res.status(500).json({ error: 'Errore durante la generazione dello Shaded Relief.' });
     return res.json({ message: 'Shaded Relief generated successfully' });
   });
 });
 
-// ---------------------------
-// Slopes
-// ---------------------------
 app.post('/calculateSlopes', upload.single('demFile'), (req, res) => {
   const file = req.file;
   if (!file) return res.status(400).send('Nessun file caricato.');
@@ -768,23 +623,14 @@ app.post('/calculateSlopes', upload.single('demFile'), (req, res) => {
   const scriptPath = path.join(__dirname, 'scripts', 'generate_slopes.py');
   const absFilePath = path.resolve(file.path);
 
-  const child = spawnPython({
-    processId: uuidv4(),
-    args: [scriptPath, absFilePath],
-  });
+  const child = spawnPython({ processId: uuidv4(), args: [scriptPath, absFilePath] });
 
   child.on('close', (code) => {
-    if (code !== 0) {
-      fs.appendFile('error_log.txt', `Errore slopes. Exit: ${code}\n`, () => {});
-      return res.status(500).json({ error: 'Errore durante la generazione delle due pendenze.' });
-    }
+    if (code !== 0) return res.status(500).json({ error: 'Errore durante la generazione delle due pendenze.' });
     return res.json({ message: 'Slope calculation successful' });
   });
 });
 
-// ---------------------------
-// Curvatures
-// ---------------------------
 app.post('/calculateCurvatures', upload.single('demFile'), (req, res) => {
   const file = req.file;
   if (!file) return res.status(400).send('Nessun file caricato.');
@@ -792,26 +638,18 @@ app.post('/calculateCurvatures', upload.single('demFile'), (req, res) => {
   const scriptPath = path.join(__dirname, 'scripts', 'calculate_curvatures.py');
   const absFilePath = path.resolve(file.path);
 
-  const child = spawnPython({
-    processId: uuidv4(),
-    args: [scriptPath, absFilePath],
-  });
+  const child = spawnPython({ processId: uuidv4(), args: [scriptPath, absFilePath] });
 
   child.on('close', (code) => {
-    if (code !== 0) {
-      fs.appendFile('error_log.txt', `Errore curvature. Exit: ${code}\n`, () => {});
-      return res.status(500).json({ error: 'Errore durante la generazione delle curvature.' });
-    }
+    if (code !== 0) return res.status(500).json({ error: 'Errore durante la generazione delle curvature.' });
     return res.json({ message: 'Curvature calcolate con successo' });
   });
 });
 
 // ---------------------------
-// Serve React build (Docker prod) — aligned SPA fallback with exclusions
+// Serve React build (Docker prod) — SPA fallback with exclusions
 // ---------------------------
-const frontendBuildDir = process.env.FRONTEND_BUILD_DIR
-  ? path.resolve(process.env.FRONTEND_BUILD_DIR)
-  : null;
+const frontendBuildDir = process.env.FRONTEND_BUILD_DIR ? path.resolve(process.env.FRONTEND_BUILD_DIR) : null;
 
 if (frontendBuildDir && fs.existsSync(frontendBuildDir)) {
   app.use(express.static(frontendBuildDir));

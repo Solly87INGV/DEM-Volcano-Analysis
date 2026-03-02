@@ -19,11 +19,8 @@ const VolumeSelection = ({
   setStep,        // ✅ NEW (from App wrapper)
   setVolumeRun,   // ✅ NEW (from App)
 }) => {
-  const [volumeType, setVolumeType] = useState('');                 // circular | elliptical
-  const [baseScenario, setBaseScenario] = useState('');             // island | continental  ✅ NEW (no preselect)
-  const [approximationType, setApproximationType] = useState('');   // approximation1 | approximation2
-  const [selectedApproximation, setSelectedApproximation] = useState('');
-  const [infoImage, setInfoImage] = useState('');
+  // ✅ MorphoVolc 2.0: only scenario selection
+  const [baseScenario, setBaseScenario] = useState(''); // island | continental
   const [isLoading, setIsLoading] = useState(false);
 
   // output UI (kept for debug, but we won't render inline anymore)
@@ -57,43 +54,14 @@ const VolumeSelection = ({
     setServerPhasesCalc(null);
   };
 
-  // ✅ single-screen: geometry selection does NOT move to another screen
-  const handleVolumeSelect = (type) => {
-    setVolumeType(type);
-
-    // reset dependent selections
-    setBaseScenario('');
-    setApproximationType('');
-    setSelectedApproximation('');
-    setInfoImage('');
-
-    resetOutputs();
-  };
-
-  const handleBaseScenarioSelect = (scenario) => {
+  const handleScenarioSelect = (scenario) => {
     setBaseScenario(scenario);
     resetOutputs();
   };
 
-  const handleApproximationSelect = (type) => {
-    setApproximationType(type);
-    setSelectedApproximation(type);
-
-    if (volumeType === 'circular') {
-      setInfoImage(type === 'approximation1' ? '/images/1_Circ.png' : '/images/2_Circ.png');
-    } else if (volumeType === 'elliptical') {
-      setInfoImage(type === 'approximation1' ? '/images/1_Ellipt.png' : '/images/2_Ellipt.png');
-    }
-    resetOutputs();
-  };
-
-  // ✅ Back arrow now means: clear selections on this screen (not "go to previous screen")
-  const handleBack = () => {
-    setVolumeType('');
+  // ✅ Reset selections on this screen
+  const handleReset = () => {
     setBaseScenario('');
-    setApproximationType('');
-    setSelectedApproximation('');
-    setInfoImage('');
     resetOutputs();
   };
 
@@ -112,14 +80,13 @@ const VolumeSelection = ({
     resetOutputs();
 
     const formData = new FormData();
-    formData.append('demFile', demFile);
-    formData.append('volumeType', volumeType);
-    formData.append('approximationType', approximationType);
-    formData.append('baseProfile', baseScenario);
 
-    // ⚠️ NOTE: baseScenario is UI-only for this step (no backend changes yet).
-    // When we do the backend bridge, we'll append:
-    // formData.append('baseScenario', baseScenario);
+    // Keep demFile upload for backward compatibility.
+    // Server will prefer dem_working.tif in OUTPUTS_DIR/<processId>/ when present.
+    if (demFile) formData.append('demFile', demFile);
+
+    // ✅ MorphoVolc 2.0: only baseProfile is required for unified model
+    formData.append('baseProfile', baseScenario);
 
     const originalFileName =
       (demFile && demFile.name) ||
@@ -172,16 +139,17 @@ const VolumeSelection = ({
         vr = await fetchJsonOrNull(vrUrl);
       }
 
+      // moduleKey fallback (unified)
+      const fallbackModuleKey = `unified_${baseScenario || 'unknown'}`;
+
       // costruisci payload compatibile con VolumeResultsViewer
       const run = {
         processId: pid,
         status: vr?.status || response?.data?.status || 'completed',
-        moduleKey: response?.data?.moduleKey || vr?.moduleKey || `${volumeType}_${baseScenario}`,
-        // VolumeResultsViewer gestisce result sia come "result" che come "root object"
-        result: vr?.result || vr?.numbers || response?.data?.result || null,
+        moduleKey: response?.data?.moduleKey || vr?.moduleKey || fallbackModuleKey,
+        result: vr?.result || response?.data?.result || null,
         images: vr?.images || response?.data?.images || [],
-        // (optional: keep UI selection metadata locally if you ever want it in results)
-        selection: { volumeType, baseScenario, approximationType },
+        selection: { baseScenario }, // keep only what exists in 2.0 UI
       };
 
       if (setVolumeRun) setVolumeRun(run);
@@ -199,17 +167,20 @@ const VolumeSelection = ({
   const quickRows = useMemo(() => {
     const mm = metrics?.morphometrics;
     const vv = metrics?.volumes;
-    if (!mm && !vv) return [];
+    const hh = metrics?.height_model;
+    if (!mm && !vv && !hh) return [];
 
     const rows = [];
     if (mm) {
       rows.push(['Base area (m²)', mm.A_base_m2]);
       rows.push(['Base perimeter (m)', mm.P_base_m]);
-      rows.push(['Base diameter (m)', mm.D_base_m]);
+      rows.push(['Base span (m)', mm.D_base_m]);
       rows.push(['Caldera area (m²)', mm.A_caldera_m2]);
       rows.push(['Caldera perimeter (m)', mm.P_caldera_m]);
-      rows.push(['Caldera diameter (m)', mm.D_caldera_m]);
-      rows.push(['Height used (m)', mm.h_max_m]);
+      rows.push(['Caldera span (m)', mm.D_caldera_m]);
+    }
+    if (hh) {
+      rows.push(['Height used (m)', hh.h_max_m]);
     }
     if (vv) {
       rows.push(['Total volume (m³)', vv.V_total_m3]);
@@ -222,15 +193,12 @@ const VolumeSelection = ({
   // ✅ inline results OFF: questa schermata deve solo selezionare e lanciare il run
   const SHOW_INLINE_RESULTS = false;
 
-  // ✅ instruction text based on progress
   const instructionText = useMemo(() => {
-    if (!volumeType) return "Choose geometry";
-    if (!baseScenario) return "Choose base scenario";
-    if (!approximationType) return "Choose approximation method";
+    if (!baseScenario) return "Choose volcano scenario";
     return "Ready to calculate volume";
-  }, [volumeType, baseScenario, approximationType]);
+  }, [baseScenario]);
 
-  const canCalculate = Boolean(volumeType && baseScenario && approximationType && !isLoading);
+  const canCalculate = Boolean(baseScenario && !isLoading);
 
   return (
     <Box className="volume-selection-container">
@@ -241,117 +209,31 @@ const VolumeSelection = ({
       </Typography>
 
       {/* Optional: reset arrow (clears selections) */}
-      {(volumeType || baseScenario || approximationType) && (
-        <IconButton onClick={handleBack} className="back-arrow" aria-label="Reset selections">
+      {baseScenario && (
+        <IconButton onClick={handleReset} className="back-arrow" aria-label="Reset selections">
           <ArrowBackIcon />
         </IconButton>
       )}
 
-      {/* ===== GEOMETRY (cards) ===== */}
+      {/* ===== SCENARIO (2 cards) ===== */}
       <Box className="main-layout">
         <Box className="card-container">
           <CardSelection
-            title="Circular Volcano"
-            description="Volcanic edifice with an approximately circular base and caldera, modeled from DEM-derived contours to estimate edifice and caldera volumes."
-            onClick={() => handleVolumeSelect('circular')}
-            imageSrc="/images/Circular.png"
-            isSelected={volumeType === 'circular'}
+            title="Island volcano (simple base)"
+            description="Recommended when the edifice is isolated and the base contour is clear (e.g., island volcanoes)."
+            onClick={() => handleScenarioSelect('island')}
+            imageSrc="/images/IslandBase.png"
+            isSelected={baseScenario === 'island'}
           />
           <CardSelection
-            title="Elliptical Volcano"
-            description="Volcanic edifice with an elongated (elliptical) base and caldera, modeled from DEM-derived contours to estimate edifice and caldera volumes."
-            onClick={() => handleVolumeSelect('elliptical')}
-            imageSrc="/images/Elliptical.png"
-            isSelected={volumeType === 'elliptical'}
+            title="Continental volcano (complex base)"
+            description="Recommended when the edifice merges with surrounding topography and the base contour is ambiguous."
+            onClick={() => handleScenarioSelect('continental')}
+            imageSrc="/images/ContinentalBase.png"
+            isSelected={baseScenario === 'continental'}
           />
         </Box>
-
-        {/* right-side info image (based on approximation) */}
-        {infoImage && (
-          <Box className="info-image-container">
-            <img src={infoImage} alt="Description" />
-          </Box>
-        )}
       </Box>
-
-      {/* ===== BASE SCENARIO (cards) ===== */}
-      {volumeType && (
-        <>
-          <Divider sx={{ my: 2 }} />
-
-          <Typography variant="h6" className="instruction-message" sx={{ mb: 1 }}>
-            Base scenario
-          </Typography>
-
-          <Box className="card-container">
-            <CardSelection
-              title="Island / Simple base"
-              description="Recommended when the edifice is isolated and the base contour is clear (e.g., island volcanoes)."
-              onClick={() => handleBaseScenarioSelect('island')}
-              imageSrc="/images/IslandBase.png"
-              isSelected={baseScenario === 'island'}
-            />
-            <CardSelection
-              title="Continental / Complex base"
-              description="Recommended when the edifice merges with surrounding topography and the base contour is ambiguous."
-              onClick={() => handleBaseScenarioSelect('continental')}
-              imageSrc="/images/ContinentalBase.png"
-              isSelected={baseScenario === 'continental'}
-            />
-          </Box>
-        </>
-      )}
-
-      {/* ===== APPROXIMATION (cards) — kept for now (backend still uses it) ===== */}
-      {volumeType && baseScenario && (
-        <>
-          <Divider sx={{ my: 2 }} />
-
-          <Typography variant="h6" className="instruction-message" sx={{ mb: 1 }}>
-            Approximation method
-          </Typography>
-
-          <Box className="main-layout">
-            <Box className="card-container">
-              {volumeType === 'circular' ? (
-                <>
-                  <CardSelection
-                    title="Circular Approximation 1"
-                    description="Rim→DEM depth integration"
-                    onClick={() => handleApproximationSelect('approximation1')}
-                    imageSrc="/images/Approx1Circ.png"
-                    isSelected={selectedApproximation === 'approximation1'}
-                  />
-                  <CardSelection
-                    title="Circular Approximation 2"
-                    description="Frustum"
-                    onClick={() => handleApproximationSelect('approximation2')}
-                    imageSrc="/images/Approx2Circ.png"
-                    isSelected={selectedApproximation === 'approximation2'}
-                  />
-                </>
-              ) : (
-                <>
-                  <CardSelection
-                    title="Elliptical Approximation 1"
-                    description="Elliptical frustum + DEM semi-ellipsoid"
-                    onClick={() => handleApproximationSelect('approximation1')}
-                    imageSrc="/images/Ellipt1Approx.png"
-                    isSelected={selectedApproximation === 'approximation1'}
-                  />
-                  <CardSelection
-                    title="Elliptical Approximation 2"
-                    description="Elliptical frustum + DEM cylindrical caldera"
-                    onClick={() => handleApproximationSelect('approximation2')}
-                    imageSrc="/images/Ellipt2Approx.png"
-                    isSelected={selectedApproximation === 'approximation2'}
-                  />
-                </>
-              )}
-            </Box>
-          </Box>
-        </>
-      )}
 
       {/* ===== ACTIONS ===== */}
       <Box className="button-group" sx={{ mt: 2 }}>
