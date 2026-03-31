@@ -92,6 +92,7 @@ from scipy.ndimage import (
     binary_closing,
     binary_fill_holes,
     binary_erosion,
+    binary_opening,
     label,
 )
 
@@ -329,20 +330,77 @@ def select_base_contour(dem: np.ndarray, transform, nodata=None, base_profile: s
     bp = _normalize_base_profile(base_profile)
 
     if bp == "island":
-        ratio = 0.05
-        level = vmin + rng * ratio
-        contours = _find_contours_at_level(demf, level)
-        if not contours:
-            raise ValueError("No base contours found (island preset).")
-        base = max(contours, key=len)
+        # Island: still deterministic, but avoid pathological base contours that hug the raster border.
+        # This is important for summit-focused crops (e.g., Piton) where the minimum elevation often lies on the clip edge.
+        ratios = [0.05, 0.08, 0.12, 0.16, 0.20]
+        img_area_px = float(demf.shape[0] * demf.shape[1])
+
+        best = None
+        best_score = -1e18
+        picked_ratio = None
+        picked_level = None
+        n_total = 0
+        n_kept = 0
+
+        for ratio in ratios:
+            level = vmin + rng * float(ratio)
+            contours = _find_contours_at_level(demf, level)
+            if not contours:
+                continue
+            n_total += len(contours)
+
+            for c in contours:
+                if len(c) < 50:
+                    continue
+                # Avoid clip-edge / coastline artifacts
+                if _touches_border(c, demf.shape, margin_px=2):
+                    continue
+
+                mask = contour_to_mask(c, demf.shape)
+                area_px = float(np.sum(mask))
+                area_frac = float(area_px / img_area_px)
+
+                # reject pathological: too small or too big
+                if area_frac < 0.01 or area_frac > 0.75:
+                    continue
+
+                A = calculate_area(c, transform)
+                P = contour_perimeter_m(c, transform)
+                circ = (4.0 * math.pi * A / (P * P)) if (A > 0 and P > 0) else 0.0
+
+                # score: prefer mid-size base + some circularity + longer contour
+                size_term = -abs(area_frac - 0.35)
+                score = 2.0 * size_term + 0.3 * float(circ) + 0.0005 * float(len(c))
+
+                n_kept += 1
+                if score > best_score:
+                    best_score = score
+                    best = c
+                    picked_ratio = float(ratio)
+                    picked_level = float(level)
+
+        if best is None:
+            # Last-resort fallback: allow border-touching but still prefer reasonable size.
+            ratio = 0.12
+            level = vmin + rng * ratio
+            contours = _find_contours_at_level(demf, level)
+            if not contours:
+                raise ValueError("No base contours found (island preset).")
+            # pick the largest non-tiny contour
+            best = max(contours, key=len)
+            picked_ratio = float(ratio)
+            picked_level = float(level)
+
         dbg = {
-            "method": "ratio_single_longest",
-            "ratio": float(ratio),
-            "level_m": float(level),
-            "n_contours": int(len(contours)),
-            "picked_len": int(len(base)),
+            "method": "island_sweep_scored_no_border",
+            "ratios": [float(r) for r in ratios],
+            "picked_ratio": float(picked_ratio) if picked_ratio is not None else None,
+            "picked_level_m": float(picked_level) if picked_level is not None else None,
+            "n_contours_total": int(n_total),
+            "n_candidates_kept": int(n_kept),
+            "picked_len": int(len(best)),
         }
-        return base, dbg
+        return best, dbg
 
     # continental: sweep and score
     ratios = [0.03, 0.05, 0.07, 0.10, 0.13, 0.16, 0.20]
@@ -441,17 +499,34 @@ def _peak_in_roi(dem: np.ndarray, roi: np.ndarray) -> Optional[Tuple[float, floa
     except Exception:
         return _centroid_of_mask(roi)
 
+
+def _min_in_roi(dem: np.ndarray, roi: np.ndarray) -> Optional[Tuple[float, float]]:
+    """Return the location (row,col) of the minimum elevation inside ROI.
+    Useful for caldera-centered selection (depression) vs peak-based selection.
+    """
+    try:
+        vals = np.where(roi, dem.astype(float), np.inf)
+        if not np.isfinite(vals).any():
+            return _centroid_of_mask(roi)
+        idx = int(np.nanargmin(vals))
+        r, c = np.unravel_index(idx, dem.shape)
+        return (float(r), float(c))
+    except Exception:
+        return _centroid_of_mask(roi)
+
 def find_caldera_contour_morphological(
     dem: np.ndarray,
     base_contour: np.ndarray,
     transform,
     nodata=None,
     preset: str = "continental",
+    _override_cfg: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """
     Morphological rim detection with two presets.
     We intentionally keep it parameter-driven (no new formulas).
     """
+    debug: Dict[str, Any] = {}
     bp = _normalize_base_profile(preset)
 
     # Presets (tuned knobs)
@@ -461,11 +536,16 @@ def find_caldera_contour_morphological(
             "smooth_sigma": 1.0,
             "slope_q": 90.0,
             "min_component_px": 400,
+            "min_area_frac": 0.02,
             "closing_iterations": 2,
             "extra_dilate_px": 0,
             "max_area_frac": 0.35,
             "inner_buffer_px": 10,
             "center_bias_weight": 18.0,
+            "overlap_mode": "reward_inner",
+            "post_close_iterations": 2,
+            "post_fill_holes": True,
+            "center_mode": "centroid",
         }
     else:
         cfg = {
@@ -473,12 +553,24 @@ def find_caldera_contour_morphological(
             "smooth_sigma": 1.2,
             "slope_q": 86.0,
             "min_component_px": 600,
+            "min_area_frac": 0.01,
             "closing_iterations": 3,
             "extra_dilate_px": 1,
             "max_area_frac": 0.50,
             "inner_buffer_px": 14,
             "center_bias_weight": 22.0,
+            "overlap_mode": "reward_inner",
+            "post_close_iterations": 2,
+            "post_fill_holes": True,
+            "center_mode": "depression",
         }
+
+    # Optional override (used by fallback relaxed pass)
+    if _override_cfg is not None:
+        try:
+            cfg = dict(_override_cfg)
+        except Exception:
+            pass
 
     demf = dem.astype(float)
     valid = np.isfinite(demf)
@@ -495,7 +587,15 @@ def find_caldera_contour_morphological(
 
     roi_px = int(np.sum(roi))
     if roi_px < max(200, int(cfg["min_component_px"] * 0.5)):
-        raise ValueError(f"ROI too small (roi_px={roi_px}).")
+        # Summit/clip safety: if ROI derived from base is too small, fall back to full valid-data mask.
+        roi = valid.copy()
+        roi_px = int(np.sum(roi))
+        debug["roi_fallback"] = {
+            "reason": "base_roi_too_small",
+            "roi_px": int(roi_px),
+        }
+        if roi_px == 0:
+            raise ValueError(f"ROI too small (roi_px={roi_px}).")
 
     # inner ROI (eroded) for overlap scoring
     inner_buffer_px = int(max(0, cfg["inner_buffer_px"]))
@@ -534,32 +634,164 @@ def find_caldera_contour_morphological(
     if ncomp <= 0:
         raise ValueError("No components in rim candidates.")
 
-    # Eligibility by size and max area fraction
+    # Eligibility by size and area fractions (relative to ROI)
     sizes = [int(np.sum(lbl == cid)) for cid in range(1, ncomp + 1)]
     eligible = []
+
     max_area_px = int(float(cfg["max_area_frac"]) * float(roi_px))
+    min_area_px = int(float(cfg.get("min_area_frac", 0.0)) * float(roi_px))
+
+    # Always enforce min_component_px, and (optionally) a minimum area fraction
+    hard_min_px = int(max(int(cfg["min_component_px"]), min_area_px))
+
     for cid, sz in zip(range(1, ncomp + 1), sizes):
-        if sz < int(cfg["min_component_px"]):
+        if sz < hard_min_px:
             continue
         if max_area_px > 0 and sz > max_area_px:
             continue
         eligible.append((cid, sz))
-
     if not eligible:
+        # Second-pass fallback: relax constraints and retry once.
+        # Useful for small summit-focused crops (e.g., Piton/Dolomieu) where the rim may be fragmented.
+        if not bool(cfg.get("_relaxed_pass", False)):
+            cfg_rel = dict(cfg)
+            cfg_rel["_relaxed_pass"] = True
+            cfg_rel["slope_q"] = float(cfg_rel.get("slope_q", 90.0)) - 4.0
+            cfg_rel["min_component_px"] = max(80, int(cfg_rel.get("min_component_px", 400) * 0.5))
+            cfg_rel["min_area_frac"] = float(cfg_rel.get("min_area_frac", 0.0)) * 0.25
+            cfg_rel["inner_buffer_px"] = max(3, int(cfg_rel.get("inner_buffer_px", 10) * 0.6))
+            cfg_rel["closing_iterations"] = int(cfg_rel.get("closing_iterations", 2)) + 1
+            cfg_rel["post_close_iterations"] = int(cfg_rel.get("post_close_iterations", 2)) + 2
+            debug["fallback_relaxed_cfg"] = {
+                "slope_q": cfg_rel["slope_q"],
+                "min_component_px": cfg_rel["min_component_px"],
+                "min_area_frac": cfg_rel["min_area_frac"],
+                "inner_buffer_px": cfg_rel["inner_buffer_px"],
+                "closing_iterations": cfg_rel["closing_iterations"],
+                "post_close_iterations": cfg_rel["post_close_iterations"],
+            }
+            return find_caldera_contour_morphological(
+                dem,
+                base_contour,
+                transform,
+                nodata=nodata,
+                preset=preset,
+                _override_cfg=cfg_rel,
+            )
         raise ValueError("No rim component meets constraints.")
 
-    # Center-biased selection with inner ROI overlap
-    center = _peak_in_roi(demf, roi) or _centroid_of_mask(roi)
-    if center is None:
-        # fallback largest
-        selected_cid, selected_sz = max(eligible, key=lambda t: t[1])
-        center_used = None
-    else:
-        center_r, center_c = center
-        center_used = {"row": float(center_r), "col": float(center_c), "method": "peak_in_roi_or_centroid"}
 
-        best = None
-        for cid, sz in eligible:
+    # Barnie-mode heuristic (summit caldera with deep pit craters):
+    # If the only eligible components are very small relative to ROI, the detector is likely picking pit fragments.
+    # In that case, run one additional relaxed pass that:
+    # - lowers slope_q more (includes more of the caldera scarp),
+    # - increases closing (connects fragmented rim),
+    # - increases inner_buffer (reduces pit dominance in overlap),
+    # - penalizes inner overlap (prefers boundary ring instead of pit interior).
+    if eligible and not bool(cfg.get("_barnie_pass", False)):
+        roi_px_f = float(max(1, roi_px))
+        max_elig_px = max(int(sz) for _, sz in eligible)
+        max_elig_frac = float(max_elig_px) / roi_px_f
+        # trigger when components are tiny (<~1.5% of ROI) which is typical of pit fragments on summit crops
+        if max_elig_frac < float(cfg.get("barnie_trigger_max_elig_frac", 0.015)):
+            cfg_rel2 = dict(cfg)
+            cfg_rel2["_barnie_pass"] = True
+            cfg_rel2["slope_q"] = float(cfg_rel2.get("slope_q", 90.0)) - 10.0
+            cfg_rel2["closing_iterations"] = int(cfg_rel2.get("closing_iterations", 2)) + 4
+            cfg_rel2["inner_buffer_px"] = int(cfg_rel2.get("inner_buffer_px", 10)) + 8
+            cfg_rel2["min_component_px"] = max(80, int(cfg_rel2.get("min_component_px", 400) * 0.35))
+            cfg_rel2["min_area_frac"] = float(cfg_rel2.get("min_area_frac", 0.0)) * 0.25
+            cfg_rel2["post_close_iterations"] = int(cfg_rel2.get("post_close_iterations", 2)) + 2
+            cfg_rel2["center_mode"] = "centroid"
+            cfg_rel2["overlap_mode"] = "penalize_inner"
+            debug["fallback_barnie_cfg"] = {
+                "trigger_max_elig_frac": float(cfg.get("barnie_trigger_max_elig_frac", 0.015)),
+                "max_elig_frac": float(max_elig_frac),
+                "slope_q": cfg_rel2["slope_q"],
+                "closing_iterations": cfg_rel2["closing_iterations"],
+                "inner_buffer_px": cfg_rel2["inner_buffer_px"],
+                "min_component_px": cfg_rel2["min_component_px"],
+                "min_area_frac": cfg_rel2["min_area_frac"],
+                "post_close_iterations": cfg_rel2["post_close_iterations"],
+                "center_mode": cfg_rel2["center_mode"],
+                "overlap_mode": cfg_rel2["overlap_mode"],
+            }
+            return find_caldera_contour_morphological(
+                dem,
+                base_contour,
+                transform,
+                nodata=nodata,
+                preset=preset,
+                _override_cfg=cfg_rel2,
+            )
+
+    # Center-biased selection with inner ROI overlap
+    center_mode = str(cfg.get("center_mode", "depression")).strip().lower()
+
+    # Adaptive center selection:
+    # - "depression" is great for simple calderas (Okmok), but fails when deep pits exist inside the caldera (Erta Ale),
+    #   because the minimum can sit on a pit or edge/noise and drag selection to a small component.
+    # Heuristics to auto-switch to centroid:
+    #   1) depression-center falls near raster border (likely edge/noise) OR
+    #   2) eligible components are all small relative to ROI (likely pit/segment) OR
+    #   3) depression-center is far from centroid of roi_inner (pit offset).
+    def _near_border(rc, shape, margin=3):
+        if rc is None:
+            return True
+        r, c = rc
+        return (r < margin) or (c < margin) or (r > (shape[0] - 1 - margin)) or (c > (shape[1] - 1 - margin))
+
+    center_dep = _min_in_roi(demf, roi_inner) or _min_in_roi(demf, roi)
+    center_ctr = _centroid_of_mask(roi_inner) or _centroid_of_mask(roi)
+
+    roi_px_f = float(max(1, roi_px))
+    elig_sizes = [sz for _, sz in eligible] if eligible else []
+    max_elig_frac = (max(elig_sizes) / roi_px_f) if elig_sizes else 0.0
+
+    dep_far = False
+    if center_dep is not None and center_ctr is not None:
+        dr = float(center_dep[0] - center_ctr[0])
+        dc = float(center_dep[1] - center_ctr[1])
+        dep_far = (dr * dr + dc * dc) ** 0.5 > float(cfg.get("dep_to_centroid_max_px", 25.0))
+
+    auto_centroid = (
+        _near_border(center_dep, dem.shape, margin=int(cfg.get("center_border_margin_px", 3)))
+        or (max_elig_frac > 0.0 and max_elig_frac < float(cfg.get("min_eligible_frac_for_depression", 0.06)))
+        or dep_far
+    )
+
+    if center_mode in ("auto", "adaptive"):
+        if auto_centroid:
+            center = center_ctr
+            center_mode_used = "centroid_auto"
+        else:
+            center = center_dep or center_ctr
+            center_mode_used = "depression_auto"
+    elif center_mode in ("depression", "min", "pit"):
+        center = center_dep or center_ctr
+        center_mode_used = "depression"
+    elif center_mode in ("centroid", "center"):
+        center = center_ctr
+        center_mode_used = "centroid"
+    else:
+        center = _peak_in_roi(demf, roi) or center_ctr
+        center_mode_used = "peak_legacy"
+
+    if center is None:
+        center = (float(dem.shape[0]) * 0.5, float(dem.shape[1]) * 0.5)
+        center_mode_used = "fallback_image_center"
+
+    center_r, center_c = float(center[0]), float(center[1])
+    center_used = {
+        "row": float(center_r),
+        "col": float(center_c),
+        "method": f"center_mode:{center_mode_used}",
+        "auto_centroid": bool(auto_centroid),
+        "max_eligible_frac": float(max_elig_frac),
+    }
+
+    best = None
+    for cid, sz in eligible:
             m = (lbl == cid)
             rr, cc = np.nonzero(m)
             if rr.size == 0:
@@ -581,9 +813,15 @@ def find_caldera_contour_morphological(
             except Exception:
                 inner_overlap = 0.0
 
-            # key: smaller mean radius is better, but reward inner overlap strongly
+            # key: smaller mean radius is better.
+            # Default behavior rewards inner overlap (works well for simple calderas).
+            # For pit-dominated summit systems (e.g., Erta Ale), we may instead penalize inner overlap
+            # to avoid selecting pit-slope fragments.
+            overlap_mode = str(cfg.get("overlap_mode", "reward_inner")).strip().lower()
+            w = float(cfg["center_bias_weight"])
+            overlap_term = (-w * inner_overlap) if overlap_mode in ("reward_inner", "inner", "reward") else (+w * inner_overlap)
             key = (
-                mean_radius_px - float(cfg["center_bias_weight"]) * inner_overlap,
+                mean_radius_px + overlap_term,
                 p90_radius_px,
                 d2,
                 -sz
@@ -592,9 +830,9 @@ def find_caldera_contour_morphological(
             if best is None or key < best[0]:
                 best = (key, cid, sz, cent, inner_overlap, mean_radius_px, p90_radius_px)
 
-        if best is None:
+    if best is None:
             selected_cid, selected_sz = max(eligible, key=lambda t: t[1])
-        else:
+    else:
             selected_cid = int(best[1])
             selected_sz = int(best[2])
             center_used["selected_component_centroid"] = {"row": float(best[3][0]), "col": float(best[3][1])}
@@ -603,12 +841,35 @@ def find_caldera_contour_morphological(
             center_used["selected_component_p90_radius_px"] = float(best[6])
 
     best_mask = (lbl == selected_cid)
+    # Post-process selected rim mask to reduce small gaps and spurs.
+    # This helps cases where the rim has minor discontinuities in the slope-based candidates.
+    post_close = int(max(0, cfg.get("post_close_iterations", 0)))
+    post_fill = bool(cfg.get("post_fill_holes", True))
+    if post_close > 0:
+        try:
+            best_mask = binary_closing(best_mask, iterations=post_close)
+        except Exception:
+            pass
+    if post_fill:
+        try:
+            best_mask = binary_fill_holes(best_mask)
+        except Exception:
+            pass
+    # Keep the largest connected component after post-processing
+    try:
+        lbl2, n2 = label(best_mask)
+        if n2 > 1:
+            sizes2 = [int(np.sum(lbl2 == cid)) for cid in range(1, n2 + 1)]
+            keep = int(np.argmax(sizes2) + 1)
+            best_mask = (lbl2 == keep)
+    except Exception:
+        pass
     contours = measure.find_contours(best_mask.astype(np.uint8), 0.5)
     if not contours:
         raise ValueError("Rim contour extraction failed.")
     caldera_contour = max(contours, key=len)
 
-    debug = {
+    debug.update({
         "method": "morphological_slope_roi",
         "preset": bp,
         "config": cfg,
@@ -619,10 +880,11 @@ def find_caldera_contour_morphological(
         "eligible_component_sizes_px": [int(sz) for (_, sz) in eligible],
         "selected_component_id": int(selected_cid),
         "selected_component_px": int(selected_sz),
+        "post_process": {"post_close_iterations": int(max(0, cfg.get("post_close_iterations", 0))), "post_fill_holes": bool(cfg.get("post_fill_holes", True))},
         "center": center_used,
         "threshold": float(thr),
         "contour_len": int(len(caldera_contour)),
-    }
+    })
     return caldera_contour, debug
 
 
