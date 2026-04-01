@@ -220,6 +220,116 @@ function pickMetricsPath(procDir, ext /* 'csv'|'json' */) {
   }
 }
 
+function isSafeProcessId(processId) {
+  return /^[A-Za-z0-9_-]+$/.test(String(processId || ''));
+}
+
+function getProcessDir(processId) {
+  return path.join(outputsDir, String(processId));
+}
+
+function getAutoRimPath(processId) {
+  return path.join(getProcessDir(processId), 'caldera_rim_auto.geojson');
+}
+
+function getEditedRimPath(processId) {
+  return path.join(getProcessDir(processId), 'caldera_rim_edited.geojson');
+}
+
+function pickAvailableRim(processId) {
+  const editedPath = getEditedRimPath(processId);
+  if (fs.existsSync(editedPath)) {
+    return {
+      rimSource: 'edited',
+      rimFile: 'caldera_rim_edited.geojson',
+      rimPath: editedPath,
+    };
+  }
+
+  const autoPath = getAutoRimPath(processId);
+  if (fs.existsSync(autoPath)) {
+    return {
+      rimSource: 'auto',
+      rimFile: 'caldera_rim_auto.geojson',
+      rimPath: autoPath,
+    };
+  }
+
+  return null;
+}
+
+function ensureLinearRingClosed(coords) {
+  if (!Array.isArray(coords) || coords.length < 4) return false;
+
+  const first = coords[0];
+  const last = coords[coords.length - 1];
+
+  if (
+    !Array.isArray(first) || first.length < 2 ||
+    !Array.isArray(last) || last.length < 2
+  ) {
+    return false;
+  }
+
+  return Number(first[0]) === Number(last[0]) && Number(first[1]) === Number(last[1]);
+}
+
+function isValidPolygonGeometry(geometry) {
+  if (!geometry || geometry.type !== 'Polygon' || !Array.isArray(geometry.coordinates)) return false;
+  if (geometry.coordinates.length < 1) return false;
+
+  for (const ring of geometry.coordinates) {
+    if (!Array.isArray(ring) || ring.length < 4) return false;
+    for (const pt of ring) {
+      if (!Array.isArray(pt) || pt.length < 2) return false;
+      const x = Number(pt[0]);
+      const y = Number(pt[1]);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+    }
+    if (!ensureLinearRingClosed(ring)) return false;
+  }
+
+  return true;
+}
+
+function extractSinglePolygonFeature(payload) {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('Request body must be a valid GeoJSON object.');
+  }
+
+  let feature = null;
+
+  if (payload.type === 'Feature') {
+    feature = payload;
+  } else if (payload.type === 'FeatureCollection') {
+    if (!Array.isArray(payload.features) || payload.features.length !== 1) {
+      throw new Error('FeatureCollection must contain exactly one feature.');
+    }
+    feature = payload.features[0];
+  } else {
+    throw new Error('GeoJSON must be a Feature or a FeatureCollection.');
+  }
+
+  if (!feature || feature.type !== 'Feature') {
+    throw new Error('GeoJSON payload must contain a valid Feature.');
+  }
+
+  if (!isValidPolygonGeometry(feature.geometry)) {
+    throw new Error('GeoJSON geometry must be a valid Polygon with closed rings.');
+  }
+
+  return {
+    type: 'Feature',
+    geometry: feature.geometry,
+    properties: {
+      ...(feature.properties && typeof feature.properties === 'object' ? feature.properties : {}),
+      source: 'edited',
+      editing_crs: 'EPSG:4326',
+      saved_at: new Date().toISOString(),
+    },
+  };
+}
+
 // ---------------------------
 // Healthcheck
 // ---------------------------
@@ -491,6 +601,85 @@ app.get('/api/metrics/:processId', (req, res) => {
 });
 
 // ---------------------------
+// Rim endpoints
+// GET /api/rim/:processId
+// POST /api/rim/:processId
+// ---------------------------
+app.get('/api/rim/:processId', (req, res) => {
+  const { processId } = req.params;
+
+  if (!processId || !isSafeProcessId(processId)) {
+    return res.status(400).json({ error: 'Invalid processId' });
+  }
+
+  const picked = pickAvailableRim(processId);
+  if (!picked) {
+    return res.status(404).json({
+      error: 'No rim available for this processId',
+      processId,
+      expectedFiles: ['caldera_rim_auto.geojson', 'caldera_rim_edited.geojson'],
+    });
+  }
+
+  try {
+    const geojson = JSON.parse(fs.readFileSync(picked.rimPath, 'utf-8'));
+    return res.json({
+      processId,
+      rim_source: picked.rimSource,
+      rim_file: picked.rimFile,
+      geojson,
+    });
+  } catch (e) {
+    return res.status(500).json({
+      error: 'Failed to read rim GeoJSON',
+      processId,
+      rim_file: picked.rimFile,
+      detail: String(e.message || e),
+    });
+  }
+});
+
+app.post('/api/rim/:processId', (req, res) => {
+  const { processId } = req.params;
+
+  if (!processId || !isSafeProcessId(processId)) {
+    return res.status(400).json({ error: 'Invalid processId' });
+  }
+
+  let feature = null;
+  try {
+    feature = extractSinglePolygonFeature(req.body);
+  } catch (e) {
+    return res.status(400).json({
+      error: String(e.message || e),
+      processId,
+    });
+  }
+
+  const procDir = getProcessDir(processId);
+  const editedPath = getEditedRimPath(processId);
+
+  try {
+    fs.mkdirSync(procDir, { recursive: true });
+    fs.writeFileSync(editedPath, JSON.stringify(feature, null, 2), 'utf-8');
+
+    return res.status(201).json({
+      ok: true,
+      processId,
+      rim_source: 'edited',
+      rim_file: 'caldera_rim_edited.geojson',
+      saved: true,
+    });
+  } catch (e) {
+    return res.status(500).json({
+      error: 'Failed to save edited rim GeoJSON',
+      processId,
+      detail: String(e.message || e),
+    });
+  }
+});
+
+// ---------------------------
 // PDF Report endpoint
 // GET /api/report/:processId?moduleKey=...
 // ---------------------------
@@ -667,6 +856,7 @@ if (frontendBuildDir && fs.existsSync(frontendBuildDir)) {
       req.path.startsWith('/analysis') ||
       req.path.startsWith('/api/report') ||
       req.path.startsWith('/api/metrics') ||
+      req.path.startsWith('/api/rim') ||
       req.path.startsWith('/health')
     ) {
       return next();

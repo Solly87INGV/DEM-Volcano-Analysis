@@ -2,6 +2,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Box, Button, Typography, CircularProgress, Divider, Paper } from '@mui/material';
 import axios from 'axios';
+import RimMapModal from './RimMapModal';
 
 function normalizeImages(processId, images) {
   const base = processId ? `/outputs/${processId}` : '';
@@ -46,7 +47,6 @@ function getName(it) {
   return String(it?.filename || it?.name || it?.file || it?.url || '');
 }
 
-// ✅ Option B2 (final): px/py controlla lati e top/bottom in modo uniforme
 const FramePaper = ({ title, sx, children }) => (
   <Paper
     elevation={3}
@@ -109,8 +109,9 @@ export default function VolumeResultsViewer({ volumeRun, processId: processIdPro
   const [images, setImages] = useState(normalizeImages(volumeRun?.processId, volumeRun?.images));
   const [slideIdx, setSlideIdx] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [mapOpen, setMapOpen] = useState(false);
+  const [isRecalculating, setIsRecalculating] = useState(false);
 
-  // ✅ NON fissiamo più l'altezza del frame: mettiamo maxHeight sull’immagine
   const IMG_MAX_H = '70vh';
 
   const IMG_STYLE = {
@@ -123,8 +124,6 @@ export default function VolumeResultsViewer({ volumeRun, processId: processIdPro
     background: 'transparent',
   };
 
-  // ✅ Key tweak: per le slide singole (double_XX.png) le rendiamo "colonna" su desktop
-  // così assumono una scala visiva simile a DEM/Aspect (che stanno già in 2 colonne).
   const SINGLE_INNER_SX = {
     width: { xs: '100%', md: 'calc(50% - 8px)' },
     display: 'flex',
@@ -187,7 +186,6 @@ export default function VolumeResultsViewer({ volumeRun, processId: processIdPro
     };
   }, [processId, status]);
 
-  // ✅ costruiamo una slide "pair" DEM+Aspect, poi tutte le altre immagini
   const slides = useMemo(() => {
     const dem = pickByName(images, 'dem_overview');
     const asp = pickByName(images, 'aspect_overview');
@@ -225,6 +223,8 @@ export default function VolumeResultsViewer({ volumeRun, processId: processIdPro
   const rows = useMemo(() => buildResultRows(result), [result]);
 
   const canDownloadPdf = Boolean(processId) && Boolean(moduleKey) && status === 'completed';
+  const canOpenMap = Boolean(processId) && status === 'completed';
+  const canRecalculate = Boolean(processId) && Boolean(volumeRun?.baseProfile || moduleKey || status === 'completed');
 
   const handleDownloadPdf = async () => {
     if (!processId) return;
@@ -257,7 +257,6 @@ export default function VolumeResultsViewer({ volumeRun, processId: processIdPro
     }
   };
 
-  // ✅ NEW: download metrics (JSON/CSV) via /api/metrics/:processId
   const handleDownloadMetrics = async (format) => {
     if (!processId) return;
     const mk = moduleKey || 'unknown_module';
@@ -290,6 +289,58 @@ export default function VolumeResultsViewer({ volumeRun, processId: processIdPro
     }
   };
 
+  const handleRecalculate = async () => {
+    if (!processId) return;
+
+    const inferredBaseProfile =
+      volumeRun?.baseProfile ||
+      (moduleKey && moduleKey.includes('island') ? 'island' : null) ||
+      (moduleKey && moduleKey.includes('continental') ? 'continental' : null);
+
+    if (!inferredBaseProfile) {
+      alert('Unable to infer baseProfile for recalculation.');
+      return;
+    }
+
+    try {
+      setIsRecalculating(true);
+      setStatus('processing');
+
+      const formData = new FormData();
+      formData.append('processId', processId);
+      formData.append('baseProfile', inferredBaseProfile);
+      formData.append('originalFileName', volumeRun?.originalFileName || 'recalculate');
+
+      const resp = await axios.post('/calculateVolume', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+
+      const data = resp?.data || {};
+      const pid = data.processId || processId;
+
+      setProcessId(pid);
+      setStatus(data.status || 'completed');
+      setModuleKey(data.moduleKey || moduleKey || null);
+
+      const maybeResult =
+        data && typeof data === 'object' && data.result && typeof data.result === 'object'
+          ? data.result
+          : data;
+
+      setResult(maybeResult || null);
+      setImages(normalizeImages(pid, data.images));
+    } catch (e) {
+      console.error('Recalculate failed:', e);
+      setStatus('failed');
+      alert(
+        e?.response?.data?.error ||
+          'Recalculate failed. Check backend /calculateVolume.'
+      );
+    } finally {
+      setIsRecalculating(false);
+    }
+  };
+
   const renderSlide = () => {
     if (!current) {
       return (
@@ -301,7 +352,6 @@ export default function VolumeResultsViewer({ volumeRun, processId: processIdPro
       );
     }
 
-    // ✅ nuova slide doppietta DEM + Aspect (2 colonne)
     if (current.type === 'pair') {
       return (
         <FramePaper title={current.title || 'Overview'}>
@@ -334,7 +384,6 @@ export default function VolumeResultsViewer({ volumeRun, processId: processIdPro
       );
     }
 
-    // ✅ caso normale: immagine singola (double_XX.png ecc) ma resa "colonna" su desktop
     const title = current?.img?.title || current?.img?.filename || 'Image';
     const url = current?.img?.url;
 
@@ -367,11 +416,10 @@ export default function VolumeResultsViewer({ volumeRun, processId: processIdPro
         <Button variant="outlined" onClick={onBack}>Back</Button>
         {onBackToUpload ? <Button variant="outlined" onClick={onBackToUpload}>Back to Upload</Button> : null}
 
-        {/* ✅ NEW: metrics exports (same gating as PDF) */}
         <Button
           variant="outlined"
           onClick={() => handleDownloadMetrics('json')}
-          disabled={!canDownloadPdf || loading}
+          disabled={!canDownloadPdf || loading || isRecalculating}
           title={canDownloadPdf ? 'Download metrics JSON' : 'Available when status=completed and moduleKey is present'}
         >
           Download JSON
@@ -380,23 +428,41 @@ export default function VolumeResultsViewer({ volumeRun, processId: processIdPro
         <Button
           variant="outlined"
           onClick={() => handleDownloadMetrics('csv')}
-          disabled={!canDownloadPdf || loading}
+          disabled={!canDownloadPdf || loading || isRecalculating}
           title={canDownloadPdf ? 'Download metrics CSV' : 'Available when status=completed and moduleKey is present'}
         >
           Download CSV
         </Button>
 
         <Button
+          variant="outlined"
+          onClick={() => setMapOpen(true)}
+          disabled={!canOpenMap || loading || isRecalculating}
+          title={canOpenMap ? 'Open read-only rim map' : 'Available when status=completed'}
+        >
+          Open map
+        </Button>
+
+        <Button
+          variant="outlined"
+          onClick={handleRecalculate}
+          disabled={!canRecalculate || loading || isRecalculating}
+          title="Re-run volume calculation on the current processId and dem_working.tif"
+        >
+          {isRecalculating ? 'Recalculating...' : 'Recalculate'}
+        </Button>
+
+        <Button
           variant="contained"
           onClick={handleDownloadPdf}
-          disabled={!canDownloadPdf || loading}
+          disabled={!canDownloadPdf || loading || isRecalculating}
           title={canDownloadPdf ? 'Download PDF report' : 'Available when status=completed and moduleKey is present'}
         >
           Download PDF
         </Button>
 
         <Box sx={{ width: 28, height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          {loading ? <CircularProgress size={20} /> : null}
+          {loading || isRecalculating ? <CircularProgress size={20} /> : null}
         </Box>
       </Box>
 
@@ -449,6 +515,12 @@ export default function VolumeResultsViewer({ volumeRun, processId: processIdPro
           <Typography sx={{ opacity: 0.7 }}>Not available yet.</Typography>
         )}
       </Box>
+
+      <RimMapModal
+        open={mapOpen}
+        onClose={() => setMapOpen(false)}
+        processId={processId}
+      />
     </Box>
   );
 }

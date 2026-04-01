@@ -27,6 +27,9 @@
 # - metrics.json, metrics.csv
 # - volume_results.json (UI-ready)
 # - final_doublet_base_vs_caldera.png
+# - caldera_rim_auto.geojson (EPSG:4326)
+# - dem_preview.png
+# - dem_preview.json
 # -----------------------------------------------------------------------------
 
 import os
@@ -83,6 +86,7 @@ if HEADLESS:
 
 import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
+from rasterio.warp import transform as rio_transform
 from rasterio.crs import CRS as RioCRS
 
 from scipy.ndimage import (
@@ -291,6 +295,136 @@ def dem_nodata_stats(dem: np.ndarray, nodata=None) -> Dict[str, Any]:
         "valid_p98": float(np.percentile(valid, 98)) if valid.size else None,
     }
 
+
+
+
+# -------------------- Step2 logging & Leaflet export helpers --------------------
+def _log(msg: str) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[STEP2B {ts}] {msg}", flush=True)
+
+def _decimate_contour(contour: "np.ndarray", max_vertices: int = 2000) -> "np.ndarray":
+    c = np.asarray(contour)
+    if c.ndim != 2 or c.shape[0] < 3:
+        return c
+    n = int(c.shape[0])
+    if max_vertices <= 0 or n <= max_vertices:
+        return c
+    step = int(math.ceil(n / float(max_vertices)))
+    c2 = c[::step].copy()
+    return c2 if c2.shape[0] >= 3 else c
+
+def _transform_xy_to_lonlat(xs, ys, src_crs: str, chunk: int = 5000):
+    out_lon, out_lat = [], []
+    n = len(xs)
+    for i in range(0, n, chunk):
+        lons, lats = rio_transform(src_crs, "EPSG:4326", xs[i:i+chunk], ys[i:i+chunk])
+        out_lon.extend(list(lons))
+        out_lat.extend(list(lats))
+    return out_lon, out_lat
+
+def _same_xy(a: Tuple[float, float], b: Tuple[float, float], eps: float = 1e-12) -> bool:
+    return (abs(float(a[0]) - float(b[0])) <= eps) and (abs(float(a[1]) - float(b[1])) <= eps)
+
+def _transform_xy_lists_to_wgs84(xs: List[float], ys: List[float], src_crs) -> Tuple[List[float], List[float]]:
+    if src_crs is None:
+        raise RuntimeError("Cannot export to EPSG:4326 because DEM CRS is missing.")
+    try:
+        if RioCRS.from_user_input(src_crs) == RioCRS.from_epsg(4326):
+            return [float(x) for x in xs], [float(y) for y in ys]
+    except Exception:
+        pass
+    chunk = int(os.environ.get("RIM_XFORM_CHUNK", "5000"))
+    lon, lat = _transform_xy_to_lonlat(xs, ys, src_crs, chunk=chunk)
+    return [float(v) for v in lon], [float(v) for v in lat]
+
+def _contour_rc_to_lonlat_ring(contour: np.ndarray, transform, src_crs) -> List[List[float]]:
+    c = np.asarray(contour, dtype=float)
+    if c.ndim != 2 or c.shape[0] < 3 or c.shape[1] < 2:
+        raise ValueError("Contour is invalid or too short for GeoJSON export.")
+    xs = []
+    ys = []
+    for row, col in c:
+        x, y = _pixel_to_map_xy(transform, row, col)
+        xs.append(float(x))
+        ys.append(float(y))
+    lons, lats = _transform_xy_lists_to_wgs84(xs, ys, src_crs)
+    ring = [[float(lon), float(lat)] for lon, lat in zip(lons, lats)]
+    if len(ring) < 3:
+        raise ValueError("GeoJSON ring has too few vertices.")
+    if not _same_xy(tuple(ring[0]), tuple(ring[-1])):
+        ring.append([float(ring[0][0]), float(ring[0][1])])
+    return ring
+
+def write_auto_rim_geojson(caldera_contour: np.ndarray, transform, src_crs, out_path: Path) -> None:
+    max_vertices = int(os.environ.get("RIM_MAX_VERTICES", "2000"))
+    n0 = int(np.asarray(caldera_contour).shape[0]) if caldera_contour is not None else -1
+    _log(f"write_auto_rim_geojson: original_vertices={n0} max_vertices={max_vertices}")
+    caldera_contour = _decimate_contour(caldera_contour, max_vertices=max_vertices)
+    n1 = int(np.asarray(caldera_contour).shape[0]) if caldera_contour is not None else -1
+    _log(f"write_auto_rim_geojson: decimated_vertices={n1}")
+    ring = _contour_rc_to_lonlat_ring(caldera_contour, transform, src_crs)
+    feature = {
+        "type": "Feature",
+        "geometry": {"type": "Polygon", "coordinates": [ring]},
+        "properties": {"source": "auto", "editing_crs": "EPSG:4326"},
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(feature, indent=2, ensure_ascii=False), encoding="utf-8")
+
+def _normalize_dem_for_preview(dem: np.ndarray, nodata=None, p_lo: float = 2.0, p_hi: float = 98.0) -> np.ndarray:
+    arr = dem.astype(float)
+    valid = np.isfinite(arr)
+    if nodata is not None:
+        try:
+            valid = valid & (arr != float(nodata))
+        except Exception:
+            pass
+    img = np.zeros(arr.shape, dtype=np.uint8)
+    vals = arr[valid]
+    if vals.size == 0:
+        return img
+    vmin = float(np.percentile(vals, p_lo))
+    vmax = float(np.percentile(vals, p_hi))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        vmin = float(np.min(vals))
+        vmax = float(np.max(vals))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        img[valid] = 127
+        return img
+    scaled = (arr - vmin) / (vmax - vmin)
+    scaled = np.clip(scaled, 0.0, 1.0)
+    img[valid] = np.round(scaled[valid] * 255.0).astype(np.uint8)
+    return img
+
+def write_dem_preview_png(dem: np.ndarray, nodata, out_path: Path, max_dim: int = 1600) -> None:
+    img8 = _normalize_dem_for_preview(dem, nodata=nodata, p_lo=2.0, p_hi=98.0)
+    h, w = img8.shape[:2]
+    long_side = max(h, w)
+    if long_side > int(max_dim):
+        step = int(math.ceil(long_side / float(max_dim)))
+        img8 = img8[::step, ::step]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.imsave(str(out_path), img8, cmap="gray", vmin=0, vmax=255, format="png")
+
+def _bounds_to_wgs84(bounds, src_crs) -> Tuple[float, float, float, float]:
+    xs = [float(bounds.left), float(bounds.right), float(bounds.right), float(bounds.left)]
+    ys = [float(bounds.bottom), float(bounds.bottom), float(bounds.top), float(bounds.top)]
+    lons, lats = _transform_xy_lists_to_wgs84(xs, ys, src_crs)
+    west = float(min(lons))
+    east = float(max(lons))
+    south = float(min(lats))
+    north = float(max(lats))
+    return west, south, east, north
+
+def write_dem_preview_json(bounds, src_crs, out_path: Path) -> None:
+    west, south, east, north = _bounds_to_wgs84(bounds, src_crs)
+    payload = {
+        "bounds": [[south, west], [north, east]],
+        "crs": "EPSG:4326",
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 # -------------------- base contour selection (profile presets) --------------------
 def _find_contours_at_level(dem: np.ndarray, level: float) -> List[np.ndarray]:
@@ -1276,10 +1410,13 @@ def main() -> int:
     # Read DEM
     with rasterio.open(dem_path) as src:
         dem = src.read(1)
+        _log("DEM read OK")
+        _log(f"DEM shape={dem.shape} crs={src.crs}")
         transform = src.transform
         crs = src.crs
         res = src.res
         nodata = src.nodata
+        bounds = src.bounds
 
     meta = {
         "process_id": process_id,
@@ -1293,7 +1430,29 @@ def main() -> int:
     }
 
     # Compute
+    _log("run_unified START")
     out = run_unified(dem, transform, meta, base_profile=base_profile)
+    _log("run_unified DONE")
+
+    auto_rim_name = "caldera_rim_auto.geojson"
+    auto_rim_path = proc_dir / auto_rim_name
+    _log("write_auto_rim_geojson START")
+    write_auto_rim_geojson(
+        caldera_contour=out["caldera_contour"],
+        transform=transform,
+        src_crs=crs,
+        out_path=auto_rim_path,
+    )
+    _log("write_auto_rim_geojson DONE")
+
+    dem_preview_png_name = "dem_preview.png"
+    dem_preview_json_name = "dem_preview.json"
+    dem_preview_png_path = proc_dir / dem_preview_png_name
+    dem_preview_json_path = proc_dir / dem_preview_json_name
+    _log("write_dem_preview START")
+    write_dem_preview_png(dem=dem, nodata=nodata, out_path=dem_preview_png_path)
+    write_dem_preview_json(bounds=bounds, src_crs=crs, out_path=dem_preview_json_path)
+    _log("write_dem_preview DONE")
 
     # Save final doublet
     doublet_name = "final_doublet_base_vs_caldera.png"
@@ -1432,11 +1591,14 @@ def main() -> int:
             "h_max_m": float(out.get("height_model", {}).get("h_max_m", 0.0)),
             "pixel_size_m": pixel_size_m,
         },
-        "images": ["final_doublet_base_vs_caldera.png"],
+        "images": ["final_doublet_base_vs_caldera.png", "dem_preview.png"],
         "links": {
             "metrics_json": _public_path(process_id, "metrics.json"),
             "metrics_csv": _public_path(process_id, "metrics.csv"),
             "final_doublet": _public_path(process_id, "final_doublet_base_vs_caldera.png"),
+            "dem_preview": _public_path(process_id, "dem_preview.png"),
+            "dem_preview_meta": _public_path(process_id, "dem_preview.json"),
+            "caldera_rim_auto": _public_path(process_id, "caldera_rim_auto.geojson"),
         }
     }
 
@@ -1446,6 +1608,9 @@ def main() -> int:
     print(f"[INFO] Wrote: {metrics_json_path}")
     print(f"[INFO] Wrote: {metrics_csv_path}")
     print(f"[INFO] Wrote: {doublet_path}")
+    print(f"[INFO] Wrote: {auto_rim_path}")
+    print(f"[INFO] Wrote: {dem_preview_png_path}")
+    print(f"[INFO] Wrote: {dem_preview_json_path}")
 
     # Print compact JSON for Node logs / optional parsing
     try:
@@ -1454,7 +1619,7 @@ def main() -> int:
             "status": "completed",
             "moduleKey": module_key,
             "baseProfile": base_profile,
-            "images": ["final_doublet_base_vs_caldera.png"],
+            "images": ["final_doublet_base_vs_caldera.png", "dem_preview.png"],
         }, ensure_ascii=False), flush=True)
     except Exception:
         pass
