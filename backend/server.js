@@ -187,7 +187,7 @@ function writeProcessMeta(procDir, metaPatch) {
   }
 }
 
-function patchVolumeResultsFile(procDir, moduleKey, baseProfile) {
+function patchVolumeResultsFile(procDir, moduleKey, baseProfile, rimSource = null, rimFile = null) {
   try {
     const p = path.join(procDir, 'volume_results.json');
     if (!fs.existsSync(p)) return;
@@ -202,6 +202,8 @@ function patchVolumeResultsFile(procDir, moduleKey, baseProfile) {
 
     obj.moduleKey = moduleKey;
     obj.baseProfile = baseProfile || '';
+    if (rimSource) obj.rim_source = rimSource;
+    if (rimFile) obj.rim_file = rimFile;
 
     fs.writeFileSync(p, JSON.stringify(obj, null, 2), 'utf-8');
   } catch (e) {
@@ -459,6 +461,11 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
   const procDir = path.join(outputsDir, processId);
   fs.mkdirSync(procDir, { recursive: true });
 
+  const editedRimPath = getEditedRimPath(processId);
+  const hasEditedRim = fs.existsSync(editedRimPath);
+  const rimSource = hasEditedRim ? 'edited' : 'auto';
+  const rimFile = hasEditedRim ? 'caldera_rim_edited.geojson' : 'caldera_rim_auto.geojson';
+
   // Manifest-first DEM selection
   const demWorkingPath = path.join(procDir, 'dem_working.tif');
   let demInputPath = null;
@@ -484,6 +491,8 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
     volumeType: 'unified',
     approximationType: 'unified',
     dem_input_path: demInputPath ? String(demInputPath) : '',
+    rim_source: rimSource,
+    rim_file: rimFile,
     step: 'calculate_volume',
     updated_at: new Date().toISOString(),
   });
@@ -510,6 +519,10 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
       VOLUME_TYPE: 'unified',
       APPROXIMATION_TYPE: 'unified',
       DEM_INPUT: demInputPath,
+
+      USE_EDITED_RIM: hasEditedRim ? '1' : '0',
+      RIM_PATH: hasEditedRim ? editedRimPath : '',
+      RIM_SOURCE: rimSource,
     },
   });
 
@@ -538,7 +551,7 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
       return res.status(500).json({ error: 'Error calculating volume' });
     }
 
-    patchVolumeResultsFile(procDir, moduleKey, baseProfile);
+    patchVolumeResultsFile(procDir, moduleKey, baseProfile, rimSource, rimFile);
 
     // Preferred: serve the on-disk truth
     try {
@@ -547,6 +560,8 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
         const vr = JSON.parse(fs.readFileSync(vrPath, 'utf-8'));
         vr.moduleKey = moduleKey;
         vr.baseProfile = baseProfile || '';
+        vr.rim_source = rimSource;
+        vr.rim_file = rimFile;
         return res.json(vr);
       }
     } catch (e) {
@@ -558,6 +573,8 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
       const parsed = JSON.parse(resultData);
       parsed.moduleKey = moduleKey;
       parsed.baseProfile = baseProfile || '';
+      parsed.rim_source = rimSource;
+      parsed.rim_file = rimFile;
       return res.json(parsed);
     } catch {
       return res.json({
@@ -565,6 +582,8 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
         status: 'completed',
         moduleKey,
         baseProfile,
+        rim_source: rimSource,
+        rim_file: rimFile,
         result: resultData,
         images: [],
       });

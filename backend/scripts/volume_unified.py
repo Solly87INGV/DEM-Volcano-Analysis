@@ -12,14 +12,14 @@
 # - island: "simple base" (more selective, assumes isolated edifice)
 # - continental: "complex base" (more robust to merged topography)
 #
-# No UI choice for circular/elliptical or approx types.
-#
 # Inputs:
 # - Env (recommended):
 #     PROCESS_ID, OUTPUTS_DIR, HEADLESS
 #     BASE_PROFILE: island|continental
-#     MODULE_KEY: usually "{volumeType}_{baseProfile}" but here use "unified_{baseProfile}"
+#     MODULE_KEY: "unified_{baseProfile}"
 #     ORIGINAL_FILE_NAME, ORIGINAL_FILE_STEM (optional)
+#     USE_EDITED_RIM=1|0
+#     RIM_PATH=<outputs/<PID>/caldera_rim_edited.geojson>
 # - CLI (compat):
 #     python volume_unified.py <dem_path> [original_file_stem]
 #
@@ -27,7 +27,7 @@
 # - metrics.json, metrics.csv
 # - volume_results.json (UI-ready)
 # - final_doublet_base_vs_caldera.png
-# - caldera_rim_auto.geojson (EPSG:4326)
+# - caldera_rim_auto.geojson
 # - dem_preview.png
 # - dem_preview.json
 # -----------------------------------------------------------------------------
@@ -39,7 +39,6 @@ import csv
 import math
 import time
 import datetime
-import shutil
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List
 
@@ -47,10 +46,6 @@ import numpy as np
 
 # -------------------- PROJ/GDAL safety (Windows vs Docker) --------------------
 def _fix_proj_env():
-    """
-    - Windows: force PROJ_LIB to pyproj datadir to avoid PostGIS PROJ mismatch.
-    - Non-Windows (Docker/Linux): unset PROJ_LIB/PROJ_DATA to avoid host mismatch.
-    """
     try:
         is_windows = (os.name == "nt")
         if is_windows:
@@ -96,7 +91,6 @@ from scipy.ndimage import (
     binary_closing,
     binary_fill_holes,
     binary_erosion,
-    binary_opening,
     label,
 )
 
@@ -141,13 +135,14 @@ def _normalize_base_profile(v: str) -> str:
     return s or "continental"
 
 
+# -------------------- logging --------------------
+def _log(msg: str) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[STEP4B {ts}] {msg}", flush=True)
+
+
 # -------------------- DEM selection (manifest-first) --------------------
 def _pick_dem_manifest_first(proc_dir: Path, cli_dem: Optional[str]) -> Tuple[Path, str]:
-    """
-    Priority:
-    1) proc_dir/dem_working.tif
-    2) cli_dem if exists
-    """
     dem_working = proc_dir / "dem_working.tif"
     if dem_working.exists():
         return dem_working, "process_dir/dem_working.tif"
@@ -164,10 +159,6 @@ def _utm_epsg_from_lonlat(lon: float, lat: float) -> int:
     return (32600 + zone) if lat >= 0 else (32700 + zone)
 
 def ensure_metric_dem(dem_path: Path, proc_dir: Path) -> Path:
-    """
-    If CRS is geographic, reproject to local UTM and write proc_dir/dem_working.tif.
-    If already projected, return original path.
-    """
     with rasterio.open(dem_path) as src:
         src_crs = src.crs
         if src_crs is None:
@@ -234,13 +225,10 @@ def calculate_area(contour: np.ndarray, transform) -> float:
     if c.shape[0] < 3:
         return 0.0
 
-    rows = c[:, 0]
-    cols = c[:, 1]
-
     xs = np.empty(len(c), dtype=float)
     ys = np.empty(len(c), dtype=float)
     for i in range(len(c)):
-        xs[i], ys[i] = _pixel_to_map_xy(transform, rows[i], cols[i])
+        xs[i], ys[i] = _pixel_to_map_xy(transform, c[i, 0], c[i, 1])
 
     area = 0.5 * np.abs(np.dot(xs, np.roll(ys, -1)) - np.dot(ys, np.roll(xs, -1)))
     return float(area)
@@ -250,12 +238,10 @@ def contour_perimeter_m(contour: np.ndarray, transform) -> float:
     if c.shape[0] < 2:
         return 0.0
 
-    rows = c[:, 0]
-    cols = c[:, 1]
     xs = np.empty(len(c), dtype=float)
     ys = np.empty(len(c), dtype=float)
     for i in range(len(c)):
-        xs[i], ys[i] = _pixel_to_map_xy(transform, rows[i], cols[i])
+        xs[i], ys[i] = _pixel_to_map_xy(transform, c[i, 0], c[i, 1])
 
     dx = np.diff(np.r_[xs, xs[0]])
     dy = np.diff(np.r_[ys, ys[0]])
@@ -296,135 +282,143 @@ def dem_nodata_stats(dem: np.ndarray, nodata=None) -> Dict[str, Any]:
     }
 
 
-
-
-# -------------------- Step2 logging & Leaflet export helpers --------------------
-def _log(msg: str) -> None:
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[STEP2B {ts}] {msg}", flush=True)
-
-def _decimate_contour(contour: "np.ndarray", max_vertices: int = 2000) -> "np.ndarray":
-    c = np.asarray(contour)
-    if c.ndim != 2 or c.shape[0] < 3:
-        return c
-    n = int(c.shape[0])
-    if max_vertices <= 0 or n <= max_vertices:
-        return c
-    step = int(math.ceil(n / float(max_vertices)))
-    c2 = c[::step].copy()
-    return c2 if c2.shape[0] >= 3 else c
-
-def _transform_xy_to_lonlat(xs, ys, src_crs: str, chunk: int = 5000):
-    out_lon, out_lat = [], []
-    n = len(xs)
-    for i in range(0, n, chunk):
-        lons, lats = rio_transform(src_crs, "EPSG:4326", xs[i:i+chunk], ys[i:i+chunk])
-        out_lon.extend(list(lons))
-        out_lat.extend(list(lats))
-    return out_lon, out_lat
+# -------------------- preview + auto rim export --------------------
+RIM_MAX_VERTICES = 2000
+DEM_PREVIEW_MAX_SIZE = 1400
 
 def _same_xy(a: Tuple[float, float], b: Tuple[float, float], eps: float = 1e-12) -> bool:
     return (abs(float(a[0]) - float(b[0])) <= eps) and (abs(float(a[1]) - float(b[1])) <= eps)
 
+def _decimate_contour_vertices(contour: np.ndarray, max_vertices: int = RIM_MAX_VERTICES) -> np.ndarray:
+    c = np.asarray(contour, dtype=float)
+    n = int(c.shape[0])
+    if n <= max_vertices or max_vertices < 3:
+        return c
+    idx = np.linspace(0, n - 1, max_vertices, dtype=int)
+    idx = np.unique(idx)
+    return c[idx]
+
 def _transform_xy_lists_to_wgs84(xs: List[float], ys: List[float], src_crs) -> Tuple[List[float], List[float]]:
     if src_crs is None:
         raise RuntimeError("Cannot export to EPSG:4326 because DEM CRS is missing.")
+
     try:
         if RioCRS.from_user_input(src_crs) == RioCRS.from_epsg(4326):
             return [float(x) for x in xs], [float(y) for y in ys]
     except Exception:
         pass
-    chunk = int(os.environ.get("RIM_XFORM_CHUNK", "5000"))
-    lon, lat = _transform_xy_to_lonlat(xs, ys, src_crs, chunk=chunk)
+
+    lon, lat = rio_transform(src_crs, "EPSG:4326", xs, ys)
     return [float(v) for v in lon], [float(v) for v in lat]
 
 def _contour_rc_to_lonlat_ring(contour: np.ndarray, transform, src_crs) -> List[List[float]]:
-    c = np.asarray(contour, dtype=float)
+    c = _decimate_contour_vertices(np.asarray(contour, dtype=float), max_vertices=RIM_MAX_VERTICES)
     if c.ndim != 2 or c.shape[0] < 3 or c.shape[1] < 2:
         raise ValueError("Contour is invalid or too short for GeoJSON export.")
+
     xs = []
     ys = []
     for row, col in c:
         x, y = _pixel_to_map_xy(transform, row, col)
         xs.append(float(x))
         ys.append(float(y))
+
     lons, lats = _transform_xy_lists_to_wgs84(xs, ys, src_crs)
     ring = [[float(lon), float(lat)] for lon, lat in zip(lons, lats)]
+
     if len(ring) < 3:
         raise ValueError("GeoJSON ring has too few vertices.")
+
     if not _same_xy(tuple(ring[0]), tuple(ring[-1])):
         ring.append([float(ring[0][0]), float(ring[0][1])])
+
     return ring
 
-def write_auto_rim_geojson(caldera_contour: np.ndarray, transform, src_crs, out_path: Path) -> None:
-    max_vertices = int(os.environ.get("RIM_MAX_VERTICES", "2000"))
-    n0 = int(np.asarray(caldera_contour).shape[0]) if caldera_contour is not None else -1
-    _log(f"write_auto_rim_geojson: original_vertices={n0} max_vertices={max_vertices}")
-    caldera_contour = _decimate_contour(caldera_contour, max_vertices=max_vertices)
-    n1 = int(np.asarray(caldera_contour).shape[0]) if caldera_contour is not None else -1
-    _log(f"write_auto_rim_geojson: decimated_vertices={n1}")
+def write_auto_rim_geojson(
+    caldera_contour: np.ndarray,
+    transform,
+    src_crs,
+    out_path: Path,
+) -> None:
     ring = _contour_rc_to_lonlat_ring(caldera_contour, transform, src_crs)
     feature = {
         "type": "Feature",
-        "geometry": {"type": "Polygon", "coordinates": [ring]},
-        "properties": {"source": "auto", "editing_crs": "EPSG:4326"},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [ring],
+        },
+        "properties": {
+            "source": "auto",
+            "editing_crs": "EPSG:4326",
+        },
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(feature, indent=2, ensure_ascii=False), encoding="utf-8")
 
-def _normalize_dem_for_preview(dem: np.ndarray, nodata=None, p_lo: float = 2.0, p_hi: float = 98.0) -> np.ndarray:
+def _bounds_to_wgs84(bounds_tuple, src_crs) -> List[List[float]]:
+    left, bottom, right, top = [float(v) for v in bounds_tuple]
+
+    try:
+        if RioCRS.from_user_input(src_crs) == RioCRS.from_epsg(4326):
+            west, south, east, north = left, bottom, right, top
+        else:
+            xs = [left, right, right, left]
+            ys = [bottom, bottom, top, top]
+            lons, lats = rio_transform(src_crs, "EPSG:4326", xs, ys)
+            west = float(min(lons))
+            east = float(max(lons))
+            south = float(min(lats))
+            north = float(max(lats))
+    except Exception as e:
+        raise RuntimeError(f"Failed to transform DEM bounds to EPSG:4326: {e}") from e
+
+    return [[south, west], [north, east]]
+
+def _downsample_for_preview(arr: np.ndarray, max_size: int = DEM_PREVIEW_MAX_SIZE) -> np.ndarray:
+    h, w = arr.shape
+    scale = max(h / float(max_size), w / float(max_size), 1.0)
+    step = int(math.ceil(scale))
+    if step <= 1:
+        return arr
+    return arr[::step, ::step]
+
+def write_dem_preview(
+    dem: np.ndarray,
+    bounds_tuple,
+    src_crs,
+    out_png: Path,
+    out_json: Path,
+) -> None:
     arr = dem.astype(float)
     valid = np.isfinite(arr)
-    if nodata is not None:
-        try:
-            valid = valid & (arr != float(nodata))
-        except Exception:
-            pass
-    img = np.zeros(arr.shape, dtype=np.uint8)
-    vals = arr[valid]
-    if vals.size == 0:
-        return img
-    vmin = float(np.percentile(vals, p_lo))
-    vmax = float(np.percentile(vals, p_hi))
+    if not np.any(valid):
+        raise RuntimeError("Cannot write DEM preview: no valid DEM pixels.")
+
+    preview = _downsample_for_preview(arr, max_size=DEM_PREVIEW_MAX_SIZE)
+    valid_p = np.isfinite(preview)
+    vals = preview[valid_p]
+
+    vmin = float(np.percentile(vals, 2))
+    vmax = float(np.percentile(vals, 98))
     if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
         vmin = float(np.min(vals))
         vmax = float(np.max(vals))
-    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
-        img[valid] = 127
-        return img
-    scaled = (arr - vmin) / (vmax - vmin)
-    scaled = np.clip(scaled, 0.0, 1.0)
-    img[valid] = np.round(scaled[valid] * 255.0).astype(np.uint8)
-    return img
+    if vmax <= vmin:
+        vmax = vmin + 1.0
 
-def write_dem_preview_png(dem: np.ndarray, nodata, out_path: Path, max_dim: int = 1600) -> None:
-    img8 = _normalize_dem_for_preview(dem, nodata=nodata, p_lo=2.0, p_hi=98.0)
-    h, w = img8.shape[:2]
-    long_side = max(h, w)
-    if long_side > int(max_dim):
-        step = int(math.ceil(long_side / float(max_dim)))
-        img8 = img8[::step, ::step]
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.imsave(str(out_path), img8, cmap="gray", vmin=0, vmax=255, format="png")
+    preview_norm = np.zeros_like(preview, dtype=float)
+    preview_norm[valid_p] = np.clip((preview[valid_p] - vmin) / (vmax - vmin), 0.0, 1.0)
 
-def _bounds_to_wgs84(bounds, src_crs) -> Tuple[float, float, float, float]:
-    xs = [float(bounds.left), float(bounds.right), float(bounds.right), float(bounds.left)]
-    ys = [float(bounds.bottom), float(bounds.bottom), float(bounds.top), float(bounds.top)]
-    lons, lats = _transform_xy_lists_to_wgs84(xs, ys, src_crs)
-    west = float(min(lons))
-    east = float(max(lons))
-    south = float(min(lats))
-    north = float(max(lats))
-    return west, south, east, north
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    plt.imsave(str(out_png), preview_norm, cmap="gray", vmin=0.0, vmax=1.0)
 
-def write_dem_preview_json(bounds, src_crs, out_path: Path) -> None:
-    west, south, east, north = _bounds_to_wgs84(bounds, src_crs)
-    payload = {
-        "bounds": [[south, west], [north, east]],
+    bounds_wgs84 = _bounds_to_wgs84(bounds_tuple, src_crs)
+    meta = {
+        "bounds": bounds_wgs84,
         "crs": "EPSG:4326",
     }
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    out_json.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+
 
 # -------------------- base contour selection (profile presets) --------------------
 def _find_contours_at_level(dem: np.ndarray, level: float) -> List[np.ndarray]:
@@ -441,11 +435,91 @@ def _touches_border(contour: np.ndarray, shape: Tuple[int, int], margin_px: int 
         np.any(r >= (h - 1 - margin_px)) or np.any(col >= (w - 1 - margin_px))
     )
 
+
+# -------------------- edited rim override helpers (Step 4B) --------------------
+def _is_closed_ring(coords: List[List[float]], eps: float = 1e-12) -> bool:
+    if not coords or len(coords) < 4:
+        return False
+    a = coords[0]
+    b = coords[-1]
+    return (abs(float(a[0]) - float(b[0])) <= eps) and (abs(float(a[1]) - float(b[1])) <= eps)
+
+def _feature_to_lonlat_ring(feature: dict) -> List[List[float]]:
+    if not isinstance(feature, dict) or feature.get("type") != "Feature":
+        raise ValueError("Edited rim GeoJSON must be a Feature.")
+
+    geom = feature.get("geometry") or {}
+    if geom.get("type") != "Polygon":
+        raise ValueError("Edited rim GeoJSON geometry must be Polygon.")
+
+    coords = geom.get("coordinates")
+    if not isinstance(coords, list) or len(coords) < 1:
+        raise ValueError("Edited rim GeoJSON has no polygon coordinates.")
+
+    ring = coords[0]
+    if not isinstance(ring, list) or len(ring) < 4:
+        raise ValueError("Edited rim polygon ring is too short.")
+
+    for pt in ring:
+        if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+            raise ValueError("Edited rim polygon contains invalid coordinate.")
+        x = float(pt[0])
+        y = float(pt[1])
+        if not np.isfinite(x) or not np.isfinite(y):
+            raise ValueError("Edited rim polygon contains non-finite coordinate.")
+
+    if not _is_closed_ring(ring):
+        raise ValueError("Edited rim polygon ring is not closed.")
+
+    return [[float(pt[0]), float(pt[1])] for pt in ring]
+
+def load_edited_rim_contour_from_geojson(
+    rim_path: Path,
+    transform,
+    dst_crs,
+    dem_shape: Tuple[int, int],
+) -> np.ndarray:
+    raw = json.loads(Path(rim_path).read_text(encoding="utf-8"))
+    ring_lonlat = _feature_to_lonlat_ring(raw)
+
+    if len(ring_lonlat) >= 2 and ring_lonlat[0] == ring_lonlat[-1]:
+        ring_lonlat = ring_lonlat[:-1]
+
+    lons = [float(pt[0]) for pt in ring_lonlat]
+    lats = [float(pt[1]) for pt in ring_lonlat]
+
+    if dst_crs is None:
+        raise RuntimeError("DEM CRS is missing; cannot project edited rim.")
+
+    try:
+        if RioCRS.from_user_input(dst_crs) == RioCRS.from_epsg(4326):
+            xs = lons
+            ys = lats
+        else:
+            xs, ys = rio_transform("EPSG:4326", dst_crs, lons, lats)
+    except Exception as e:
+        raise RuntimeError(f"Failed to transform edited rim to DEM CRS: {e}") from e
+
+    inv = ~transform
+    rows = []
+    cols = []
+    for x, y in zip(xs, ys):
+        col, row = inv * (float(x), float(y))
+        rows.append(float(row))
+        cols.append(float(col))
+
+    contour = np.column_stack([rows, cols]).astype(float)
+
+    if contour.shape[0] < 3:
+        raise ValueError("Edited rim contour has too few vertices after reprojection.")
+
+    h, w = dem_shape
+    if np.all((contour[:, 0] < -1) | (contour[:, 0] > h + 1) | (contour[:, 1] < -1) | (contour[:, 1] > w + 1)):
+        raise ValueError("Edited rim contour falls completely outside DEM extent.")
+
+    return contour
+
 def select_base_contour(dem: np.ndarray, transform, nodata=None, base_profile: str = "continental") -> Tuple[np.ndarray, Dict[str, Any]]:
-    """
-    Island: simple + deterministic (legacy-like) -> ratio=0.05, pick longest contour.
-    Continental: robust -> sweep ratios, score candidates, pick best.
-    """
     demf = dem.astype(float)
 
     valid = np.isfinite(demf)
@@ -464,8 +538,6 @@ def select_base_contour(dem: np.ndarray, transform, nodata=None, base_profile: s
     bp = _normalize_base_profile(base_profile)
 
     if bp == "island":
-        # Island: still deterministic, but avoid pathological base contours that hug the raster border.
-        # This is important for summit-focused crops (e.g., Piton) where the minimum elevation often lies on the clip edge.
         ratios = [0.05, 0.08, 0.12, 0.16, 0.20]
         img_area_px = float(demf.shape[0] * demf.shape[1])
 
@@ -486,7 +558,6 @@ def select_base_contour(dem: np.ndarray, transform, nodata=None, base_profile: s
             for c in contours:
                 if len(c) < 50:
                     continue
-                # Avoid clip-edge / coastline artifacts
                 if _touches_border(c, demf.shape, margin_px=2):
                     continue
 
@@ -494,7 +565,6 @@ def select_base_contour(dem: np.ndarray, transform, nodata=None, base_profile: s
                 area_px = float(np.sum(mask))
                 area_frac = float(area_px / img_area_px)
 
-                # reject pathological: too small or too big
                 if area_frac < 0.01 or area_frac > 0.75:
                     continue
 
@@ -502,7 +572,6 @@ def select_base_contour(dem: np.ndarray, transform, nodata=None, base_profile: s
                 P = contour_perimeter_m(c, transform)
                 circ = (4.0 * math.pi * A / (P * P)) if (A > 0 and P > 0) else 0.0
 
-                # score: prefer mid-size base + some circularity + longer contour
                 size_term = -abs(area_frac - 0.35)
                 score = 2.0 * size_term + 0.3 * float(circ) + 0.0005 * float(len(c))
 
@@ -514,13 +583,11 @@ def select_base_contour(dem: np.ndarray, transform, nodata=None, base_profile: s
                     picked_level = float(level)
 
         if best is None:
-            # Last-resort fallback: allow border-touching but still prefer reasonable size.
             ratio = 0.12
             level = vmin + rng * ratio
             contours = _find_contours_at_level(demf, level)
             if not contours:
                 raise ValueError("No base contours found (island preset).")
-            # pick the largest non-tiny contour
             best = max(contours, key=len)
             picked_ratio = float(ratio)
             picked_level = float(level)
@@ -536,10 +603,8 @@ def select_base_contour(dem: np.ndarray, transform, nodata=None, base_profile: s
         }
         return best, dbg
 
-    # continental: sweep and score
     ratios = [0.03, 0.05, 0.07, 0.10, 0.13, 0.16, 0.20]
     best = None
-
     img_area_px = float(demf.shape[0] * demf.shape[1])
 
     for ratio in ratios:
@@ -558,7 +623,6 @@ def select_base_contour(dem: np.ndarray, transform, nodata=None, base_profile: s
             area_px = float(np.sum(mask))
             area_frac = float(area_px / img_area_px)
 
-            # reject pathological: too small or too big
             if area_frac < 0.01 or area_frac > 0.75:
                 continue
 
@@ -566,9 +630,7 @@ def select_base_contour(dem: np.ndarray, transform, nodata=None, base_profile: s
             P = contour_perimeter_m(c, transform)
             circ = (4.0 * math.pi * A / (P * P)) if (A > 0 and P > 0) else 0.0
 
-            # score: prefer mid-size base, reasonable circularity, longer contour
-            # keep it simple & deterministic
-            size_term = -abs(area_frac - 0.25)  # target ~25% of frame (heuristic)
+            size_term = -abs(area_frac - 0.25)
             circ_term = max(0.0, min(1.0, circ))
             len_term = math.log(float(len(c)))
 
@@ -587,7 +649,6 @@ def select_base_contour(dem: np.ndarray, transform, nodata=None, base_profile: s
                 best = {"contour": c, "cand": cand}
 
     if not best:
-        # hard fallback: island-style
         ratio = 0.05
         level = vmin + rng * ratio
         contours = _find_contours_at_level(demf, level)
@@ -633,11 +694,7 @@ def _peak_in_roi(dem: np.ndarray, roi: np.ndarray) -> Optional[Tuple[float, floa
     except Exception:
         return _centroid_of_mask(roi)
 
-
 def _min_in_roi(dem: np.ndarray, roi: np.ndarray) -> Optional[Tuple[float, float]]:
-    """Return the location (row,col) of the minimum elevation inside ROI.
-    Useful for caldera-centered selection (depression) vs peak-based selection.
-    """
     try:
         vals = np.where(roi, dem.astype(float), np.inf)
         if not np.isfinite(vals).any():
@@ -656,14 +713,9 @@ def find_caldera_contour_morphological(
     preset: str = "continental",
     _override_cfg: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """
-    Morphological rim detection with two presets.
-    We intentionally keep it parameter-driven (no new formulas).
-    """
     debug: Dict[str, Any] = {}
     bp = _normalize_base_profile(preset)
 
-    # Presets (tuned knobs)
     if bp == "island":
         cfg = {
             "roi_dilate_px": 4,
@@ -699,7 +751,6 @@ def find_caldera_contour_morphological(
             "center_mode": "depression",
         }
 
-    # Optional override (used by fallback relaxed pass)
     if _override_cfg is not None:
         try:
             cfg = dict(_override_cfg)
@@ -721,7 +772,6 @@ def find_caldera_contour_morphological(
 
     roi_px = int(np.sum(roi))
     if roi_px < max(200, int(cfg["min_component_px"] * 0.5)):
-        # Summit/clip safety: if ROI derived from base is too small, fall back to full valid-data mask.
         roi = valid.copy()
         roi_px = int(np.sum(roi))
         debug["roi_fallback"] = {
@@ -731,7 +781,6 @@ def find_caldera_contour_morphological(
         if roi_px == 0:
             raise ValueError(f"ROI too small (roi_px={roi_px}).")
 
-    # inner ROI (eroded) for overlap scoring
     inner_buffer_px = int(max(0, cfg["inner_buffer_px"]))
     try:
         roi_inner = binary_erosion(roi, iterations=inner_buffer_px) if inner_buffer_px > 0 else roi
@@ -768,14 +817,11 @@ def find_caldera_contour_morphological(
     if ncomp <= 0:
         raise ValueError("No components in rim candidates.")
 
-    # Eligibility by size and area fractions (relative to ROI)
     sizes = [int(np.sum(lbl == cid)) for cid in range(1, ncomp + 1)]
     eligible = []
 
     max_area_px = int(float(cfg["max_area_frac"]) * float(roi_px))
     min_area_px = int(float(cfg.get("min_area_frac", 0.0)) * float(roi_px))
-
-    # Always enforce min_component_px, and (optionally) a minimum area fraction
     hard_min_px = int(max(int(cfg["min_component_px"]), min_area_px))
 
     for cid, sz in zip(range(1, ncomp + 1), sizes):
@@ -785,8 +831,6 @@ def find_caldera_contour_morphological(
             continue
         eligible.append((cid, sz))
     if not eligible:
-        # Second-pass fallback: relax constraints and retry once.
-        # Useful for small summit-focused crops (e.g., Piton/Dolomieu) where the rim may be fragmented.
         if not bool(cfg.get("_relaxed_pass", False)):
             cfg_rel = dict(cfg)
             cfg_rel["_relaxed_pass"] = True
@@ -814,19 +858,10 @@ def find_caldera_contour_morphological(
             )
         raise ValueError("No rim component meets constraints.")
 
-
-    # Barnie-mode heuristic (summit caldera with deep pit craters):
-    # If the only eligible components are very small relative to ROI, the detector is likely picking pit fragments.
-    # In that case, run one additional relaxed pass that:
-    # - lowers slope_q more (includes more of the caldera scarp),
-    # - increases closing (connects fragmented rim),
-    # - increases inner_buffer (reduces pit dominance in overlap),
-    # - penalizes inner overlap (prefers boundary ring instead of pit interior).
     if eligible and not bool(cfg.get("_barnie_pass", False)):
         roi_px_f = float(max(1, roi_px))
         max_elig_px = max(int(sz) for _, sz in eligible)
         max_elig_frac = float(max_elig_px) / roi_px_f
-        # trigger when components are tiny (<~1.5% of ROI) which is typical of pit fragments on summit crops
         if max_elig_frac < float(cfg.get("barnie_trigger_max_elig_frac", 0.015)):
             cfg_rel2 = dict(cfg)
             cfg_rel2["_barnie_pass"] = True
@@ -859,16 +894,8 @@ def find_caldera_contour_morphological(
                 _override_cfg=cfg_rel2,
             )
 
-    # Center-biased selection with inner ROI overlap
     center_mode = str(cfg.get("center_mode", "depression")).strip().lower()
 
-    # Adaptive center selection:
-    # - "depression" is great for simple calderas (Okmok), but fails when deep pits exist inside the caldera (Erta Ale),
-    #   because the minimum can sit on a pit or edge/noise and drag selection to a small component.
-    # Heuristics to auto-switch to centroid:
-    #   1) depression-center falls near raster border (likely edge/noise) OR
-    #   2) eligible components are all small relative to ROI (likely pit/segment) OR
-    #   3) depression-center is far from centroid of roi_inner (pit offset).
     def _near_border(rc, shape, margin=3):
         if rc is None:
             return True
@@ -926,57 +953,49 @@ def find_caldera_contour_morphological(
 
     best = None
     for cid, sz in eligible:
-            m = (lbl == cid)
-            rr, cc = np.nonzero(m)
-            if rr.size == 0:
-                continue
+        m = (lbl == cid)
+        rr, cc = np.nonzero(m)
+        if rr.size == 0:
+            continue
 
-            # distance stats to center
-            rad = np.hypot(rr - center_r, cc - center_c)
-            mean_radius_px = float(np.mean(rad))
-            p90_radius_px = float(np.percentile(rad, 90))
+        rad = np.hypot(rr - center_r, cc - center_c)
+        mean_radius_px = float(np.mean(rad))
+        p90_radius_px = float(np.percentile(rad, 90))
 
-            cent = _centroid_of_mask(m) or (center_r, center_c)
-            dr = float(cent[0] - center_r)
-            dc = float(cent[1] - center_c)
-            d2 = float(dr * dr + dc * dc)
+        cent = _centroid_of_mask(m) or (center_r, center_c)
+        dr = float(cent[0] - center_r)
+        dc = float(cent[1] - center_c)
+        d2 = float(dr * dr + dc * dc)
 
-            # inner overlap (prefer components that actually occupy inner ROI)
-            try:
-                inner_overlap = float(np.sum(m & roi_inner)) / float(np.sum(m) + 1e-9)
-            except Exception:
-                inner_overlap = 0.0
+        try:
+            inner_overlap = float(np.sum(m & roi_inner)) / float(np.sum(m) + 1e-9)
+        except Exception:
+            inner_overlap = 0.0
 
-            # key: smaller mean radius is better.
-            # Default behavior rewards inner overlap (works well for simple calderas).
-            # For pit-dominated summit systems (e.g., Erta Ale), we may instead penalize inner overlap
-            # to avoid selecting pit-slope fragments.
-            overlap_mode = str(cfg.get("overlap_mode", "reward_inner")).strip().lower()
-            w = float(cfg["center_bias_weight"])
-            overlap_term = (-w * inner_overlap) if overlap_mode in ("reward_inner", "inner", "reward") else (+w * inner_overlap)
-            key = (
-                mean_radius_px + overlap_term,
-                p90_radius_px,
-                d2,
-                -sz
-            )
+        overlap_mode = str(cfg.get("overlap_mode", "reward_inner")).strip().lower()
+        w = float(cfg["center_bias_weight"])
+        overlap_term = (-w * inner_overlap) if overlap_mode in ("reward_inner", "inner", "reward") else (+w * inner_overlap)
+        key = (
+            mean_radius_px + overlap_term,
+            p90_radius_px,
+            d2,
+            -sz
+        )
 
-            if best is None or key < best[0]:
-                best = (key, cid, sz, cent, inner_overlap, mean_radius_px, p90_radius_px)
+        if best is None or key < best[0]:
+            best = (key, cid, sz, cent, inner_overlap, mean_radius_px, p90_radius_px)
 
     if best is None:
-            selected_cid, selected_sz = max(eligible, key=lambda t: t[1])
+        selected_cid, selected_sz = max(eligible, key=lambda t: t[1])
     else:
-            selected_cid = int(best[1])
-            selected_sz = int(best[2])
-            center_used["selected_component_centroid"] = {"row": float(best[3][0]), "col": float(best[3][1])}
-            center_used["selected_component_inner_overlap"] = float(best[4])
-            center_used["selected_component_mean_radius_px"] = float(best[5])
-            center_used["selected_component_p90_radius_px"] = float(best[6])
+        selected_cid = int(best[1])
+        selected_sz = int(best[2])
+        center_used["selected_component_centroid"] = {"row": float(best[3][0]), "col": float(best[3][1])}
+        center_used["selected_component_inner_overlap"] = float(best[4])
+        center_used["selected_component_mean_radius_px"] = float(best[5])
+        center_used["selected_component_p90_radius_px"] = float(best[6])
 
     best_mask = (lbl == selected_cid)
-    # Post-process selected rim mask to reduce small gaps and spurs.
-    # This helps cases where the rim has minor discontinuities in the slope-based candidates.
     post_close = int(max(0, cfg.get("post_close_iterations", 0)))
     post_fill = bool(cfg.get("post_fill_holes", True))
     if post_close > 0:
@@ -989,7 +1008,6 @@ def find_caldera_contour_morphological(
             best_mask = binary_fill_holes(best_mask)
         except Exception:
             pass
-    # Keep the largest connected component after post-processing
     try:
         lbl2, n2 = label(best_mask)
         if n2 > 1:
@@ -998,6 +1016,7 @@ def find_caldera_contour_morphological(
             best_mask = (lbl2 == keep)
     except Exception:
         pass
+
     contours = measure.find_contours(best_mask.astype(np.uint8), 0.5)
     if not contours:
         raise ValueError("Rim contour extraction failed.")
@@ -1014,7 +1033,10 @@ def find_caldera_contour_morphological(
         "eligible_component_sizes_px": [int(sz) for (_, sz) in eligible],
         "selected_component_id": int(selected_cid),
         "selected_component_px": int(selected_sz),
-        "post_process": {"post_close_iterations": int(max(0, cfg.get("post_close_iterations", 0))), "post_fill_holes": bool(cfg.get("post_fill_holes", True))},
+        "post_process": {
+            "post_close_iterations": int(max(0, cfg.get("post_close_iterations", 0))),
+            "post_fill_holes": bool(cfg.get("post_fill_holes", True))
+        },
         "center": center_used,
         "threshold": float(thr),
         "contour_len": int(len(caldera_contour)),
@@ -1055,7 +1077,6 @@ def caldera_volume_depth_integrated(
     rim_method = "percentile_on_outside_ring"
 
     if rim_vals.size == 0:
-        # fallback: percentile on contour samples
         c = np.round(np.asarray(caldera_contour)).astype(int)
         ok = (c[:, 0] >= 0) & (c[:, 0] < demf.shape[0]) & (c[:, 1] >= 0) & (c[:, 1] < demf.shape[1])
         c = c[ok]
@@ -1282,25 +1303,38 @@ def _as_serializable(v):
 
 
 # -------------------- main compute --------------------
-def run_unified(dem: np.ndarray, transform, meta: Dict[str, Any], base_profile: str) -> Dict[str, Any]:
+def run_unified(
+    dem: np.ndarray,
+    transform,
+    meta: Dict[str, Any],
+    base_profile: str,
+    caldera_contour_override: Optional[np.ndarray] = None,
+    rim_source: str = "auto",
+) -> Dict[str, Any]:
     nodata = meta.get("nodata", None)
 
     base_contour, base_dbg = select_base_contour(dem, transform, nodata=nodata, base_profile=base_profile)
     slope = calculate_slope(dem)
 
-    caldera_contour, cal_dbg = find_caldera_contour_morphological(
-        dem=dem,
-        base_contour=base_contour,
-        transform=transform,
-        nodata=nodata,
-        preset=base_profile,
-    )
+    if caldera_contour_override is not None:
+        caldera_contour = np.asarray(caldera_contour_override, dtype=float)
+        cal_dbg = {
+            "method": "geojson_override",
+            "source": rim_source,
+            "contour_len": int(len(caldera_contour)),
+        }
+    else:
+        caldera_contour, cal_dbg = find_caldera_contour_morphological(
+            dem=dem,
+            base_contour=base_contour,
+            transform=transform,
+            nodata=nodata,
+            preset=base_profile,
+        )
 
-    # Visualization points
     base_p1, base_p2 = find_opposite_points(base_contour)
     cal_p1, cal_p2 = find_opposite_slope_points(slope, caldera_contour)
 
-    # Morphometrics
     A_base_m2 = calculate_area(base_contour, transform)
     A_caldera_m2 = calculate_area(caldera_contour, transform)
     P_base_m = contour_perimeter_m(base_contour, transform)
@@ -1309,17 +1343,14 @@ def run_unified(dem: np.ndarray, transform, meta: Dict[str, Any], base_profile: 
     D_base_m = distance_between_points(base_p1[0], base_p1[1], base_p2[0], base_p2[1], transform)
     D_caldera_m = distance_between_points(cal_p1[0], cal_p1[1], cal_p2[0], cal_p2[1], transform)
 
-    # Height
     height_model = height_p99_minus_p05_inside_base(dem, base_contour, nodata=nodata)
     h_max_m = float(height_model.get("h_max_m", 0.0))
 
-    # Edifice volume (prismoid)
     if A_base_m2 > 0 and A_caldera_m2 > 0 and h_max_m > 0:
         V_total_m3 = float((h_max_m / 3.0) * (A_base_m2 + A_caldera_m2 + math.sqrt(A_base_m2 * A_caldera_m2)))
     else:
         V_total_m3 = 0.0
 
-    # Caldera volume (depth-integrated)
     caldera_depth = caldera_volume_depth_integrated(
         dem=dem,
         caldera_contour=caldera_contour,
@@ -1334,7 +1365,6 @@ def run_unified(dem: np.ndarray, transform, meta: Dict[str, Any], base_profile: 
     depth_raw = float(caldera_depth.get("depth_ref_m", 0.0))
     V_caldera_m3 = float(caldera_depth.get("V_caldera_m3", 0.0))
 
-    # Fallback percentiles if depth is non-positive
     fallback_used = False
     if depth_raw <= 0.0:
         caldera_depth_fb = caldera_volume_depth_integrated(
@@ -1404,19 +1434,15 @@ def main() -> int:
         print(f"[ERROR] DEM not found. Expected dem_working.tif in {proc_dir} or valid CLI DEM.")
         return 1
 
-    # Ensure metric CRS (extra safety)
     dem_path = ensure_metric_dem(dem_path, proc_dir)
 
-    # Read DEM
     with rasterio.open(dem_path) as src:
         dem = src.read(1)
-        _log("DEM read OK")
-        _log(f"DEM shape={dem.shape} crs={src.crs}")
         transform = src.transform
         crs = src.crs
         res = src.res
         nodata = src.nodata
-        bounds = src.bounds
+        bounds_tuple = (src.bounds.left, src.bounds.bottom, src.bounds.right, src.bounds.top)
 
     meta = {
         "process_id": process_id,
@@ -1425,36 +1451,68 @@ def main() -> int:
         "crs": str(crs) if crs is not None else None,
         "res": list(res) if res is not None else None,
         "nodata": nodata,
+        "bounds": list(bounds_tuple),
         "original_file_name": os.environ.get("ORIGINAL_FILE_NAME") or str(Path(cli_dem).name),
         "original_file_stem": os.environ.get("ORIGINAL_FILE_STEM") or (cli_stem or Path(cli_dem).stem),
     }
 
-    # Compute
-    _log("run_unified START")
-    out = run_unified(dem, transform, meta, base_profile=base_profile)
-    _log("run_unified DONE")
+    rim_source: str = "auto"
+    rim_file: str = "caldera_rim_auto.geojson"
+    caldera_contour_override: Optional[np.ndarray] = None
 
-    auto_rim_name = "caldera_rim_auto.geojson"
-    auto_rim_path = proc_dir / auto_rim_name
-    _log("write_auto_rim_geojson START")
-    write_auto_rim_geojson(
-        caldera_contour=out["caldera_contour"],
-        transform=transform,
-        src_crs=crs,
-        out_path=auto_rim_path,
+    use_edited_rim = str(os.environ.get("USE_EDITED_RIM", "")).strip().lower() in ("1", "true", "yes", "on")
+    rim_path_env = (os.environ.get("RIM_PATH") or "").strip()
+
+    if use_edited_rim and rim_path_env:
+        rim_candidate = Path(rim_path_env)
+        if rim_candidate.exists():
+            _log(f"edited rim override requested: {rim_candidate}")
+            caldera_contour_override = load_edited_rim_contour_from_geojson(
+                rim_path=rim_candidate,
+                transform=transform,
+                dst_crs=crs,
+                dem_shape=dem.shape,
+            )
+            rim_source = "edited"
+            rim_file = rim_candidate.name
+            _log(f"edited rim override loaded: vertices={int(caldera_contour_override.shape[0])}")
+        else:
+            _log(f"edited rim override requested but file is missing: {rim_candidate}")
+
+    out = run_unified(
+        dem,
+        transform,
+        meta,
+        base_profile=base_profile,
+        caldera_contour_override=caldera_contour_override,
+        rim_source=rim_source,
     )
-    _log("write_auto_rim_geojson DONE")
 
-    dem_preview_png_name = "dem_preview.png"
-    dem_preview_json_name = "dem_preview.json"
-    dem_preview_png_path = proc_dir / dem_preview_png_name
-    dem_preview_json_path = proc_dir / dem_preview_json_name
+    auto_rim_path = proc_dir / "caldera_rim_auto.geojson"
+    if rim_source == "auto":
+        _log("write_auto_rim_geojson START")
+        write_auto_rim_geojson(
+            caldera_contour=out["caldera_contour"],
+            transform=transform,
+            src_crs=crs,
+            out_path=auto_rim_path,
+        )
+        _log("write_auto_rim_geojson DONE")
+    else:
+        _log("skip write_auto_rim_geojson because edited rim is active")
+
+    dem_preview_png = proc_dir / "dem_preview.png"
+    dem_preview_json = proc_dir / "dem_preview.json"
     _log("write_dem_preview START")
-    write_dem_preview_png(dem=dem, nodata=nodata, out_path=dem_preview_png_path)
-    write_dem_preview_json(bounds=bounds, src_crs=crs, out_path=dem_preview_json_path)
+    write_dem_preview(
+        dem=dem,
+        bounds_tuple=bounds_tuple,
+        src_crs=crs,
+        out_png=dem_preview_png,
+        out_json=dem_preview_json,
+    )
     _log("write_dem_preview DONE")
 
-    # Save final doublet
     doublet_name = "final_doublet_base_vs_caldera.png"
     doublet_path = proc_dir / doublet_name
     save_final_doublet_png(
@@ -1468,7 +1526,6 @@ def main() -> int:
         out_path=doublet_path,
     )
 
-    # Build metrics dict (canonical)
     metrics = {
         "meta": {
             "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -1476,6 +1533,8 @@ def main() -> int:
             "moduleKey": module_key,
             "baseProfile": base_profile,
             "model": "unified_area_prismoid_plus_caldera_depth_integrated",
+            "rim_source": rim_source,
+            "rim_file": rim_file,
 
             "original_file_name": meta.get("original_file_name"),
             "original_file_stem": meta.get("original_file_stem"),
@@ -1527,7 +1586,6 @@ def main() -> int:
         }
     }
 
-    # Write metrics.json/csv
     metrics_json_path = proc_dir / "metrics.json"
     metrics_csv_path = proc_dir / "metrics.csv"
 
@@ -1540,7 +1598,6 @@ def main() -> int:
         for section, label_txt, value, unit in rows:
             w.writerow([section, label_txt, value, unit])
 
-    # Build volume_results.json (UI-ready)
     res0 = meta.get("res")
     pixel_size_m = None
     try:
@@ -1549,7 +1606,6 @@ def main() -> int:
     except Exception:
         pixel_size_m = None
 
-    # Convert to km units for UI
     mm = out["morphometrics"]
     vv = out["volumes"]
 
@@ -1579,6 +1635,8 @@ def main() -> int:
         "baseProfile": base_profile,
         "volumeType": "unified",
         "approximationType": "unified",
+        "rim_source": rim_source,
+        "rim_file": rim_file,
         "summaryText": summary,
         "result": {
             "base_area_km2": base_area_km2,
@@ -1591,35 +1649,38 @@ def main() -> int:
             "h_max_m": float(out.get("height_model", {}).get("h_max_m", 0.0)),
             "pixel_size_m": pixel_size_m,
         },
-        "images": ["final_doublet_base_vs_caldera.png", "dem_preview.png"],
+        "images": ["final_doublet_base_vs_caldera.png"],
         "links": {
             "metrics_json": _public_path(process_id, "metrics.json"),
             "metrics_csv": _public_path(process_id, "metrics.csv"),
             "final_doublet": _public_path(process_id, "final_doublet_base_vs_caldera.png"),
-            "dem_preview": _public_path(process_id, "dem_preview.png"),
-            "dem_preview_meta": _public_path(process_id, "dem_preview.json"),
             "caldera_rim_auto": _public_path(process_id, "caldera_rim_auto.geojson"),
+            "dem_preview_png": _public_path(process_id, "dem_preview.png"),
+            "dem_preview_json": _public_path(process_id, "dem_preview.json"),
         }
     }
 
     vr_path = proc_dir / "volume_results.json"
     vr_path.write_text(json.dumps(vr, indent=2, ensure_ascii=False), encoding="utf-8")
+
     print(f"[INFO] Wrote: {vr_path}")
     print(f"[INFO] Wrote: {metrics_json_path}")
     print(f"[INFO] Wrote: {metrics_csv_path}")
     print(f"[INFO] Wrote: {doublet_path}")
-    print(f"[INFO] Wrote: {auto_rim_path}")
-    print(f"[INFO] Wrote: {dem_preview_png_path}")
-    print(f"[INFO] Wrote: {dem_preview_json_path}")
+    if auto_rim_path.exists():
+        print(f"[INFO] Wrote: {auto_rim_path}")
+    print(f"[INFO] Wrote: {dem_preview_png}")
+    print(f"[INFO] Wrote: {dem_preview_json}")
 
-    # Print compact JSON for Node logs / optional parsing
     try:
         print(json.dumps({
             "processId": process_id,
             "status": "completed",
             "moduleKey": module_key,
             "baseProfile": base_profile,
-            "images": ["final_doublet_base_vs_caldera.png", "dem_preview.png"],
+            "rim_source": rim_source,
+            "rim_file": rim_file,
+            "images": ["final_doublet_base_vs_caldera.png"],
         }, ensure_ascii=False), flush=True)
     except Exception:
         pass
