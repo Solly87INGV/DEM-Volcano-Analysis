@@ -698,6 +698,46 @@ app.post('/api/rim/:processId', (req, res) => {
   }
 });
 
+app.delete('/api/rim/:processId', (req, res) => {
+  const { processId } = req.params;
+
+  if (!processId || !isSafeProcessId(processId)) {
+    return res.status(400).json({ error: 'Invalid processId' });
+  }
+
+  const procDir = getProcessDir(processId);
+  const editedPath = getEditedRimPath(processId);
+  const autoPath = getAutoRimPath(processId);
+
+  try {
+    if (fs.existsSync(editedPath)) {
+      fs.unlinkSync(editedPath);
+    }
+
+    if (!fs.existsSync(autoPath)) {
+      return res.status(404).json({
+        error: 'Auto rim not found for this processId',
+        processId,
+        expectedFile: 'caldera_rim_auto.geojson',
+      });
+    }
+
+    return res.json({
+      ok: true,
+      processId,
+      rim_source: 'auto',
+      rim_file: 'caldera_rim_auto.geojson',
+      reset: true,
+      deletedEdited: true,
+    });
+  } catch (e) {
+    return res.status(500).json({
+      error: 'Failed to reset rim to auto',
+      processId,
+      detail: String(e.message || e),
+    });
+  }
+});
 // ---------------------------
 // PDF Report endpoint
 // GET /api/report/:processId?moduleKey=...

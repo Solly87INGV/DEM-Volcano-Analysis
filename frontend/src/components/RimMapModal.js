@@ -229,6 +229,7 @@ function extractFeatureFromFeatureGroup(featureGroup) {
 export default function RimMapModal({ open, onClose, processId }) {
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [error, setError] = useState('');
   const [previewMeta, setPreviewMeta] = useState(null);
   const [rimPayload, setRimPayload] = useState(null);
@@ -324,6 +325,28 @@ export default function RimMapModal({ open, onClose, processId }) {
     }
   };
 
+  const handleResetToAuto = async () => {
+    try {
+      setResetting(true);
+      setError('');
+
+      await axios.delete(`/api/rim/${processId}`);
+
+      await loadData();
+      setIsEditing(false);
+      setDirty(false);
+    } catch (e) {
+      console.error('Reset rim failed:', e);
+      setError(
+        e?.response?.data?.error ||
+          e?.message ||
+          'Failed to reset rim to auto.'
+      );
+    } finally {
+      setResetting(false);
+    }
+  };
+
   const handleReloadActive = async () => {
     setIsEditing(false);
     setDirty(false);
@@ -340,6 +363,9 @@ export default function RimMapModal({ open, onClose, processId }) {
     setDirty(false);
     loadData();
   };
+
+  const isBusy = loading || saving || resetting;
+  const isEditedSource = rimPayload?.rim_source === 'edited';
 
   return (
     <Dialog
@@ -371,33 +397,51 @@ export default function RimMapModal({ open, onClose, processId }) {
             {rimPayload?.rim_source ? <> — source: <b>{rimPayload.rim_source}</b></> : null}
             {isEditing ? <> — <b>editing</b></> : null}
           </Typography>
-          {isEditing ? (
-            <Typography variant="caption" sx={{ display: 'block', mt: 0.5, opacity: 0.75 }}>
-              Move vertices by dragging. Add vertices from the line handles. Remove a vertex with right click on a vertex marker.
-            </Typography>
-          ) : null}
         </Box>
 
         <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', flexWrap: 'wrap' }}>
           {!isEditing ? (
-            <Button variant="outlined" onClick={handleStartEditing} disabled={loading || saving || !rimGeojson}>
-              Edit rim
-            </Button>
+            <>
+              <Button
+                variant="outlined"
+                onClick={handleStartEditing}
+                disabled={isBusy || !rimGeojson}
+              >
+                Edit rim
+              </Button>
+
+              <Button
+                variant="outlined"
+                color="warning"
+                onClick={handleResetToAuto}
+                disabled={isBusy || !isEditedSource}
+              >
+                {resetting ? 'Resetting...' : 'Reset to auto'}
+              </Button>
+            </>
           ) : (
             <>
-              <Button variant="outlined" onClick={handleStopEditing} disabled={saving}>
+              <Button variant="outlined" onClick={handleStopEditing} disabled={saving || resetting}>
                 Cancel
               </Button>
-              <Button variant="outlined" onClick={handleReloadActive} disabled={saving}>
+              <Button variant="outlined" onClick={handleReloadActive} disabled={saving || resetting}>
                 Reload
               </Button>
-              <Button variant="contained" onClick={handleSave} disabled={saving || !dirty}>
+              <Button
+                variant="outlined"
+                color="warning"
+                onClick={handleResetToAuto}
+                disabled={saving || resetting || !isEditedSource}
+              >
+                {resetting ? 'Resetting...' : 'Reset to auto'}
+              </Button>
+              <Button variant="contained" onClick={handleSave} disabled={saving || resetting || !dirty}>
                 {saving ? 'Saving...' : 'Save rim'}
               </Button>
             </>
           )}
 
-          <IconButton onClick={onClose}>
+          <IconButton onClick={onClose} disabled={isBusy}>
             <CloseIcon />
           </IconButton>
         </Box>
@@ -424,27 +468,56 @@ export default function RimMapModal({ open, onClose, processId }) {
             <Alert severity="error">{error}</Alert>
           </Box>
         ) : previewBounds && previewUrl && rimGeojson ? (
-          <Box sx={{ height: '100%', minHeight: 500 }}>
-            <MapContainer
-              center={[0, 0]}
-              zoom={2}
-              style={{ height: '100%', width: '100%', background: '#111' }}
-              zoomControl={true}
-              attributionControl={false}
-            >
-              <ImageOverlay url={previewUrl} bounds={previewBounds} opacity={1.0} />
+          <Box sx={{ height: '100%', minHeight: 500, display: 'flex', flexDirection: 'column' }}>
+            {isEditing ? (
+              <Box sx={{ p: 1.5, pb: 0 }}>
+                <Alert severity="info" sx={{ alignItems: 'flex-start' }}>
+                  <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
+                    Editing tips
+                  </Typography>
+                  <Box component="ul" sx={{ m: 0, pl: 2.5 }}>
+                    <li>
+                      <Typography variant="body2">
+                        Drag a vertex to move it.
+                      </Typography>
+                    </li>
+                    <li>
+                      <Typography variant="body2">
+                        Click on an edge handle to add a new vertex.
+                      </Typography>
+                    </li>
+                    <li>
+                      <Typography variant="body2">
+                        Right-click a vertex marker to delete that vertex.
+                      </Typography>
+                    </li>
+                  </Box>
+                </Alert>
+              </Box>
+            ) : null}
 
-              <FeatureGroup ref={featureGroupRef} />
+            <Box sx={{ flex: 1, minHeight: 500 }}>
+              <MapContainer
+                center={[0, 0]}
+                zoom={2}
+                style={{ height: '100%', width: '100%', background: '#111' }}
+                zoomControl={true}
+                attributionControl={false}
+              >
+                <ImageOverlay url={previewUrl} bounds={previewBounds} opacity={1.0} />
 
-              <EditableRimLayer
-                geojson={rimGeojson}
-                featureGroupRef={featureGroupRef}
-                editing={isEditing}
-                onDirty={handleDirty}
-              />
+                <FeatureGroup ref={featureGroupRef} />
 
-              <FitToData previewBounds={previewBounds} geojson={rimGeojson} />
-            </MapContainer>
+                <EditableRimLayer
+                  geojson={rimGeojson}
+                  featureGroupRef={featureGroupRef}
+                  editing={isEditing}
+                  onDirty={handleDirty}
+                />
+
+                <FitToData previewBounds={previewBounds} geojson={rimGeojson} />
+              </MapContainer>
+            </Box>
           </Box>
         ) : (
           <Box sx={{ p: 2 }}>

@@ -412,57 +412,79 @@ export default function VolumeResultsViewer({ volumeRun, processId: processIdPro
         </Typography>
       </Box>
 
-      <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 1, flexWrap: 'wrap', mb: 2, alignItems: 'center' }}>
-        <Button variant="outlined" onClick={onBack}>Back</Button>
-        {onBackToUpload ? <Button variant="outlined" onClick={onBackToUpload}>Back to Upload</Button> : null}
+      <Box
+        sx={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'flex-start',
+          gap: 1.5,
+          flexWrap: 'wrap',
+          mb: 2,
+        }}
+      >
+        <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'center' }}>
+          <Button variant="outlined" onClick={onBack}>
+            Back
+          </Button>
 
-        <Button
-          variant="outlined"
-          onClick={() => handleDownloadMetrics('json')}
-          disabled={!canDownloadPdf || loading || isRecalculating}
-          title={canDownloadPdf ? 'Download metrics JSON' : 'Available when status=completed and moduleKey is present'}
-        >
-          Download JSON
-        </Button>
+          {onBackToUpload ? (
+            <Button variant="outlined" onClick={onBackToUpload}>
+              Back to Upload
+            </Button>
+          ) : null}
+        </Box>
 
-        <Button
-          variant="outlined"
-          onClick={() => handleDownloadMetrics('csv')}
-          disabled={!canDownloadPdf || loading || isRecalculating}
-          title={canDownloadPdf ? 'Download metrics CSV' : 'Available when status=completed and moduleKey is present'}
-        >
-          Download CSV
-        </Button>
+        <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'center' }}>
+          <Button
+            variant="outlined"
+            onClick={() => handleDownloadMetrics('json')}
+            disabled={!canDownloadPdf || loading || isRecalculating}
+            title={canDownloadPdf ? 'Download metrics JSON' : 'Available when status=completed and moduleKey is present'}
+          >
+            Download JSON
+          </Button>
 
-        <Button
-          variant="outlined"
-          onClick={() => setMapOpen(true)}
-          disabled={!canOpenMap || loading || isRecalculating}
-          title={canOpenMap ? 'Open read-only rim map' : 'Available when status=completed'}
-        >
-          Open map
-        </Button>
+          <Button
+            variant="outlined"
+            onClick={() => handleDownloadMetrics('csv')}
+            disabled={!canDownloadPdf || loading || isRecalculating}
+            title={canDownloadPdf ? 'Download metrics CSV' : 'Available when status=completed and moduleKey is present'}
+          >
+            Download CSV
+          </Button>
 
-        <Button
-          variant="outlined"
-          onClick={handleRecalculate}
-          disabled={!canRecalculate || loading || isRecalculating}
-          title="Re-run volume calculation on the current processId and dem_working.tif"
-        >
-          {isRecalculating ? 'Recalculating...' : 'Recalculate'}
-        </Button>
+          <Button
+            variant="outlined"
+            onClick={handleDownloadPdf}
+            disabled={!canDownloadPdf || loading || isRecalculating}
+            title={canDownloadPdf ? 'Download PDF report' : 'Available when status=completed and moduleKey is present'}
+          >
+            Download PDF
+          </Button>
+        </Box>
 
-        <Button
-          variant="contained"
-          onClick={handleDownloadPdf}
-          disabled={!canDownloadPdf || loading || isRecalculating}
-          title={canDownloadPdf ? 'Download PDF report' : 'Available when status=completed and moduleKey is present'}
-        >
-          Download PDF
-        </Button>
+        <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'center' }}>
+          <Button
+            variant="outlined"
+            onClick={() => setMapOpen(true)}
+            disabled={!canOpenMap || loading || isRecalculating}
+            title={canOpenMap ? 'Open and edit rim' : 'Available when status=completed'}
+          >
+            Open and Edit Rim
+          </Button>
 
-        <Box sx={{ width: 28, height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          {loading || isRecalculating ? <CircularProgress size={20} /> : null}
+          <Button
+            variant="contained"
+            onClick={handleRecalculate}
+            disabled={!canRecalculate || loading || isRecalculating}
+            title="Re-run volume calculation on the current processId and dem_working.tif"
+          >
+            {isRecalculating ? 'Recalculating...' : 'Recalculate'}
+          </Button>
+
+          <Box sx={{ width: 28, height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            {loading || isRecalculating ? <CircularProgress size={20} /> : null}
+          </Box>
         </Box>
       </Box>
 
