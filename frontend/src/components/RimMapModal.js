@@ -65,11 +65,97 @@ function flattenPolygonLayers(rootLayer) {
   return out;
 }
 
+function extractFeatureFromFeatureGroup(featureGroup) {
+  if (!featureGroup) return null;
+
+  const layers = [];
+  featureGroup.eachLayer((layer) => {
+    layers.push(...flattenPolygonLayers(layer));
+  });
+
+  if (!layers.length) return null;
+
+  const gj = layers[0].toGeoJSON();
+  if (!gj || gj.type !== 'Feature') return null;
+  if (gj?.geometry?.type !== 'Polygon') return null;
+
+  return gj;
+}
+
+function deleteVerticesFromFeatureByBounds(feature, bounds) {
+  if (!feature || feature?.geometry?.type !== 'Polygon') {
+    return { feature, removedCount: 0, changed: false, error: 'Invalid polygon feature.' };
+  }
+
+  const coords = feature.geometry.coordinates;
+  if (!Array.isArray(coords) || !coords.length || !Array.isArray(coords[0])) {
+    return { feature, removedCount: 0, changed: false, error: 'Invalid polygon coordinates.' };
+  }
+
+  const outerRing = coords[0];
+  if (outerRing.length < 4) {
+    return { feature, removedCount: 0, changed: false, error: 'Polygon ring too short.' };
+  }
+
+  const ringOpen = outerRing.slice(0, -1); // remove closing coordinate
+  const kept = [];
+  let removedCount = 0;
+
+  for (const pt of ringOpen) {
+    const lng = Number(pt[0]);
+    const lat = Number(pt[1]);
+
+    if (!Number.isFinite(lng) || !Number.isFinite(lat)) {
+      kept.push(pt);
+      continue;
+    }
+
+    const inside = bounds.contains(L.latLng(lat, lng));
+    if (inside) {
+      removedCount += 1;
+    } else {
+      kept.push([lng, lat]);
+    }
+  }
+
+  if (removedCount === 0) {
+    return { feature, removedCount: 0, changed: false, error: null };
+  }
+
+  if (kept.length < 3) {
+    return {
+      feature,
+      removedCount: 0,
+      changed: false,
+      error: 'Selection would remove too many vertices and invalidate the polygon.',
+    };
+  }
+
+  const rebuiltRing = [...kept, kept[0]];
+  const newFeature = {
+    ...feature,
+    geometry: {
+      ...feature.geometry,
+      coordinates: [rebuiltRing],
+    },
+  };
+
+  return {
+    feature: newFeature,
+    removedCount,
+    changed: true,
+    error: null,
+  };
+}
+
 function EditableRimLayer({
   geojson,
   featureGroupRef,
   editing,
+  deleteBoxMode,
   onDirty,
+  onDeleteBoxDone,
+  onReplaceGeojson,
 }) {
   const map = useMap();
   const workingLayersRef = useRef([]);
@@ -206,24 +292,105 @@ function EditableRimLayer({
     };
   }, [map, featureGroupRef, editing, onDirty]);
 
+  useEffect(() => {
+    if (!map || !editing || !deleteBoxMode) return;
+
+    const handleCreate = (e) => {
+      try {
+        if (e.shape !== 'Rectangle' || !e.layer) return;
+
+        const bounds = e.layer.getBounds();
+        try {
+          map.removeLayer(e.layer);
+        } catch (err) {
+          // ignore
+        }
+
+        const fg = featureGroupRef.current;
+        const currentFeature = extractFeatureFromFeatureGroup(fg);
+
+        if (!currentFeature) {
+          if (onDeleteBoxDone) {
+            onDeleteBoxDone({
+              ok: false,
+              removedCount: 0,
+              message: 'No editable rim geometry is currently loaded.',
+            });
+          }
+          return;
+        }
+
+        const result = deleteVerticesFromFeatureByBounds(currentFeature, bounds);
+
+        if (!result.changed) {
+          if (onDeleteBoxDone) {
+            onDeleteBoxDone({
+              ok: false,
+              removedCount: 0,
+              message: result.error || 'No vertices were found inside the selected box.',
+            });
+          }
+          return;
+        }
+
+        if (onReplaceGeojson) onReplaceGeojson(result.feature);
+        if (onDirty) onDirty();
+
+        if (onDeleteBoxDone) {
+          onDeleteBoxDone({
+            ok: true,
+            removedCount: result.removedCount,
+            message:
+              result.removedCount === 1
+                ? '1 vertex deleted from the selected box.'
+                : `${result.removedCount} vertices deleted from the selected box.`,
+          });
+        }
+      } catch (err) {
+        console.error('Delete vertices by box failed:', err);
+        if (onDeleteBoxDone) {
+          onDeleteBoxDone({
+            ok: false,
+            removedCount: 0,
+            message: err?.message || 'Failed to delete vertices by box.',
+          });
+        }
+      }
+    };
+
+    map.on('pm:create', handleCreate);
+
+    try {
+      map.pm.enableDraw('Rectangle', {
+        snappable: false,
+        continueDrawing: false,
+        pathOptions: {
+          color: '#d97706',
+          weight: 2,
+        },
+      });
+    } catch (e) {
+      console.error('Enable rectangle draw failed:', e);
+      if (onDeleteBoxDone) {
+        onDeleteBoxDone({
+          ok: false,
+          removedCount: 0,
+          message: 'Unable to start rectangle selection mode.',
+        });
+      }
+    }
+
+    return () => {
+      map.off('pm:create', handleCreate);
+      try {
+        map.pm.disableDraw('Rectangle');
+      } catch (e) {
+        // ignore
+      }
+    };
+  }, [map, editing, deleteBoxMode, featureGroupRef, onDirty, onDeleteBoxDone, onReplaceGeojson]);
+
   return null;
-}
-
-function extractFeatureFromFeatureGroup(featureGroup) {
-  if (!featureGroup) return null;
-
-  const layers = [];
-  featureGroup.eachLayer((layer) => {
-    layers.push(...flattenPolygonLayers(layer));
-  });
-
-  if (!layers.length) return null;
-
-  const gj = layers[0].toGeoJSON();
-  if (!gj || gj.type !== 'Feature') return null;
-  if (gj?.geometry?.type !== 'Polygon') return null;
-
-  return gj;
 }
 
 export default function RimMapModal({ open, onClose, processId }) {
@@ -233,8 +400,11 @@ export default function RimMapModal({ open, onClose, processId }) {
   const [error, setError] = useState('');
   const [previewMeta, setPreviewMeta] = useState(null);
   const [rimPayload, setRimPayload] = useState(null);
+  const [workingGeojson, setWorkingGeojson] = useState(null);
   const [isEditing, setIsEditing] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const [deleteBoxMode, setDeleteBoxMode] = useState(false);
+  const [infoMessage, setInfoMessage] = useState('');
 
   const featureGroupRef = useRef(null);
 
@@ -244,9 +414,12 @@ export default function RimMapModal({ open, onClose, processId }) {
     try {
       setLoading(true);
       setError('');
+      setInfoMessage('');
       setPreviewMeta(null);
       setRimPayload(null);
+      setWorkingGeojson(null);
       setDirty(false);
+      setDeleteBoxMode(false);
 
       const [previewResp, rimResp] = await Promise.all([
         axios.get(`/outputs/${processId}/dem_preview.json`, {
@@ -257,8 +430,10 @@ export default function RimMapModal({ open, onClose, processId }) {
         }),
       ]);
 
+      const rimData = rimResp.data || null;
       setPreviewMeta(previewResp.data || null);
-      setRimPayload(rimResp.data || null);
+      setRimPayload(rimData);
+      setWorkingGeojson(rimData?.geojson || null);
     } catch (e) {
       console.error('RimMapModal load error:', e);
       setError(
@@ -282,7 +457,7 @@ export default function RimMapModal({ open, onClose, processId }) {
     return b;
   }, [previewMeta]);
 
-  const rimGeojson = useMemo(() => rimPayload?.geojson || null, [rimPayload]);
+  const rimGeojson = useMemo(() => workingGeojson || rimPayload?.geojson || null, [workingGeojson, rimPayload]);
 
   const previewUrl = useMemo(() => {
     if (!processId) return null;
@@ -305,6 +480,8 @@ export default function RimMapModal({ open, onClose, processId }) {
 
       setSaving(true);
       setError('');
+      setInfoMessage('');
+      setDeleteBoxMode(false);
 
       await axios.post(`/api/rim/${processId}`, feature, {
         headers: { 'Content-Type': 'application/json' },
@@ -313,6 +490,7 @@ export default function RimMapModal({ open, onClose, processId }) {
       await loadData();
       setIsEditing(false);
       setDirty(false);
+      setInfoMessage('Edited rim saved successfully.');
     } catch (e) {
       console.error('Save rim failed:', e);
       setError(
@@ -329,12 +507,15 @@ export default function RimMapModal({ open, onClose, processId }) {
     try {
       setResetting(true);
       setError('');
+      setInfoMessage('');
+      setDeleteBoxMode(false);
 
       await axios.delete(`/api/rim/${processId}`);
 
       await loadData();
       setIsEditing(false);
       setDirty(false);
+      setInfoMessage('Edited rim removed. Auto rim restored.');
     } catch (e) {
       console.error('Reset rim failed:', e);
       setError(
@@ -350,19 +531,45 @@ export default function RimMapModal({ open, onClose, processId }) {
   const handleReloadActive = async () => {
     setIsEditing(false);
     setDirty(false);
+    setDeleteBoxMode(false);
+    setInfoMessage('');
     await loadData();
   };
 
   const handleStartEditing = () => {
     setIsEditing(true);
     setDirty(false);
+    setDeleteBoxMode(false);
+    setInfoMessage('');
   };
 
   const handleStopEditing = () => {
     setIsEditing(false);
     setDirty(false);
+    setDeleteBoxMode(false);
+    setInfoMessage('');
     loadData();
   };
+
+  const handleStartDeleteByBox = () => {
+    setDeleteBoxMode(true);
+    setInfoMessage('Draw a rectangle on the map to delete all vertices inside it.');
+    setError('');
+  };
+
+  const handleDeleteBoxDone = useCallback(({ ok, message }) => {
+    setDeleteBoxMode(false);
+    if (ok) {
+      setInfoMessage(message || 'Vertices deleted.');
+      setError('');
+    } else {
+      setError(message || 'No vertices were deleted.');
+    }
+  }, []);
+
+  const handleReplaceGeojson = useCallback((feature) => {
+    setWorkingGeojson(feature);
+  }, []);
 
   const isBusy = loading || saving || resetting;
   const isEditedSource = rimPayload?.rim_source === 'edited';
@@ -396,6 +603,7 @@ export default function RimMapModal({ open, onClose, processId }) {
             processId: <code>{processId || '-'}</code>
             {rimPayload?.rim_source ? <> — source: <b>{rimPayload.rim_source}</b></> : null}
             {isEditing ? <> — <b>editing</b></> : null}
+            {deleteBoxMode ? <> — <b>delete-by-box</b></> : null}
           </Typography>
         </Box>
 
@@ -426,6 +634,14 @@ export default function RimMapModal({ open, onClose, processId }) {
               </Button>
               <Button variant="outlined" onClick={handleReloadActive} disabled={saving || resetting}>
                 Reload
+              </Button>
+              <Button
+                variant="outlined"
+                color="secondary"
+                onClick={handleStartDeleteByBox}
+                disabled={saving || resetting || deleteBoxMode}
+              >
+                {deleteBoxMode ? 'Draw box...' : 'Delete vertices by box'}
               </Button>
               <Button
                 variant="outlined"
@@ -471,7 +687,7 @@ export default function RimMapModal({ open, onClose, processId }) {
           <Box sx={{ height: '100%', minHeight: 500, display: 'flex', flexDirection: 'column' }}>
             {isEditing ? (
               <Box sx={{ p: 1.5, pb: 0 }}>
-                <Alert severity="info" sx={{ alignItems: 'flex-start' }}>
+                <Alert severity={deleteBoxMode ? 'warning' : 'info'} sx={{ alignItems: 'flex-start' }}>
                   <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
                     Editing tips
                   </Typography>
@@ -491,8 +707,19 @@ export default function RimMapModal({ open, onClose, processId }) {
                         Right-click a vertex marker to delete that vertex.
                       </Typography>
                     </li>
+                    <li>
+                      <Typography variant="body2">
+                        Use <b>Delete vertices by box</b> to draw a rectangle and remove multiple vertices at once.
+                      </Typography>
+                    </li>
                   </Box>
                 </Alert>
+              </Box>
+            ) : null}
+
+            {infoMessage ? (
+              <Box sx={{ p: 1.5, pb: 0 }}>
+                <Alert severity="success">{infoMessage}</Alert>
               </Box>
             ) : null}
 
@@ -512,7 +739,10 @@ export default function RimMapModal({ open, onClose, processId }) {
                   geojson={rimGeojson}
                   featureGroupRef={featureGroupRef}
                   editing={isEditing}
+                  deleteBoxMode={deleteBoxMode}
                   onDirty={handleDirty}
+                  onDeleteBoxDone={handleDeleteBoxDone}
+                  onReplaceGeojson={handleReplaceGeojson}
                 />
 
                 <FitToData previewBounds={previewBounds} geojson={rimGeojson} />

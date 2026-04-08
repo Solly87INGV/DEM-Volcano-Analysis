@@ -1,48 +1,54 @@
 // VolumeSelection.js
 import React, { useMemo, useState } from 'react';
-import { Box, Typography, Button, IconButton, CircularProgress, Divider } from '@mui/material';
+import {
+  Box,
+  Typography,
+  Button,
+  CircularProgress,
+  Divider,
+  Paper,
+} from '@mui/material';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import AssessmentIcon from '@mui/icons-material/Assessment';
-import CardSelection from './CardSelection';
 import axios from 'axios';
 import './VolumeSelection.css';
 
-// ✅ DEV+DOCKER: usa path relativi (/calculateVolume, /outputs/...)
-// - in DEV: CRA proxy inoltra a http://localhost:5000
-// - in DOCKER/PROD: sei già su http://localhost:5000
+// DEV+DOCKER: usa path relativi
 const API_BASE = '';
+
+// Workflow unificato: per compatibilità col backend attuale,
+// passiamo ancora un baseProfile fisso.
+// La distinzione non è più esposta in UI.
+const UNIFIED_BASE_PROFILE = 'continental';
 
 const VolumeSelection = ({
   demFile,
   onBack,
   processId,
-  setStep,        // ✅ NEW (from App wrapper)
-  setVolumeRun,   // ✅ NEW (from App)
+  setStep,
+  setVolumeRun,
 }) => {
-  // ✅ MorphoVolc 2.0: only scenario selection
-  const [baseScenario, setBaseScenario] = useState(''); // island | continental
   const [isLoading, setIsLoading] = useState(false);
 
-  // output UI (kept for debug, but we won't render inline anymore)
+  // debug / diagnostica
   const [resultText, setResultText] = useState('');
   const [effectivePid, setEffectivePid] = useState(null);
   const [metrics, setMetrics] = useState(null);
   const [manifest, setManifest] = useState(null);
 
-  // ⏱️ timing
   const [calcWallMs, setCalcWallMs] = useState(null);
   const [serverPhasesCalc, setServerPhasesCalc] = useState(null);
 
   const manifestImages = useMemo(() => {
     const imgs = manifest?.images || [];
     return imgs
-      .map(it => ({
+      .map((it) => ({
         filename: it.filename,
         publicPath: it.public_path,
         titles: it.titles || [],
-        descriptions: it.descriptions || []
+        descriptions: it.descriptions || [],
       }))
-      .filter(it => !!it.publicPath);
+      .filter((it) => !!it.publicPath);
   }, [manifest]);
 
   const resetOutputs = () => {
@@ -52,17 +58,6 @@ const VolumeSelection = ({
     setManifest(null);
     setCalcWallMs(null);
     setServerPhasesCalc(null);
-  };
-
-  const handleScenarioSelect = (scenario) => {
-    setBaseScenario(scenario);
-    resetOutputs();
-  };
-
-  // ✅ Reset selections on this screen
-  const handleReset = () => {
-    setBaseScenario('');
-    resetOutputs();
   };
 
   async function fetchJsonOrNull(url) {
@@ -81,12 +76,10 @@ const VolumeSelection = ({
 
     const formData = new FormData();
 
-    // Keep demFile upload for backward compatibility.
-    // Server will prefer dem_working.tif in OUTPUTS_DIR/<processId>/ when present.
     if (demFile) formData.append('demFile', demFile);
 
-    // ✅ MorphoVolc 2.0: only baseProfile is required for unified model
-    formData.append('baseProfile', baseScenario);
+    // workflow unificato: valore fisso, non più selezionato dall’utente
+    formData.append('baseProfile', UNIFIED_BASE_PROFILE);
 
     const originalFileName =
       (demFile && demFile.name) ||
@@ -109,18 +102,17 @@ const VolumeSelection = ({
       if (phaseHeader) {
         try {
           setServerPhasesCalc(JSON.parse(phaseHeader));
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
       }
 
-      // 🔑 PID definitivo
       const pid = response?.data?.processId || pidFromProp || null;
       setEffectivePid(pid);
 
-      // fallback: se server ti ha dato result string, mettila
       const serverResult = response?.data?.result;
       if (typeof serverResult === 'string') setResultText(serverResult);
 
-      // (debug fetch: metrics/manifest) — non serve alla UI finale, ma utile se vuoi controllare
       if (pid) {
         const metricsUrl = `${API_BASE}/outputs/${pid}/metrics.json`;
         const manifestUrl = `${API_BASE}/outputs/${pid}/analysis_images.json`;
@@ -132,38 +124,38 @@ const VolumeSelection = ({
         setManifest(man);
       }
 
-      // ✅ CARICA volume_results.json (se presente) e passa tutto al viewer separato
       let vr = null;
       if (pid) {
         const vrUrl = `${API_BASE}/outputs/${pid}/volume_results.json`;
         vr = await fetchJsonOrNull(vrUrl);
       }
 
-      // moduleKey fallback (unified)
-      const fallbackModuleKey = `unified_${baseScenario || 'unknown'}`;
+      const fallbackModuleKey = response?.data?.moduleKey || vr?.moduleKey || 'unified';
 
-      // costruisci payload compatibile con VolumeResultsViewer
       const run = {
         processId: pid,
         status: vr?.status || response?.data?.status || 'completed',
-        moduleKey: response?.data?.moduleKey || vr?.moduleKey || fallbackModuleKey,
+        moduleKey: fallbackModuleKey,
         result: vr?.result || response?.data?.result || null,
         images: vr?.images || response?.data?.images || [],
-        selection: { baseScenario }, // keep only what exists in 2.0 UI
+        baseProfile: UNIFIED_BASE_PROFILE,
+        selection: {
+          workflow: 'unified',
+          legacyBaseProfileUsedForCompatibility: UNIFIED_BASE_PROFILE,
+        },
       };
 
       if (setVolumeRun) setVolumeRun(run);
-      if (setStep) setStep('results'); // App wrapper -> volumeResults
+      if (setStep) setStep('results');
       return;
     } catch (error) {
       console.error('Error calculating volume:', error);
-      alert('Si è verificato un errore durante il calcolo del volume.');
+      alert('An error occurred during the volume calculation.');
     } finally {
       setIsLoading(false);
     }
   };
 
-  // piccola tabella “umana” da metrics.json (debug only, we won't render inline)
   const quickRows = useMemo(() => {
     const mm = metrics?.morphometrics;
     const vv = metrics?.volumes;
@@ -187,55 +179,83 @@ const VolumeSelection = ({
       rows.push(['Caldera volume (m³)', vv.V_caldera_m3]);
       rows.push(['Effective volume (m³)', vv.V_effective_m3]);
     }
-    return rows.filter(r => r[1] !== undefined && r[1] !== null);
+    return rows.filter((r) => r[1] !== undefined && r[1] !== null);
   }, [metrics]);
 
-  // ✅ inline results OFF: questa schermata deve solo selezionare e lanciare il run
   const SHOW_INLINE_RESULTS = false;
 
   const instructionText = useMemo(() => {
-    if (!baseScenario) return "Choose volcano scenario";
-    return "Ready to calculate volume";
-  }, [baseScenario]);
+    if (isLoading) return 'Running unified volume workflow...';
+    return 'Unified volume workflow';
+  }, [isLoading]);
 
-  const canCalculate = Boolean(baseScenario && !isLoading);
+  const canCalculate = !isLoading;
 
   return (
     <Box className="volume-selection-container">
-      <Typography variant="h5" className="success-message">First processing successful</Typography>
+      <Typography variant="h5" className="success-message">
+        First processing successful
+      </Typography>
 
       <Typography variant="h6" className="instruction-message">
         {instructionText}
       </Typography>
 
-      {/* Optional: reset arrow (clears selections) */}
-      {baseScenario && (
-        <IconButton onClick={handleReset} className="back-arrow" aria-label="Reset selections">
-          <ArrowBackIcon />
-        </IconButton>
-      )}
+      <Box
+        sx={{
+          maxWidth: 920,
+          mx: 'auto',
+          mt: 3,
+          mb: 2,
+        }}
+      >
+        <Paper
+          elevation={3}
+          sx={{
+            borderRadius: 4,
+            p: { xs: 2.5, md: 3.5 },
+            border: '1px solid',
+            borderColor: 'divider',
+            background: 'linear-gradient(180deg, #ffffff 0%, #f7f8fa 100%)',
+          }}
+        >
+          <Typography variant="h5" sx={{ mb: 1.5, fontWeight: 700 }}>
+            Unified volume calculation
+          </Typography>
 
-      {/* ===== SCENARIO (2 cards) ===== */}
-      <Box className="main-layout">
-        <Box className="card-container">
-          <CardSelection
-            title="Island volcano (simple base)"
-            description="Recommended when the edifice is isolated and the base contour is clear (e.g., island volcanoes)."
-            onClick={() => handleScenarioSelect('island')}
-            imageSrc="/images/IslandBase.png"
-            isSelected={baseScenario === 'island'}
-          />
-          <CardSelection
-            title="Continental volcano (complex base)"
-            description="Recommended when the edifice merges with surrounding topography and the base contour is ambiguous."
-            onClick={() => handleScenarioSelect('continental')}
-            imageSrc="/images/ContinentalBase.png"
-            isSelected={baseScenario === 'continental'}
-          />
-        </Box>
+          <Typography variant="body1" sx={{ mb: 2, lineHeight: 1.7 }}>
+            MorphoVolc now uses a single workflow for volume calculation.
+            The current implementation keeps the internal processing aligned with the existing
+            backend logic, while simplifying the user interface and preparing the codebase
+            for a more adaptive calculation strategy.
+          </Typography>
+
+          <Box component="ul" sx={{ m: 0, pl: 3, mb: 2 }}>
+            <li>
+              <Typography variant="body2" sx={{ lineHeight: 1.7 }}>
+                A single calculation path is launched from the interface.
+              </Typography>
+            </li>
+            <li>
+              <Typography variant="body2" sx={{ lineHeight: 1.7 }}>
+                After the first run, the caldera rim can still be opened, edited, saved, reset to auto,
+                and recalculated from the results viewer.
+              </Typography>
+            </li>
+            <li>
+              <Typography variant="body2" sx={{ lineHeight: 1.7 }}>
+                This setup is intended to support upcoming testing, validation against literature,
+                and future adaptive improvements in the backend logic.
+              </Typography>
+            </li>
+          </Box>
+
+          <Typography variant="body2" sx={{ opacity: 0.72 }}>
+            Internal compatibility profile currently used: <b>{UNIFIED_BASE_PROFILE}</b>
+          </Typography>
+        </Paper>
       </Box>
 
-      {/* ===== ACTIONS ===== */}
       <Box className="button-group" sx={{ mt: 2 }}>
         {isLoading && (
           <Box display="flex" justifyContent="center" alignItems="center" mb={2}>
@@ -250,7 +270,7 @@ const VolumeSelection = ({
           startIcon={<ArrowBackIcon />}
           disabled={isLoading}
         >
-          Back to Upload
+          Back to DEM Results
         </Button>
 
         <Button
@@ -291,7 +311,13 @@ const VolumeSelection = ({
                     {quickRows.map(([k, v]) => (
                       <tr key={k}>
                         <td style={{ padding: '6px 8px', borderBottom: '1px solid #ddd' }}>{k}</td>
-                        <td style={{ padding: '6px 8px', borderBottom: '1px solid #ddd', textAlign: 'right' }}>
+                        <td
+                          style={{
+                            padding: '6px 8px',
+                            borderBottom: '1px solid #ddd',
+                            textAlign: 'right',
+                          }}
+                        >
                           {typeof v === 'number' ? v.toLocaleString() : String(v)}
                         </td>
                       </tr>
@@ -327,7 +353,9 @@ const VolumeSelection = ({
 
           {(calcWallMs != null || serverPhasesCalc) && (
             <Box sx={{ mt: 2 }}>
-              <Typography variant="h6" sx={{ mb: 1 }}>Diagnostics</Typography>
+              <Typography variant="h6" sx={{ mb: 1 }}>
+                Diagnostics
+              </Typography>
               {calcWallMs != null && (
                 <Typography variant="body2">
                   POST /calculateVolume — wall-time: <b>{calcWallMs.toFixed(1)} ms</b>

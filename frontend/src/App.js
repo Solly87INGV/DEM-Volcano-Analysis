@@ -8,8 +8,6 @@ import UploadForm from "./components/UploadForm";
 import Footer from "./components/Footer";
 
 import AnalysisResultsViewer from "./components/AnalysisResultsViewer";
-
-// ⬇️ questi due li devi avere in frontend/src/components/
 import VolumeSelection from "./components/VolumeSelection";
 import VolumeResultsViewer from "./components/VolumeResultsViewer";
 
@@ -20,21 +18,19 @@ function App() {
   // step: upload -> analysisResults -> volumeSelection -> volumeResults
   const [step, setStep] = useState("upload");
 
-  // contiene il payload finale del volume (result/images/moduleKey/pdfUrl ecc.)
+  // contiene il payload finale del volume
   const [volumeRun, setVolumeRun] = useState(null);
 
   // ---------------------------
-  // Helpers: URL sync (come OLD)
+  // Helpers: URL sync
   // ---------------------------
   const syncUrl = (nextStep, nextProcessId) => {
     try {
       const qs = new URLSearchParams(window.location.search);
 
-      // step
       if (nextStep) qs.set("step", nextStep);
       else qs.delete("step");
 
-      // processId
       if (nextProcessId) qs.set("processId", nextProcessId);
       else qs.delete("processId");
 
@@ -50,6 +46,7 @@ function App() {
     setVolumeRun(null);
     setStep("upload");
     try {
+      localStorage.removeItem("lastVolumeRun");
       window.history.replaceState({}, "", "/");
     } catch {
       /* ignore */
@@ -69,7 +66,7 @@ function App() {
   }, []);
 
   // ---------------------------
-  // Bootstrap da querystring + restore volumeRun (come OLD)
+  // Bootstrap da querystring + restore volumeRun
   // ---------------------------
   useEffect(() => {
     try {
@@ -79,13 +76,11 @@ function App() {
 
       if (pid) setProcessId(pid);
 
-      // accetta solo step noti
       const allowed = new Set(["upload", "analysisResults", "volumeSelection", "volumeResults"]);
       if (s && allowed.has(s)) {
         setStep(s);
       }
 
-      // restore volumeRun da localStorage (utile se refresh su volumeResults)
       try {
         const raw = localStorage.getItem("lastVolumeRun");
         if (raw) setVolumeRun(JSON.parse(raw));
@@ -98,7 +93,7 @@ function App() {
   }, []);
 
   // ---------------------------
-  // Persist volumeRun (come OLD)
+  // Persist volumeRun
   // ---------------------------
   useEffect(() => {
     if (!volumeRun) return;
@@ -110,7 +105,7 @@ function App() {
   }, [volumeRun]);
 
   // ---------------------------
-  // Sync URL ad ogni cambio step/processId
+  // Sync URL
   // ---------------------------
   useEffect(() => {
     syncUrl(step, processId);
@@ -129,10 +124,8 @@ function App() {
               setDemFile={setDemFile}
               setProcessId={(pid) => {
                 setProcessId(pid);
-                // non forzo step qui: lo fa la tua logica quando finisce l'analisi
               }}
               processId={processId}
-              // ✅ quando complete_dem_analysis finisce, vai a "analysisResults"
               setShowAnalysisResults={(v) => {
                 if (v) setStep("analysisResults");
               }}
@@ -145,7 +138,9 @@ function App() {
             <h2 style={{ marginTop: 0 }}>Complete DEM Analysis — Results</h2>
 
             {!processId ? (
-              <div style={{ color: "crimson" }}>processId mancante: impossibile caricare i risultati.</div>
+              <div style={{ color: "crimson" }}>
+                processId mancante: impossibile caricare i risultati.
+              </div>
             ) : (
               <AnalysisResultsViewer
                 processId={processId}
@@ -161,17 +156,13 @@ function App() {
           <VolumeSelection
             demFile={demFile}
             processId={processId}
-            // torna ai risultati DEM
             onBack={() => setStep("analysisResults")}
-            // compat: se la tua VolumeSelection usa "setStep('results')"
             setStep={(s) => {
               if (s === "results") setStep("volumeResults");
               if (s === "selection") setStep("volumeSelection");
             }}
-            // quando ricevi il JSON dal backend /calculateVolume
             setVolumeRun={(run) => {
               setVolumeRun(run);
-              // se il backend ti restituisce un pid diverso, allinealo
               if (run?.processId && run.processId !== processId) setProcessId(run.processId);
               setStep("volumeResults");
             }}
@@ -182,9 +173,7 @@ function App() {
           <VolumeResultsViewer
             processId={processId}
             volumeRun={volumeRun}
-            // torna alla selection (per cambiare modulo/approx)
             onBack={() => setStep("volumeSelection")}
-            // ✅ questo serve davvero al componente per mostrare "Back to Upload"
             onBackToUpload={resetAll}
             requireCompleted={true}
           />
