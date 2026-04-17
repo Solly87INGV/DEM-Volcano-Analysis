@@ -154,15 +154,21 @@ function spawnPython({ args, processId, extraEnv = {} }) {
 // ---------------------------
 function normalizeBaseProfile(v) {
   const s = String(v || '').trim().toLowerCase();
+
+  if (!s) return 'auto';
+
+  if (s === 'auto' || s === 'unified') return 'auto';
   if (s === 'island' || s === 'simple' || s === 'simple_base') return 'island';
   if (s === 'continental' || s === 'complex' || s === 'complex_base') return 'continental';
-  return s;
+
+  return 'auto';
 }
 
 function deriveUnifiedModuleKey(baseProfile) {
   const bp = normalizeBaseProfile(baseProfile);
   if (bp === 'island' || bp === 'continental') return `unified_${bp}`;
-  return 'unified';
+  if (bp === 'auto') return 'unified_auto';
+  return 'unified_auto';
 }
 
 // write meta.json (report titles / traceability)
@@ -442,8 +448,10 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
     });
   }
 
-  if (!baseProfile || (baseProfile !== 'island' && baseProfile !== 'continental')) {
-    return res.status(400).json({ error: 'Missing required field: baseProfile (island|continental).' });
+  if (!['auto', 'island', 'continental'].includes(baseProfile)) {
+    return res.status(400).json({
+      error: 'Invalid baseProfile. Allowed values: auto | island | continental.',
+    });
   }
 
   const originalFileNameRaw =
@@ -623,6 +631,7 @@ app.get('/api/metrics/:processId', (req, res) => {
 // Rim endpoints
 // GET /api/rim/:processId
 // POST /api/rim/:processId
+// DELETE /api/rim/:processId
 // ---------------------------
 app.get('/api/rim/:processId', (req, res) => {
   const { processId } = req.params;
@@ -705,7 +714,6 @@ app.delete('/api/rim/:processId', (req, res) => {
     return res.status(400).json({ error: 'Invalid processId' });
   }
 
-  const procDir = getProcessDir(processId);
   const editedPath = getEditedRimPath(processId);
   const autoPath = getAutoRimPath(processId);
 
@@ -738,6 +746,7 @@ app.delete('/api/rim/:processId', (req, res) => {
     });
   }
 });
+
 // ---------------------------
 // PDF Report endpoint
 // GET /api/report/:processId?moduleKey=...

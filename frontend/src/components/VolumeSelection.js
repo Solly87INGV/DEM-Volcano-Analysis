@@ -19,7 +19,7 @@ const API_BASE = '';
 // Workflow unificato: per compatibilità col backend attuale,
 // passiamo ancora un baseProfile fisso.
 // La distinzione non è più esposta in UI.
-const UNIFIED_BASE_PROFILE = 'continental';
+const UNIFIED_BASE_PROFILE = 'auto';
 
 const VolumeSelection = ({
   demFile,
@@ -251,7 +251,7 @@ const VolumeSelection = ({
           </Box>
 
           <Typography variant="body2" sx={{ opacity: 0.72 }}>
-            Internal compatibility profile currently used: <b>{UNIFIED_BASE_PROFILE}</b>
+            Unified workflow mode: <b>{UNIFIED_BASE_PROFILE}</b>
           </Typography>
         </Paper>
       </Box>

@@ -128,11 +128,35 @@ def _public_path(process_id: str, filename: str) -> str:
 
 def _normalize_base_profile(v: str) -> str:
     s = str(v or "").strip().lower()
+
+    if not s:
+        return "auto"
+
+    if s in ("auto", "unified"):
+        return "auto"
+
     if s in ("island", "simple", "simple_base"):
         return "island"
+
     if s in ("continental", "complex", "complex_base"):
         return "continental"
-    return s or "continental"
+
+    return "auto"
+
+
+def _resolve_internal_profile(base_profile: str) -> str:
+    """
+    User-facing workflow:
+    - auto
+    Internal scientific fallback (for now):
+    - auto -> continental
+    - island -> island
+    - continental -> continental
+    """
+    bp = _normalize_base_profile(base_profile)
+    if bp == "auto":
+        return "continental"
+    return bp
 
 
 # -------------------- logging --------------------
@@ -1313,7 +1337,15 @@ def run_unified(
 ) -> Dict[str, Any]:
     nodata = meta.get("nodata", None)
 
-    base_contour, base_dbg = select_base_contour(dem, transform, nodata=nodata, base_profile=base_profile)
+    requested_base_profile = _normalize_base_profile(base_profile)
+    internal_base_profile = _resolve_internal_profile(requested_base_profile)
+
+    base_contour, base_dbg = select_base_contour(
+        dem,
+        transform,
+        nodata=nodata,
+        base_profile=internal_base_profile,
+    )
     slope = calculate_slope(dem)
 
     if caldera_contour_override is not None:
@@ -1329,7 +1361,7 @@ def run_unified(
             base_contour=base_contour,
             transform=transform,
             nodata=nodata,
-            preset=base_profile,
+            preset=internal_base_profile,
         )
 
     base_p1, base_p2 = find_opposite_points(base_contour)
@@ -1388,6 +1420,8 @@ def run_unified(
     V_effective_m3 = float(max(0.0, V_total_m3 - V_caldera_m3))
 
     return {
+        "requested_base_profile": requested_base_profile,
+        "internal_base_profile": internal_base_profile,
         "base_contour": base_contour,
         "caldera_contour": caldera_contour,
         "base_points": {"p1_rc": base_p1, "p2_rc": base_p2},
@@ -1424,10 +1458,15 @@ def main() -> int:
     process_id = _resolve_process_id()
     proc_dir = _ensure_proc_dir(process_id)
 
-    base_profile = _normalize_base_profile(os.environ.get("BASE_PROFILE") or os.environ.get("BASE_SCENARIO") or "")
+    base_profile = _normalize_base_profile(
+        os.environ.get("BASE_PROFILE") or os.environ.get("BASE_SCENARIO") or ""
+    )
     module_key = (os.environ.get("MODULE_KEY") or "").strip()
     if not module_key:
-        module_key = f"unified_{base_profile}"
+        if base_profile == "auto":
+            module_key = "unified_auto"
+        else:
+            module_key = f"unified_{base_profile}"
 
     dem_path, reason = _pick_dem_manifest_first(proc_dir, cli_dem)
     if reason == "missing" or not dem_path.exists():
@@ -1532,6 +1571,8 @@ def main() -> int:
             "process_id": process_id,
             "moduleKey": module_key,
             "baseProfile": base_profile,
+            "requested_baseProfile": out.get("requested_base_profile"),
+            "internal_baseProfile": out.get("internal_base_profile"),
             "model": "unified_area_prismoid_plus_caldera_depth_integrated",
             "rim_source": rim_source,
             "rim_file": rim_file,
@@ -1633,6 +1674,8 @@ def main() -> int:
         "status": "completed",
         "moduleKey": module_key,
         "baseProfile": base_profile,
+        "requested_baseProfile": out.get("requested_base_profile"),
+        "internal_baseProfile": out.get("internal_base_profile"),
         "volumeType": "unified",
         "approximationType": "unified",
         "rim_source": rim_source,
