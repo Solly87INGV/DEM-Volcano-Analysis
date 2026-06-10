@@ -1,0 +1,10 @@
+node_modules
+**/node_modules
+outputs
+uploads
+**/__pycache__
+**/*.pyc
+.git
+.DS_Store
+npm-debug.log*
+yarn-error.log*
