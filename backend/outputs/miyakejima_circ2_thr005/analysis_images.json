@@ -1,0 +1,104 @@
+{
+  "processId": "874e7cdb-d58d-4f75-bcbc-57d77dbea6a4",
+  "source": "complete_dem_analysis",
+  "original_file_name": "Miyakejima_island",
+  "generated_at": "2026-06-09 10:23:56",
+  "images": [
+    {
+      "filename": "dem_overview.png",
+      "abs_path": "/app/backend/outputs/874e7cdb-d58d-4f75-bcbc-57d77dbea6a4/dem_overview.png",
+      "public_path": "/outputs/874e7cdb-d58d-4f75-bcbc-57d77dbea6a4/dem_overview.png",
+      "titles": [
+        "DEM"
+      ],
+      "units": [
+        "m"
+      ],
+      "descriptions": [
+        "Represents terrain elevation in meters above sea level."
+      ]
+    },
+    {
+      "filename": "aspect_overview.png",
+      "abs_path": "/app/backend/outputs/874e7cdb-d58d-4f75-bcbc-57d77dbea6a4/aspect_overview.png",
+      "public_path": "/outputs/874e7cdb-d58d-4f75-bcbc-57d77dbea6a4/aspect_overview.png",
+      "titles": [
+        "Aspect"
+      ],
+      "units": [
+        "Degrees"
+      ],
+      "descriptions": [
+        "Slope direction (degrees): 0\u00b0=N, clockwise up to 360\u00b0."
+      ]
+    },
+    {
+      "filename": "double_01.png",
+      "abs_path": "/app/backend/outputs/874e7cdb-d58d-4f75-bcbc-57d77dbea6a4/double_01.png",
+      "public_path": "/outputs/874e7cdb-d58d-4f75-bcbc-57d77dbea6a4/double_01.png",
+      "titles": [
+        "Shaded Relief",
+        "Hillshade"
+      ],
+      "units": [
+        "Adimensional",
+        "Adimensional"
+      ],
+      "descriptions": [
+        "Simulates light and shadow effects on the terrain.",
+        "Relative terrain illumination (Sun Alt 45\u00b0, Az 45\u00b0)."
+      ]
+    },
+    {
+      "filename": "double_02.png",
+      "abs_path": "/app/backend/outputs/874e7cdb-d58d-4f75-bcbc-57d77dbea6a4/double_02.png",
+      "public_path": "/outputs/874e7cdb-d58d-4f75-bcbc-57d77dbea6a4/double_02.png",
+      "titles": [
+        "Slope 1",
+        "Slope 2"
+      ],
+      "units": [
+        "Degrees",
+        "Degrees"
+      ],
+      "descriptions": [
+        "Slope in degrees (method 1).",
+        "Slope in degrees (method 2, uses DEM resolution)."
+      ]
+    },
+    {
+      "filename": "double_03.png",
+      "abs_path": "/app/backend/outputs/874e7cdb-d58d-4f75-bcbc-57d77dbea6a4/double_03.png",
+      "public_path": "/outputs/874e7cdb-d58d-4f75-bcbc-57d77dbea6a4/double_03.png",
+      "titles": [
+        "Roughness",
+        "Convexity"
+      ],
+      "units": [
+        "Adimensional",
+        "Adimensional"
+      ],
+      "descriptions": [
+        "Measures local variations in elevation.",
+        "Shows whether terrain areas are convex or concave."
+      ]
+    },
+    {
+      "filename": "double_04.png",
+      "abs_path": "/app/backend/outputs/874e7cdb-d58d-4f75-bcbc-57d77dbea6a4/double_04.png",
+      "public_path": "/outputs/874e7cdb-d58d-4f75-bcbc-57d77dbea6a4/double_04.png",
+      "titles": [
+        "Amplified and Smoothed Curvature",
+        "Logarithmic Amplified Gaussian Curvature"
+      ],
+      "units": [
+        "Adimensional",
+        "Adimensional"
+      ],
+      "descriptions": [
+        "Smoothed curvature for improved interpretation.",
+        "Gaussian curvature for detailed terrain analysis."
+      ]
+    }
+  ]
+}

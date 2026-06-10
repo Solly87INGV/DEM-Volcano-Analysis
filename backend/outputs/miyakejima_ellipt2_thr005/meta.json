@@ -1,0 +1,10 @@
+{
+  "input_dem_name": "Miyakejima_island.tif",
+  "original_file_stem": "Miyakejima_island",
+  "module_key": "elliptical_approx2",
+  "volume_type": "elliptical",
+  "approximation_type": "approximation2",
+  "process_id": "874e7cdb-d58d-4f75-bcbc-57d77dbea6a4",
+  "step": "calculate_volume",
+  "updated_at": "2026-06-09T10:26:18.957Z"
+}

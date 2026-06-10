@@ -1,0 +1,51 @@
+{
+  "processId": "30bb6e14-8751-44e9-b5e3-9960e72a1ac5",
+  "status": "completed",
+  "moduleKey": "circular_approx1",
+  "result": {
+    "base_area_km2": 23.030383751444052,
+    "base_width_km": 5.766324652670885,
+    "caldera_area_km2": 3.584961616884428,
+    "caldera_width_km": 2.14347848134755,
+    "total_volume_km3": 10.409760014526858,
+    "caldera_volume_km3": 2.578255841768243,
+    "effective_volume_km3": 7.831504172758615,
+    "pixel_size_m": 30.0,
+    "base_elevation_ratio": 0.1,
+    "caldera_level_ratio": 0.8,
+    "base_elevation_ratio_used": 0.1,
+    "caldera_level_ratio_used": 0.8,
+    "caldera_method_used": "level_ratio_threshold",
+    "h_max_m": 792.0
+  },
+  "images": [
+    {
+      "filename": "dem_overview.png",
+      "title": "dem_overview.png"
+    },
+    {
+      "filename": "aspect_overview.png",
+      "title": "aspect_overview.png"
+    },
+    {
+      "filename": "double_01.png",
+      "title": "double_01.png"
+    },
+    {
+      "filename": "double_02.png",
+      "title": "double_02.png"
+    },
+    {
+      "filename": "double_03.png",
+      "title": "double_03.png"
+    },
+    {
+      "filename": "double_04.png",
+      "title": "double_04.png"
+    },
+    {
+      "filename": "final_doublet_base_vs_caldera.png",
+      "title": "Base vs Caldera (final doublet)"
+    }
+  ]
+}

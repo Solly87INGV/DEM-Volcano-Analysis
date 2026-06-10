@@ -1,0 +1,28 @@
+{
+  "processId": "874e7cdb-d58d-4f75-bcbc-57d77dbea6a4",
+  "status": "completed",
+  "moduleKey": "elliptical_approx2",
+  "result": {
+    "base_area_km2": 54.63367123971283,
+    "base_width_km": 7.716534196127171,
+    "caldera_area_km2": 3.5849616168837994,
+    "caldera_width_km": 2.14347848134755,
+    "total_volume_km3": 16.72852613482512,
+    "caldera_volume_km3": 2.561429360749114,
+    "effective_volume_km3": 14.167096774076006,
+    "pixel_size_m": 30.0,
+    "base_elevation_ratio": 0.05,
+    "caldera_level_ratio": 0.8,
+    "base_elevation_ratio_used": 0.05,
+    "caldera_level_ratio_used": 0.8,
+    "caldera_method_used": "level_ratio_threshold",
+    "h_max_m": 792.0,
+    "r_caldera_km": 1.071739240673775
+  },
+  "images": [
+    {
+      "filename": "final_doublet_base_vs_caldera.png",
+      "title": "Base vs Caldera (final doublet)"
+    }
+  ]
+}

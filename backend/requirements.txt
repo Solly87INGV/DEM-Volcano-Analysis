@@ -1,10 +1,15 @@
-# Core scientific stack (validated in the technical report)
+# Core scientific stack
 rasterio>=1.2
 numpy>=1.21
 scikit-image>=0.18
 matplotlib>=3.4
 PyQt5>=5.15
 reportlab>=3.6
+
+# Runtime helpers used by complete_dem_analysis.py
+psutil>=5.9
+requests>=2.31
+pandas>=2.2
 
 # Optional (only if you expose the Python pipeline as a microservice)
 fastapi>=0.110

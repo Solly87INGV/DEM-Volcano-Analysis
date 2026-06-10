@@ -2,21 +2,6 @@
 
 import sys
 import os
-# --- PROJ FIX (Windows / PostGIS conflict) ---
-try:
-    import pyproj
-    from pyproj import datadir as _pyproj_datadir
-
-    _pyproj_proj_dir = os.path.join(os.path.dirname(pyproj.__file__), "proj_dir", "share", "proj")
-    if os.path.exists(os.path.join(_pyproj_proj_dir, "proj.db")):
-        os.environ["PROJ_LIB"] = _pyproj_proj_dir
-        _pyproj_datadir.set_data_dir(_pyproj_proj_dir)
-        print(f"[DEBUG] PROJ_LIB forced to pyproj: {_pyproj_proj_dir}")
-    else:
-        print("[WARN] pyproj proj_dir not found; PROJ_LIB not forced.")
-except Exception as _e:
-    print(f"[WARN] Unable to force PROJ_LIB: {_e}")
-# --- end PROJ FIX ---
 import json
 import numpy as np
 import rasterio
@@ -25,12 +10,6 @@ import psutil
 from contextlib import contextmanager
 
 from scipy.ndimage import gaussian_filter   # ← niente 'sobel'
-
-# ==================== OPZIONE 2 (DEM standardization) — NUOVI IMPORT ====================
-from rasterio.warp import calculate_default_transform, reproject, Resampling
-from rasterio.crs import CRS as RioCRS
-from pyproj import Transformer
-# =======================================================================================
 
 from PyQt5 import QtWidgets
 from PyQt5.QtWidgets import (
@@ -52,6 +31,9 @@ import requests
 import pandas as pd
 import matplotlib.cm as cm
 from matplotlib.widgets import RectangleSelector
+import matplotlib
+if os.environ.get("HEADLESS", "0").lower() in ("1", "true", "yes"):
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ==== Memory & timing helpers ======================================
@@ -241,160 +223,17 @@ def _resolve_process_id(cli_process_id: str | None) -> str:
     return f"local_{int(time.time())}"
 
 def _ensure_outputs_dir(process_id: str) -> str:
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    out_dir = os.path.join(base_dir, "outputs", process_id)
+    # 1) Se definito da Node/Docker, usa OUTPUTS_DIR
+    base = os.environ.get("OUTPUTS_DIR")
+    if base and len(base) > 0:
+        base_dir = os.path.abspath(base)
+    else:
+        # fallback: comportamento attuale (scripts/outputs)
+        base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
+
+    out_dir = os.path.join(base_dir, process_id)
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
-
-# ==================== OPZIONE 2 — STANDARDIZZAZIONE DEM (AUTOMATICA SOLO SE GEOGRAFICO) ====================
-
-def _normalize_rasterio_crs(src_crs) -> RioCRS:
-    """
-    Normalizza CRS per gestire GeoTIFF con WKT sporco/non standard.
-    Se non riesce -> ValueError (così facciamo STOP con messaggio chiaro).
-    """
-    if src_crs is None:
-        raise ValueError("CRS assente nel DEM (src.crs=None).")
-
-    # 1) EPSG (preferibile: pulito e stabile)
-    try:
-        epsg = src_crs.to_epsg()
-        if epsg is not None:
-            return RioCRS.from_epsg(int(epsg))
-    except Exception:
-        pass
-
-    # 2) WKT
-    try:
-        wkt = src_crs.to_wkt()
-        if wkt:
-            return RioCRS.from_wkt(wkt)
-    except Exception:
-        pass
-
-    # 3) PROJ4
-    try:
-        proj4 = src_crs.to_proj4()
-        if proj4:
-            return RioCRS.from_string(proj4)
-    except Exception:
-        pass
-
-    # 4) Fallback
-    try:
-        return RioCRS.from_user_input(str(src_crs))
-    except Exception as e:
-        raise ValueError(f"CRS non parsabile (WKT/PROJ/EPSG). Dettaglio: {e}")
-
-def _utm_epsg_from_lonlat(lon: float, lat: float) -> int:
-    zone = int((lon + 180) // 6) + 1
-    return (32600 + zone) if lat >= 0 else (32700 + zone)
-
-def _dem_center_lonlat(bounds, src_crs: RioCRS) -> tuple[float, float]:
-    """
-    Centro raster in lon/lat (WGS84).
-    Se src_crs e' geografico: bounds sono già lon/lat.
-    Se proiettato: trasformiamo il centro in WGS84.
-    """
-    cx = (bounds.left + bounds.right) / 2
-    cy = (bounds.bottom + bounds.top) / 2
-
-    if src_crs.is_geographic:
-        return float(cx), float(cy)
-
-    transformer = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
-    lon, lat = transformer.transform(cx, cy)
-    return float(lon), float(lat)
-
-def standardize_dem_option2(dem_path: str, out_dir: str, target_res_m: float | None = None) -> tuple[str, dict]:
-    """
-    OPZIONE 2:
-    - Se DEM è geografico (lat/long leggibile) -> riproietta automaticamente in UTM locale (centro DEM).
-    - Se DEM è già proiettato -> lo usa così com’è (nessuna riproiezione, niente cambi ai risultati attuali).
-    - Se CRS è assente/rotto -> STOP (ValueError) con messaggio chiaro.
-
-    Ritorna: (path_del_dem_da_usare, metadata_dict)
-    """
-    working_path = os.path.join(out_dir, "dem_working.tif")
-
-    with rasterio.open(dem_path) as src:
-        src_crs = _normalize_rasterio_crs(src.crs)
-
-        meta = {
-            "input_path": dem_path,
-            "input_crs": src_crs.to_string(),
-            "input_is_geographic": bool(src_crs.is_geographic),
-            "input_res": [float(src.res[0]), float(src.res[1])],
-            "input_nodata": src.nodata,
-            "input_bounds": [float(src.bounds.left), float(src.bounds.bottom), float(src.bounds.right), float(src.bounds.top)],
-            "input_shape": [int(src.height), int(src.width)],
-        }
-
-        # Caso: già proiettato -> usalo direttamente
-        if not src_crs.is_geographic:
-            meta.update({
-                "working_path": dem_path,
-                "working_crs": src_crs.to_string(),
-                "working_res": [float(src.res[0]), float(src.res[1])],
-                "reprojected": False,
-                "resampling": "none",
-                "note": "Input DEM already projected; used as-is (Option 2)."
-            })
-            return dem_path, meta
-
-        # Caso: geografico -> riproietta in UTM locale
-        lon, lat = _dem_center_lonlat(src.bounds, src_crs)
-        utm_epsg = _utm_epsg_from_lonlat(lon, lat)
-        dst_crs = RioCRS.from_epsg(int(utm_epsg))
-
-        transform, width, height = calculate_default_transform(
-            src_crs, dst_crs,
-            src.width, src.height,
-            *src.bounds,
-            resolution=target_res_m
-        )
-
-        dst_profile = src.profile.copy()
-        dst_profile.update({
-            "crs": dst_crs,
-            "transform": transform,
-            "width": width,
-            "height": height
-        })
-
-        nodata = src.nodata
-        if nodata is not None:
-            dst_profile["nodata"] = nodata
-
-        # resampling: bilinear per float, nearest per int
-        resampling = Resampling.bilinear
-        dst_profile.update(dtype=rasterio.float32)
-        with rasterio.open(working_path, "w", **dst_profile) as dst:
-            reproject(
-                source=rasterio.band(src, 1),
-                destination=rasterio.band(dst, 1),
-                src_transform=src.transform,
-                src_crs=src_crs,
-                dst_transform=transform,
-                dst_crs=dst_crs,
-                resampling=resampling,
-                src_nodata=nodata,
-                dst_nodata=nodata
-            )
-
-        meta.update({
-            "working_path": working_path,
-            "working_crs": f"EPSG:{utm_epsg}",
-            "working_res": [float(abs(transform.a)), float(abs(transform.e))],
-            "reprojected": True,
-            "resampling": str(resampling).split(".")[-1].lower(),
-            "utm_center_lonlat": [lon, lat],
-            "note": "Input DEM geographic; reprojected to local UTM (Option 2)."
-        })
-
-        return working_path, meta
-
-# ==================== FINE OPZIONE 2 ====================================================
 
 def _save_triplets_pngs(analysis_triplets, titles, cmaps, units, descriptions, file_name, out_dir):
     saved = []
@@ -957,8 +796,8 @@ class DEMAnalysisApp(QMainWindow):
             print("[DEBUG] 3D model window displayed successfully.")
         except Exception as e:
             QMessageBox.critical(
-                self,
-                "3D Model Error",
+                self, 
+                "3D Model Error", 
                 f"An error occurred while displaying the 3D model: {e}"
             )
             print(f"[ERROR] Error in display_volcano_3d: {e}")
@@ -990,22 +829,22 @@ class DEMAnalysisApp(QMainWindow):
                 try:
                     self.figure.savefig(file_path, format=format)
                     QMessageBox.information(
-                        self,
-                        "Success",
+                        self, 
+                        "Success", 
                         f"Graph successfully saved as {format.upper()} to {file_path}"
                     )
                     print(f"[DEBUG] Graph saved successfully as {format.upper()} to {file_path}")
                 except Exception as e:
                     QMessageBox.critical(
-                        self,
-                        "Save Error",
+                        self, 
+                        "Save Error", 
                         f"An error occurred while saving the graph: {e}"
                     )
                     print(f"[ERROR] Error during graph saving: {e}")
         except Exception as e:
             QMessageBox.critical(
-                self,
-                "Save Error",
+                self, 
+                "Save Error", 
                 f"An error occurred while initiating the save dialog: {e}"
             )
             print(f"[ERROR] Error initiating graph saving: {e}")
@@ -1020,8 +859,8 @@ class DEMAnalysisApp(QMainWindow):
                 self.apply_colormap_to_selected_graph()
         except Exception as e:
             QMessageBox.critical(
-                self,
-                "Colormap Selection Error",
+                self, 
+                "Colormap Selection Error", 
                 f"An error occurred while selecting the colormap: {e}"
             )
             print(f"[ERROR] Error in select_colormap: {e}")
@@ -1074,8 +913,8 @@ class DEMAnalysisApp(QMainWindow):
             print(f"[DEBUG] Applied new colormap and updated colorbar for graph {self.selected_graph}")
         except Exception as e:
             QMessageBox.critical(
-                self,
-                "Colormap Application Error",
+                self, 
+                "Colormap Application Error", 
                 f"An error occurred while applying the colormap: {e}"
             )
             print(f"[ERROR] Error in apply_colormap_to_selected_graph: {e}")
@@ -1130,22 +969,22 @@ class DEMAnalysisApp(QMainWindow):
                                 dst.write(data.astype(rasterio.float32), 1)
                             print(f"[DEBUG] Exported {geotiff_filename}")
                 QMessageBox.information(
-                    self,
-                    "Export Successful",
+                    self, 
+                    "Export Successful", 
                     f"All data successfully exported as {export_format} to {directory}"
                 )
                 print(f"[DEBUG] All data successfully exported as {export_format} to {directory}")
             except Exception as e:
                 QMessageBox.critical(
-                    self,
-                    "Export Error",
+                    self, 
+                    "Export Error", 
                     f"An error occurred while exporting the data: {e}"
                 )
                 print(f"[ERROR] Error during data export: {e}")
         except Exception as e:
             QMessageBox.critical(
-                self,
-                "Export Error",
+                self, 
+                "Export Error", 
                 f"An error occurred during export setup: {e}"
             )
             print(f"[ERROR] Error in export_data setup: {e}")
@@ -1231,13 +1070,12 @@ class DEMAnalysisApp(QMainWindow):
             print("[DEBUG] Displayed local statistics for selected region.")
         except Exception as e:
             QMessageBox.critical(
-                self,
-                "Selection Error",
+                self, 
+                "Selection Error", 
                 f"An error occurred during region selection: {e}"
             )
             print(f"[ERROR] Error in on_select: {e}")
 
-# Funzione principale
 def main():
     if len(sys.argv) < 2:
         print("Error: specify the DEM file path as an argument.")
@@ -1245,45 +1083,36 @@ def main():
 
     dem_path = sys.argv[1]
 
-    # Controllo esplicito per il nome originale del file
+    # Nome originale (facoltativo)
     original_file_name = sys.argv[2] if len(sys.argv) > 2 else "Unknown"
 
-    # Ottieni il process_id dagli argomenti della riga di comando
+    # process_id da argv (facoltativo)
     cli_process_id = sys.argv[3] if len(sys.argv) > 3 else None
-    # Preferisci l'env var PROCESS_ID se presente
-    process_id = _resolve_process_id(cli_process_id)
-    if process_id:
-        print(f"[DEBUG] Process ID: {process_id}")
 
-    print(f"[DEBUG] DEM path provided: {dem_path}")
-    print(f"[DEBUG] Original file name: {original_file_name}")
-    print(f"[DEBUG] Number of arguments received: {len(sys.argv)}")
+    # Risolvi process_id: preferisci env PROCESS_ID, poi argv, altrimenti fallback interno
+    process_id = _resolve_process_id(cli_process_id)
+
+    # GARANZIA: mai None
+    if not process_id or not str(process_id).strip():
+        process_id = f"local_{int(time.time())}"
+
+    process_id = str(process_id).strip()
+
+    # out_dir deve esistere SUBITO, perché viene usato anche prima dei PNG (es. statistics_json)
+    out_dir = _ensure_outputs_dir(process_id)
+
+    # Log diagnostico super chiaro (fondamentale per debug docker)
+    print(f"[DEBUG] argv_count={len(sys.argv)}")
+    print(f"[DEBUG] argv_process_id={cli_process_id}")
+    print(f"[DEBUG] env_PROCESS_ID={os.environ.get('PROCESS_ID')}")
+    print(f"[DEBUG] resolved_process_id={process_id}")
+    print(f"[DEBUG] out_dir={out_dir}")
+    print(f"[DEBUG] dem_path={dem_path}")
+    print(f"[DEBUG] original_file_name={original_file_name}")
 
     # ==== Benchmark: start ====
     _t_all_start = time.time()
     log_memory("program_start")
-
-    # ==================== OPZIONE 2 — STANDARDIZZAZIONE DEM (PRIMA DEL LOAD) ====================
-    out_dir = _ensure_outputs_dir(process_id)
-    try:
-        with phase("standardize_dem"):
-            dem_path_to_use, dem_meta = standardize_dem_option2(dem_path, out_dir, target_res_m=None)
-
-        meta_path = os.path.join(out_dir, "dem_working_metadata.json")
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(dem_meta, f, indent=2)
-
-        dem_path = dem_path_to_use  # IMPORTANTISSIMO: da qui in poi usa questo
-        print(f"[DEBUG] DEM used for analysis: {dem_path}")
-        print(f"[DEBUG] DEM metadata saved: {meta_path}")
-    except ValueError as e:
-        print(f"[ERROR] DEM non standardizzabile automaticamente (Option 2). {e}")
-        print("[HINT] Se il DEM è in lat/long, deve avere CRS valido (es. EPSG:4326). Se il CRS è rotto/assente, correggi il GeoTIFF.")
-        sys.exit(1)
-    except Exception as e:
-        print(f"[ERROR] Error standardizing DEM (Option 2): {e}")
-        sys.exit(1)
-    # ============================================================================================
 
     # Caricamento DEM (timed)
     try:
@@ -1364,8 +1193,9 @@ def main():
         _, smooth_curv_stats = gather_statistics(
             curvature_smoothed, "Amplified and Smoothed Curvature"
         )
-        write_statistics_to_json(total_statistics, filename="output_statistics.json")
-        print("[DEBUG] Statistics written to output_statistics.json")
+        stats_path = os.path.join(out_dir, "output_statistics.json")
+        write_statistics_to_json(total_statistics, filename=stats_path)
+        print(f"[DEBUG] Statistics written to {stats_path}")
         log_memory("after_statistics_json")
 
     # Organizza le analisi in triplette (timed)
@@ -1441,7 +1271,7 @@ def main():
             )
         except Exception as e:
             print(f"[ERROR] Error during PNG/manifest generation: {e}")
-        log_memory("after_save_pngs_and_manifest")
+        log_memory("after_save_pngs_and_manifest")  
     # ================================================================================
 
     # Invia notifica (opzionale)
@@ -1458,6 +1288,11 @@ def main():
     print(f"[RESULT] Peak RAM = {_peak_mb:.1f} MB")
     print(f"[TIMING] total_end_to_end = {time.time() - _t_all_start:.3f} s")
     log_memory("before_gui_start")
+
+    headless = os.environ.get("HEADLESS", "0").lower() in ("1", "true", "yes")
+    if headless:
+        print("[INFO] HEADLESS=1 -> skipping PyQt GUI and exiting.")
+        sys.exit(0)
 
     # Avvia l'applicazione PyQt5
     try:

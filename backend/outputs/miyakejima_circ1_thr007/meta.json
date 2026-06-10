@@ -1,0 +1,10 @@
+{
+  "input_dem_name": "Miyakejima_island.tif",
+  "original_file_stem": "Miyakejima_island",
+  "process_id": "f277219b-6c17-4b7e-ae9b-0d0cd4359857",
+  "step": "calculate_volume",
+  "updated_at": "2026-06-09T09:56:09.865Z",
+  "module_key": "circular_approx1",
+  "volume_type": "circular",
+  "approximation_type": "approximation1"
+}
