@@ -51,19 +51,9 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
   const handleSubmitVolumeCalculation = async () => {
     setIsLoading(true);
     const formData = new FormData();
-
-    // --- files & params ---
     formData.append('demFile', demFile);
     formData.append('volumeType', volumeType);
     formData.append('approximationType', approximationType);
-
-    // ✅ NEW: passa SEMPRE il nome originale del file di input (serve per report+metrics)
-    // fallback: localStorage (se lo hai salvato in UploadForm) -> Unknown
-    const originalFileName =
-      (demFile && demFile.name) ||
-      localStorage.getItem('lastOriginalFileName') ||
-      'Unknown';
-    formData.append('originalFileName', originalFileName);
 
     // 👉 passa il processId della fase /process (prop o fallback da localStorage)
     const effectiveProcessId = processId || localStorage.getItem('lastProcessId');
@@ -131,14 +121,14 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
                 <>
                   <CardSelection
                     title="Circular Approximation 1"
-                    description="Rim→DEM depth integration"
+                    description="semi-sphere"
                     onClick={() => handleApproximationSelect('approximation1')}
                     imageSrc="/images/Approx1Circ.png"
                     isSelected={selectedApproximation === 'approximation1'}
                   />
                   <CardSelection
                     title="Circular Approximation 2"
-                    description="Frustum"
+                    description="cylinder"
                     onClick={() => handleApproximationSelect('approximation2')}
                     imageSrc="/images/Approx2Circ.png"
                     isSelected={selectedApproximation === 'approximation2'}
@@ -148,14 +138,14 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
                 <>
                   <CardSelection
                     title="Elliptical Approximation 1"
-                    description="Elliptical frustum + DEM semi-ellipsoid"
+                    description="semi-ellipsoid of rotation"
                     onClick={() => handleApproximationSelect('approximation1')}
                     imageSrc="/images/Ellipt1Approx.png"
                     isSelected={selectedApproximation === 'approximation1'}
                   />
                   <CardSelection
                     title="Elliptical Approximation 2"
-                    description="Elliptical frustum + DEM cylindrical caldera"
+                    description="cylinder with elliptical bases"
                     onClick={() => handleApproximationSelect('approximation2')}
                     imageSrc="/images/Ellipt2Approx.png"
                     isSelected={selectedApproximation === 'approximation2'}
@@ -174,13 +164,13 @@ const VolumeSelection = ({ demFile, onBack, processId }) => {
         <Box className="card-container">
           <CardSelection
             title="Circular Volcano"
-            description="Volcanic edifice with an approximately circular base and caldera, modeled from DEM-derived contours to estimate edifice and caldera volumes."
+            description="A volcanic edifice with a base and caldera both of approximately circular shape is approximated to a truncated cone."
             onClick={() => handleVolumeSelect('circular')}
             imageSrc="/images/Circular.png"
           />
           <CardSelection
             title="Elliptical Volcano"
-            description="Volcanic edifice with an elongated (elliptical) base and caldera, modeled from DEM-derived contours to estimate edifice and caldera volumes."
+            description="A volcanic edifice with a base and caldera both of approximately elliptical shape is approximated to a truncated cone with elliptical bases."
             onClick={() => handleVolumeSelect('elliptical')}
             imageSrc="/images/Elliptical.png"
           />
