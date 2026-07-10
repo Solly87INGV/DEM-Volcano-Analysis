@@ -1,7 +1,7 @@
 // UploadForm.js
 import React, { useState, useEffect } from "react";
 import axios from "axios";
-import { Box, Button, Typography, CircularProgress, Divider } from "@mui/material";
+import { Box, Button, Typography, CircularProgress, Divider, TextField } from "@mui/material";
 import CloudUploadIcon from "@mui/icons-material/CloudUpload";
 import "./UploadForm.css";
 
@@ -16,6 +16,12 @@ const UploadForm = ({
   const [uploadMessage, setUploadMessage] = useState("");
   const [isDragOver, setIsDragOver] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+
+  // Sett 3-4: GVP vnum (optional)
+  const [vnum, setVnum] = useState("");
+  const [gvpInfo, setGvpInfo] = useState(null);       // resolved payload from /api/gvp/:vnum
+  const [gvpError, setGvpError] = useState("");
+  const [isResolvingGvp, setIsResolvingGvp] = useState(false);
 
   // ⏱️ stati per i tempi misurati lato client
   const [processWallMs, setProcessWallMs] = useState(null);
@@ -162,6 +168,39 @@ const UploadForm = ({
     }
   };
 
+  // Sett 3-4: GVP vnum handling
+  const handleVnumChange = (event) => {
+    // Accept digits only; keep the rest as-is for UX (user typing 233020)
+    const v = String(event.target.value || "").replace(/\D+/g, "").slice(0, 12);
+    setVnum(v);
+    setGvpInfo(null);
+    setGvpError("");
+  };
+
+  const handleVerifyVnum = async () => {
+    if (!vnum) {
+      setGvpError("Enter a GVP volcano number first.");
+      return;
+    }
+    setIsResolvingGvp(true);
+    setGvpInfo(null);
+    setGvpError("");
+    try {
+      const response = await axios.get(`/api/gvp/${vnum}`, { timeout: 8000 });
+      setGvpInfo(response.data);
+    } catch (error) {
+      if (error?.response?.status === 404) {
+        setGvpError(`vnum ${vnum} not found in the GVP snapshot.`);
+      } else if (error?.response) {
+        setGvpError(`Server error ${error.response.status} while resolving vnum.`);
+      } else {
+        setGvpError(`Network error while resolving vnum: ${error.message}`);
+      }
+    } finally {
+      setIsResolvingGvp(false);
+    }
+  };
+
   const handleSubmit = async (event) => {
     event.preventDefault();
 
@@ -180,6 +219,8 @@ const UploadForm = ({
     const formData = new FormData();
     formData.append("demFile", selectedFile);
     formData.append("originalFileName", selectedFile.name);
+    // Sett 3-4: forward vnum if set (optional, backend tolerates absence).
+    if (vnum) formData.append("vnum", vnum);
 
     try {
       const t0 = performance.now();
@@ -258,6 +299,60 @@ const UploadForm = ({
           <Typography className="selected-file">Selected File: {selectedFile.name}</Typography>
         </div>
       )}
+
+      {/* Sett 3-4: optional GVP vnum */}
+      <Box className="gvp-vnum-container" sx={{ mt: 2, mb: 1, display: "flex", flexDirection: "column", gap: 1 }}>
+        <Typography variant="body2" sx={{ fontWeight: 500 }}>
+          GVP Volcano Number (optional)
+        </Typography>
+        <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
+          <TextField
+            size="small"
+            value={vnum}
+            onChange={handleVnumChange}
+            placeholder="e.g. 233020"
+            disabled={isProcessing || isResolvingGvp}
+            inputProps={{ inputMode: "numeric", pattern: "[0-9]*", "aria-label": "GVP volcano number" }}
+            sx={{ maxWidth: 200 }}
+          />
+          <Button
+            variant="outlined"
+            size="small"
+            onClick={handleVerifyVnum}
+            disabled={isProcessing || isResolvingGvp || !vnum}
+          >
+            {isResolvingGvp ? <CircularProgress size={18} /> : "Verify"}
+          </Button>
+        </Box>
+        {gvpInfo && (
+          <Box className="gvp-info" sx={{ p: 1, border: "1px solid #cfd8dc", borderRadius: 1, background: "#f5faff" }}>
+            <Typography variant="body2">
+              <b>{gvpInfo.name}</b>
+              {gvpInfo.country ? ` — ${gvpInfo.country}` : ""}
+            </Typography>
+            <Typography variant="body2">
+              GVP type: <b>{gvpInfo.primary_volcano_type || "(unknown)"}</b>
+              {gvpInfo.type_verified === false ? " (unverified)" : ""}
+            </Typography>
+            {gvpInfo.preset_hint && (
+              <Typography variant="body2">
+                {gvpInfo.preset_hint.matched ? (
+                  <>
+                    Preset hint: base=<code>{gvpInfo.preset_hint.base_preset}</code>, rim=<code>{gvpInfo.preset_hint.rim_preset}</code>
+                  </>
+                ) : (
+                  <>
+                    Preset hint: <i>no mapping (reason: {gvpInfo.preset_hint.reason})</i> — the Python side will fall back to BASE_PROFILE.
+                  </>
+                )}
+              </Typography>
+            )}
+          </Box>
+        )}
+        {gvpError && (
+          <Typography variant="body2" color="error">{gvpError}</Typography>
+        )}
+      </Box>
 
       {uploadMessage && <Typography className="upload-message">{uploadMessage}</Typography>}
 

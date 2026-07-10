@@ -1,0 +1,108 @@
+{
+  "_meta": {
+    "snapshot_source": "manual_bootstrap",
+    "snapshot_date": "2026-07-10",
+    "snapshot_version": "0.1.0-bootstrap",
+    "gvp_source_url": "https://volcano.si.edu/list_volcano_holocene.cfm",
+    "records_count": 8,
+    "notes": "Bootstrap snapshot with the 8 benchmark volcanoes to unblock Sett 3-4 end-to-end tests. To be replaced by the full GVP Holocene snapshot via scripts/gvp_snapshot_ingest.py. Records with type_verified=false must be confirmed against the real GVP export before being used in the paper benchmark (Sett 5-8)."
+  },
+  "records": [
+    {
+      "vnum": "233020",
+      "name": "Piton de la Fournaise",
+      "primary_volcano_type": "Shield",
+      "country": "France",
+      "region": "Indian Ocean",
+      "subregion": "R\u00e9union",
+      "latitude": -21.244,
+      "longitude": 55.708,
+      "elevation_m": 2632,
+      "type_verified": true
+    },
+    {
+      "vnum": "221080",
+      "name": "Erta Ale",
+      "primary_volcano_type": "Shield",
+      "country": "Ethiopia",
+      "region": "Africa (NE)",
+      "subregion": "Ethiopia",
+      "latitude": 13.6,
+      "longitude": 40.67,
+      "elevation_m": 613,
+      "type_verified": true
+    },
+    {
+      "vnum": "223030",
+      "name": "Nyiragongo",
+      "primary_volcano_type": "Stratovolcano",
+      "country": "DR Congo",
+      "region": "Africa (C)",
+      "subregion": "Africa (C)",
+      "latitude": -1.52,
+      "longitude": 29.25,
+      "elevation_m": 3470,
+      "type_verified": false
+    },
+    {
+      "vnum": "311290",
+      "name": "Okmok",
+      "primary_volcano_type": "Caldera",
+      "country": "United States",
+      "region": "Aleutian Islands",
+      "subregion": "Fox Islands",
+      "latitude": 53.43,
+      "longitude": -168.13,
+      "elevation_m": 1073,
+      "type_verified": true
+    },
+    {
+      "vnum": "358041",
+      "name": "Chait\u00e9n",
+      "primary_volcano_type": "Caldera",
+      "country": "Chile",
+      "region": "South America",
+      "subregion": "Chile-Southern",
+      "latitude": -42.833,
+      "longitude": -72.646,
+      "elevation_m": 1122,
+      "type_verified": false
+    },
+    {
+      "vnum": "268060",
+      "name": "Banda Api",
+      "primary_volcano_type": "Caldera",
+      "country": "Indonesia",
+      "region": "Indonesia",
+      "subregion": "Banda Sea",
+      "latitude": -4.525,
+      "longitude": 129.871,
+      "elevation_m": 640,
+      "type_verified": false
+    },
+    {
+      "vnum": "221270",
+      "name": "Fentale",
+      "primary_volcano_type": "Stratovolcano",
+      "country": "Ethiopia",
+      "region": "Africa (NE)",
+      "subregion": "Ethiopia",
+      "latitude": 8.975,
+      "longitude": 39.93,
+      "elevation_m": 2007,
+      "type_verified": false
+    },
+    {
+      "vnum": "327010",
+      "name": "Valles",
+      "primary_volcano_type": "Caldera",
+      "country": "United States",
+      "region": "US-New Mexico",
+      "subregion": "US-New Mexico",
+      "latitude": 35.87,
+      "longitude": -106.57,
+      "elevation_m": 3430,
+      "type_verified": true
+    }
+  ]
+}

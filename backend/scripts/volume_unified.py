@@ -132,7 +132,92 @@ def _normalize_base_profile(v: str) -> str:
         return "island"
     if s in ("continental", "complex", "complex_base"):
         return "continental"
+    if s in ("shield",):
+        return "shield"
     return s or "continental"
+
+
+# -------------------- GVP-informed preset selection (Week 1-2) --------------------
+# Maps GVP primary volcano type -> (base_preset, rim_preset).
+# Rationale and per-parameter motivation: see gvp_profile_mapping.md.
+# Retro-compatible: when GVP_TYPE is absent or unknown, falls back to the
+# legacy behaviour driven by BASE_PROFILE.
+_GVP_TYPE_TO_PRESETS: Dict[str, Tuple[str, str]] = {
+    # Shield-class edifices: island-style base contour, dedicated shield rim preset
+    "shield":            ("island", "shield"),
+    "shields":           ("island", "shield"),
+    "shield volcano":    ("island", "shield"),
+    "shield volcanoes":  ("island", "shield"),
+    # Continental / stratovolcano / complex / caldera family
+    "caldera":           ("continental", "continental"),
+    "calderas":          ("continental", "continental"),
+    "stratovolcano":     ("continental", "continental"),
+    "stratovolcanoes":   ("continental", "continental"),
+    "stratovolcanos":    ("continental", "continental"),
+    "complex":           ("continental", "continental"),
+    "complex volcano":   ("continental", "continental"),
+    "compound":          ("continental", "continental"),
+    "compound volcano":  ("continental", "continental"),
+    "somma":             ("continental", "continental"),
+    "somma volcano":     ("continental", "continental"),
+    # Small isolated edifices
+    "pyroclastic cone":   ("island", "island"),
+    "pyroclastic cones":  ("island", "island"),
+    "tuff cone":          ("island", "island"),
+    "tuff cones":         ("island", "island"),
+    "lava dome":          ("island", "island"),
+    "lava domes":         ("island", "island"),
+    "maar":               ("island", "island"),
+    "maars":              ("island", "island"),
+}
+
+
+def _normalize_gvp_type(v: str) -> str:
+    """Lowercase/strip; strip trailing parenthesised suffix like 'Shield(s)'."""
+    s = str(v or "").strip().lower()
+    # Handle GVP thesaurus style 'shield(s)' -> 'shield'
+    if s.endswith("(s)"):
+        s = s[:-3].strip()
+    return s
+
+
+def resolve_presets(
+    base_profile_env: str,
+    gvp_type: Optional[str] = None,
+) -> Tuple[str, str, Dict[str, Any]]:
+    """
+    Resolve (base_preset, rim_preset) given the legacy BASE_PROFILE env value
+    and an optional GVP primary type.
+
+    Returns (base_preset, rim_preset, source_debug) where source_debug records
+    how the choice was made — this ends up in metrics.json for traceability.
+    """
+    legacy_bp = _normalize_base_profile(base_profile_env)
+    gvp_norm = _normalize_gvp_type(gvp_type) if gvp_type else ""
+
+    if gvp_norm and gvp_norm in _GVP_TYPE_TO_PRESETS:
+        base_preset, rim_preset = _GVP_TYPE_TO_PRESETS[gvp_norm]
+        source = {
+            "preset_source": "gvp_mapping",
+            "gvp_type_raw": str(gvp_type),
+            "gvp_type_normalized": gvp_norm,
+            "base_preset": base_preset,
+            "rim_preset": rim_preset,
+            "base_profile_env": legacy_bp,
+        }
+        return base_preset, rim_preset, source
+
+    # Fallback: legacy behaviour — base and rim both driven by BASE_PROFILE
+    source = {
+        "preset_source": "base_profile_env",
+        "gvp_type_raw": str(gvp_type) if gvp_type else "",
+        "gvp_type_normalized": gvp_norm,
+        "base_preset": legacy_bp,
+        "rim_preset": legacy_bp,
+        "base_profile_env": legacy_bp,
+        "reason": "gvp_type_absent" if not gvp_norm else "gvp_type_unknown",
+    }
+    return legacy_bp, legacy_bp, source
 
 
 # -------------------- logging --------------------
@@ -733,6 +818,29 @@ def find_caldera_contour_morphological(
             "post_fill_holes": True,
             "center_mode": "centroid",
         }
+    elif bp == "shield":
+        # Shield preset (Week 1-2 initial values, to be validated against
+        # ground truth in Week 7-8). See gvp_profile_mapping.md for rationale.
+        # Design goal: summit calderas on shield edifices — compact, steep,
+        # small relative to the edifice, sometimes without a true central
+        # depression.
+        cfg = {
+            "roi_dilate_px": 3,               # tight ROI: rim is at summit, not on flanks
+            "smooth_sigma": 1.2,
+            "slope_q": 93.0,                  # very selective: avoid flank slope breaks
+            "min_component_px": 200,          # allow small components
+            "min_area_frac": 0.005,
+            "closing_iterations": 3,
+            "extra_dilate_px": 1,
+            "max_area_frac": 0.15,            # shield calderas small vs edifice
+            "inner_buffer_px": 6,
+            "center_bias_weight": 15.0,
+            "overlap_mode": "reward_inner",
+            "post_close_iterations": 2,
+            "post_fill_holes": True,
+            "center_mode": "adaptive",        # switch to centroid if depression is unreliable
+            "dep_to_centroid_max_px": 12.0,   # tight: reject depressions far from centroid
+        }
     else:
         cfg = {
             "roi_dilate_px": 8,
@@ -1310,8 +1418,15 @@ def run_unified(
     base_profile: str,
     caldera_contour_override: Optional[np.ndarray] = None,
     rim_source: str = "auto",
+    rim_preset: Optional[str] = None,
 ) -> Dict[str, Any]:
     nodata = meta.get("nodata", None)
+
+    # rim_preset defaults to base_profile for full backward compatibility.
+    # When the GVP mapping produces different presets for base and rim
+    # (e.g. Shield -> base=island, rim=shield), the caller passes rim_preset
+    # explicitly.
+    effective_rim_preset = rim_preset if rim_preset else base_profile
 
     base_contour, base_dbg = select_base_contour(dem, transform, nodata=nodata, base_profile=base_profile)
     slope = calculate_slope(dem)
@@ -1329,7 +1444,7 @@ def run_unified(
             base_contour=base_contour,
             transform=transform,
             nodata=nodata,
-            preset=base_profile,
+            preset=effective_rim_preset,
         )
 
     base_p1, base_p2 = find_opposite_points(base_contour)
@@ -1424,7 +1539,29 @@ def main() -> int:
     process_id = _resolve_process_id()
     proc_dir = _ensure_proc_dir(process_id)
 
-    base_profile = _normalize_base_profile(os.environ.get("BASE_PROFILE") or os.environ.get("BASE_SCENARIO") or "")
+    base_profile_env = os.environ.get("BASE_PROFILE") or os.environ.get("BASE_SCENARIO") or ""
+    gvp_type_env = os.environ.get("GVP_TYPE") or ""
+
+    # Week 1-2: GVP-informed preset selection.
+    # If GVP_TYPE is set and recognised, base_preset and rim_preset are
+    # derived from the mapping in _GVP_TYPE_TO_PRESETS. Otherwise both fall
+    # back to the legacy BASE_PROFILE behaviour (byte-identical to pre-patch).
+    base_preset, rim_preset, preset_source_dbg = resolve_presets(
+        base_profile_env=base_profile_env,
+        gvp_type=gvp_type_env,
+    )
+
+    # Keep the legacy `base_profile` variable name in scope: it drives the
+    # module_key naming and metrics.json fields already consumed by the UI.
+    # Semantically it now means "base contour preset".
+    base_profile = base_preset
+
+    _log(
+        f"preset resolution: source={preset_source_dbg['preset_source']} "
+        f"base={base_preset} rim={rim_preset} "
+        f"gvp_type='{gvp_type_env}' base_profile_env='{base_profile_env}'"
+    )
+
     module_key = (os.environ.get("MODULE_KEY") or "").strip()
     if not module_key:
         module_key = f"unified_{base_profile}"
@@ -1454,6 +1591,7 @@ def main() -> int:
         "bounds": list(bounds_tuple),
         "original_file_name": os.environ.get("ORIGINAL_FILE_NAME") or str(Path(cli_dem).name),
         "original_file_stem": os.environ.get("ORIGINAL_FILE_STEM") or (cli_stem or Path(cli_dem).stem),
+        "preset_selection": preset_source_dbg,
     }
 
     rim_source: str = "auto"
@@ -1486,6 +1624,7 @@ def main() -> int:
         base_profile=base_profile,
         caldera_contour_override=caldera_contour_override,
         rim_source=rim_source,
+        rim_preset=rim_preset,
     )
 
     auto_rim_path = proc_dir / "caldera_rim_auto.geojson"

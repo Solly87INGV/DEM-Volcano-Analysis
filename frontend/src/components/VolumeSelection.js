@@ -1,5 +1,5 @@
 // VolumeSelection.js
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Box, Typography, Button, IconButton, CircularProgress, Divider } from '@mui/material';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import AssessmentIcon from '@mui/icons-material/Assessment';
@@ -32,6 +32,36 @@ const VolumeSelection = ({
   // ⏱️ timing
   const [calcWallMs, setCalcWallMs] = useState(null);
   const [serverPhasesCalc, setServerPhasesCalc] = useState(null);
+
+  // Sett 3-4: GVP context propagated from step 1 (read-only badge).
+  const [gvpContext, setGvpContext] = useState(null);
+
+  useEffect(() => {
+    const pid = processId || localStorage.getItem('lastProcessId');
+    if (!pid) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch(`${API_BASE}/outputs/${pid}/meta.json`, { cache: 'no-store' });
+        if (!r.ok) return;
+        const meta = await r.json();
+        if (cancelled) return;
+        if (meta && (meta.vnum || meta.gvp_type)) {
+          setGvpContext({
+            vnum: String(meta.vnum || ''),
+            gvp_type: String(meta.gvp_type || ''),
+            gvp_name: String(meta.gvp_name || ''),
+            gvp_resolution: String(meta.gvp_resolution || ''),
+          });
+        }
+      } catch {
+        /* silent: meta.json may not exist yet */
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [processId]);
 
   const manifestImages = useMemo(() => {
     const imgs = manifest?.images || [];
@@ -96,6 +126,12 @@ const VolumeSelection = ({
 
     const pidFromProp = processId || localStorage.getItem('lastProcessId');
     if (pidFromProp) formData.append('processId', String(pidFromProp));
+
+    // Sett 3-4: propagate vnum for idempotency. Backend also falls back to
+    // meta.json, so this is belt-and-suspenders — never harmful.
+    if (gvpContext && gvpContext.vnum) {
+      formData.append('vnum', gvpContext.vnum);
+    }
 
     try {
       const t0 = performance.now();
@@ -203,6 +239,31 @@ const VolumeSelection = ({
   return (
     <Box className="volume-selection-container">
       <Typography variant="h5" className="success-message">First processing successful</Typography>
+
+      {gvpContext && (
+        <Box
+          className="gvp-context-badge"
+          sx={{
+            mx: 'auto', mt: 1, mb: 1,
+            px: 2, py: 1,
+            maxWidth: 640,
+            border: '1px solid #cfd8dc',
+            borderRadius: 1,
+            background: '#f5faff',
+            textAlign: 'left',
+          }}
+        >
+          <Typography variant="body2">
+            <b>GVP context:</b>{' '}
+            {gvpContext.gvp_name || '(unnamed)'}{' '}
+            (vnum <code>{gvpContext.vnum || '-'}</code>
+            {gvpContext.gvp_type ? <>, type <code>{gvpContext.gvp_type}</code></> : null})
+            {gvpContext.gvp_resolution && gvpContext.gvp_resolution !== 'resolved' ? (
+              <> — <i>{gvpContext.gvp_resolution}</i></>
+            ) : null}
+          </Typography>
+        </Box>
+      )}
 
       <Typography variant="h6" className="instruction-message">
         {instructionText}

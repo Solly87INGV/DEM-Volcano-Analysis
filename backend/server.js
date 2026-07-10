@@ -15,6 +15,15 @@ try {
   // dotenv not installed or not wanted -> ok
 }
 
+// ---------------------------
+// GVP client (Sett 3-4)
+// ---------------------------
+const gvpClient = require('./gvp/client');
+const gvpDatasetPath = process.env.GVP_DATASET_PATH
+  ? path.resolve(process.env.GVP_DATASET_PATH)
+  : path.join(__dirname, 'data', 'gvp_holocene.json');
+gvpClient.loadGvpDataset(gvpDatasetPath);
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -163,6 +172,62 @@ function deriveUnifiedModuleKey(baseProfile) {
   const bp = normalizeBaseProfile(baseProfile);
   if (bp === 'island' || bp === 'continental') return `unified_${bp}`;
   return 'unified';
+}
+
+// ---------------------------
+// GVP helpers (Sett 3-4)
+// ---------------------------
+// Extract a raw vnum from either the request body (form-data) or the
+// meta.json already written by a previous step. Returns a trimmed string
+// or '' if not set. The body takes priority so that a run can override
+// what was previously stored in meta.
+function extractVnum(req, procDir) {
+  const rawFromBody =
+    (req && req.body && req.body.vnum != null) ? String(req.body.vnum).trim() : '';
+  if (rawFromBody) return rawFromBody;
+
+  try {
+    const metaPath = path.join(procDir, 'meta.json');
+    if (fs.existsSync(metaPath)) {
+      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+      if (meta && meta.vnum != null) {
+        const v = String(meta.vnum).trim();
+        if (v) return v;
+      }
+    }
+  } catch {
+    // fall through
+  }
+  return '';
+}
+
+// Resolve vnum -> { record, gvp_type, gvp_type_env, resolution } for logging
+// and to build the GVP_TYPE env var passed to Python. Never throws.
+function resolveVnumForRun(vnum) {
+  const raw = String(vnum || '').trim();
+  const out = {
+    vnum: raw,
+    record: null,
+    gvp_type: '',        // raw type string, e.g. "Shield"
+    gvp_type_env: '',    // exact string to feed as GVP_TYPE (raw, not normalized)
+    resolution: 'none',
+    preset_hint: null,   // { matched, base_preset, rim_preset, reason }
+  };
+  if (!raw) return out;
+
+  const rec = gvpClient.resolveByVnum(raw);
+  if (!rec) {
+    out.resolution = 'vnum_not_found';
+    return out;
+  }
+  out.record = rec;
+  out.gvp_type = String(rec.primary_volcano_type || '');
+  out.gvp_type_env = out.gvp_type;
+  out.preset_hint = gvpClient.resolvePresetsForType(out.gvp_type);
+  out.resolution = out.preset_hint && out.preset_hint.matched
+    ? 'resolved'
+    : 'type_unmapped';
+  return out;
 }
 
 // write meta.json (report titles / traceability)
@@ -364,12 +429,29 @@ app.post('/process', upload.single('demFile'), (req, res) => {
   const procDir = path.join(outputsDir, processId);
   const inputDemName = file?.originalname ? String(file.originalname) : (originalFileNameRaw || `${processId}.tif`);
 
+  // Sett 3-4: capture vnum on step 1 (optional) so that step 2 can retrieve
+  // it from meta.json without re-entry.
+  const vnumRaw = req.body.vnum != null ? String(req.body.vnum).trim() : '';
+  const gvpRes = resolveVnumForRun(vnumRaw);
+  if (vnumRaw) {
+    console.log(
+      `[GVP] /process pid=${processId} vnum=${vnumRaw} ` +
+      `resolution=${gvpRes.resolution} type='${gvpRes.gvp_type}'`
+    );
+  }
+
   writeProcessMeta(procDir, {
     input_dem_name: inputDemName,
     original_file_stem: String(originalFileStem || ''),
     processId: String(processId || ''),
     step: 'complete_dem_analysis',
     updated_at: new Date().toISOString(),
+    // GVP fields — always written (empty strings when absent) so downstream
+    // code can rely on the schema.
+    vnum: gvpRes.vnum,
+    gvp_type: gvpRes.gvp_type,
+    gvp_resolution: gvpRes.resolution,
+    gvp_name: gvpRes.record ? String(gvpRes.record.name || '') : '',
   });
 
   const absFilePath = path.resolve(file.path);
@@ -382,6 +464,9 @@ app.post('/process', upload.single('demFile'), (req, res) => {
       ORIGINAL_FILE_STEM: originalFileStem,
       UPLOADS_DIR: uploadsDir,
       OUTPUTS_DIR: outputsDir,
+      // GVP_TYPE is currently only consumed by volume_unified.py in step 2;
+      // exporting it here too is harmless and keeps the two steps symmetric.
+      GVP_TYPE: gvpRes.gvp_type_env,
     },
   });
 
@@ -482,6 +567,15 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
 
   const moduleKey = deriveUnifiedModuleKey(baseProfile);
 
+  // Sett 3-4: resolve vnum. Body takes priority over meta.json (idempotency).
+  const gvpRes = resolveVnumForRun(extractVnum(req, procDir));
+  if (gvpRes.vnum) {
+    console.log(
+      `[GVP] /calculateVolume pid=${processId} vnum=${gvpRes.vnum} ` +
+      `resolution=${gvpRes.resolution} type='${gvpRes.gvp_type}'`
+    );
+  }
+
   writeProcessMeta(procDir, {
     input_dem_name: (demInputPath === demWorkingPath) ? 'dem_working.tif' : (file?.originalname || originalFileNameRaw || `${processId}.tif`),
     original_file_stem: String(originalFileStem || ''),
@@ -495,6 +589,10 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
     rim_file: rimFile,
     step: 'calculate_volume',
     updated_at: new Date().toISOString(),
+    vnum: gvpRes.vnum,
+    gvp_type: gvpRes.gvp_type,
+    gvp_resolution: gvpRes.resolution,
+    gvp_name: gvpRes.record ? String(gvpRes.record.name || '') : '',
   });
 
   const scriptPath = path.join(__dirname, 'scripts', 'volume_unified.py');
@@ -523,6 +621,11 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
       USE_EDITED_RIM: hasEditedRim ? '1' : '0',
       RIM_PATH: hasEditedRim ? editedRimPath : '',
       RIM_SOURCE: rimSource,
+
+      // GVP-informed preset selection (see gvp_profile_mapping.md).
+      // Raw GVP type string; volume_unified.py normalizes it internally.
+      // Empty string preserves the pre-patch retrocompatibility path.
+      GVP_TYPE: gvpRes.gvp_type_env,
     },
   });
 
@@ -847,6 +950,52 @@ app.get('/api/report/:processId', (req, res) => {
 });
 
 // ---------------------------
+// GVP API (Sett 3-4)
+// GET /api/gvp/status         -> loader status
+// GET /api/gvp/search?q=...   -> up to 10 name matches
+// GET /api/gvp/:vnum          -> record + preset hint
+// ---------------------------
+app.get('/api/gvp/status', (req, res) => {
+  return res.json(gvpClient.getStatus());
+});
+
+app.get('/api/gvp/search', (req, res) => {
+  const q = String(req.query.q || '').trim();
+  const limit = Number(req.query.limit) || 10;
+  if (!q) return res.json({ query: q, results: [] });
+  const results = gvpClient.searchByName(q, limit);
+  return res.json({ query: q, limit, count: results.length, results });
+});
+
+app.get('/api/gvp/:vnum', (req, res) => {
+  const vnum = String(req.params.vnum || '').trim();
+  if (!vnum) return res.status(400).json({ error: 'Missing vnum' });
+
+  const rec = gvpClient.resolveByVnum(vnum);
+  if (!rec) {
+    return res.status(404).json({
+      error: 'vnum not found in GVP snapshot',
+      vnum,
+      hint: 'Verify the volcano number on https://volcano.si.edu/ or refresh the snapshot.',
+    });
+  }
+  const hint = gvpClient.resolvePresetsForType(rec.primary_volcano_type);
+  return res.json({
+    vnum: rec.vnum,
+    name: rec.name,
+    primary_volcano_type: rec.primary_volcano_type,
+    country: rec.country || '',
+    region: rec.region || '',
+    subregion: rec.subregion || '',
+    latitude: rec.latitude,
+    longitude: rec.longitude,
+    elevation_m: rec.elevation_m,
+    type_verified: rec.type_verified === true,
+    preset_hint: hint,
+  });
+});
+
+// ---------------------------
 // Other legacy endpoints (kept)
 // ---------------------------
 app.post('/shadedRelief', upload.single('demFile'), (req, res) => {
@@ -916,6 +1065,7 @@ if (frontendBuildDir && fs.existsSync(frontendBuildDir)) {
       req.path.startsWith('/api/report') ||
       req.path.startsWith('/api/metrics') ||
       req.path.startsWith('/api/rim') ||
+      req.path.startsWith('/api/gvp') ||
       req.path.startsWith('/health')
     ) {
       return next();
