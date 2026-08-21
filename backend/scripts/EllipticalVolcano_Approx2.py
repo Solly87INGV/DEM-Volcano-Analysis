@@ -333,9 +333,9 @@ def run_volume_analysis(
     v = (1/3) * np.pi * h_max * (R1**2 + R2**2 + R1 * R2)
     v_km3 = float(v * 1e-9)
 
-    # Caldera (Approx2: come nel tuo originale in questo file)
+    # Caldera (Approx2: cilindro a base ellittica; base = area del contorno caldera, altezza = span/2)
     r_caldera_km = float(R2 * 1e-3)
-    v_caldera = float((2/3) * np.pi * (area_caldera_km2 / np.pi) * (distance_caldera_km / 2.0))
+    v_caldera = float(area_caldera_km2 * (distance_caldera_km / 2.0))
 
     v_volcano = float(v_km3 - v_caldera)
 
