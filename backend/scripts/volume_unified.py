@@ -497,8 +497,24 @@ def write_dem_preview(
     preview_norm = np.zeros_like(preview, dtype=float)
     preview_norm[valid_p] = np.clip((preview[valid_p] - vmin) / (vmax - vmin), 0.0, 1.0)
 
+    # Hillshade (shaded relief) come sfondo della preview: molto piu' leggibile
+    # del grigio piatto di quota per riconoscere i bordi della caldera
+    # (feedback Federico 2026-09-10). Puramente cosmetico: NON tocca preview_norm,
+    # vmin/vmax, bounds o il JSON — cambia solo i pixel del PNG.
+    az_rad = np.deg2rad(315.0)   # azimuth luce da NW (convenzione cartografica)
+    alt_rad = np.deg2rad(45.0)   # altitudine luce
+    fill_val = float(np.nanmin(preview[valid_p]))
+    dem_filled = np.where(valid_p, preview, fill_val).astype(float)
+    dy, dx = np.gradient(dem_filled)
+    slope = np.pi / 2.0 - np.arctan(np.hypot(dx, dy))
+    aspect = np.arctan2(-dx, dy)
+    hs = (np.sin(alt_rad) * np.sin(slope) +
+          np.cos(alt_rad) * np.cos(slope) * np.cos(az_rad - aspect))
+    hs = np.clip(hs, 0.0, 1.0)
+    hs[~valid_p] = 0.0
+
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    plt.imsave(str(out_png), preview_norm, cmap="gray", vmin=0.0, vmax=1.0)
+    plt.imsave(str(out_png), hs, cmap="gray", vmin=0.0, vmax=1.0)
 
     bounds_wgs84 = _bounds_to_wgs84(bounds_tuple, src_crs)
     meta = {
@@ -2472,7 +2488,25 @@ def find_opposite_slope_points(slope: np.ndarray, contour: np.ndarray) -> Tuple[
     p2 = (int(c[idx2, 0]), int(c[idx2, 1]))
     return p1, p2
 
-
+def _hillshade_for_doublet(dem: np.ndarray, azimuth: float = 315.0, altitude: float = 45.0) -> np.ndarray:
+    """Hillshade normalizzato 0..1 per lo sfondo del doublet. Puramente
+    cosmetico: non entra in nessun calcolo morfometrico/volumetrico."""
+    arr = np.asarray(dem, dtype=float)
+    valid = np.isfinite(arr)
+    if not np.any(valid):
+        return np.zeros_like(arr, dtype=float)
+    fill_val = float(np.nanmin(arr[valid]))
+    dem_filled = np.where(valid, arr, fill_val)
+    az_rad = np.deg2rad(azimuth)
+    alt_rad = np.deg2rad(altitude)
+    dy, dx = np.gradient(dem_filled)
+    slope = np.pi / 2.0 - np.arctan(np.hypot(dx, dy))
+    aspect = np.arctan2(-dx, dy)
+    hs = (np.sin(alt_rad) * np.sin(slope) +
+          np.cos(alt_rad) * np.cos(slope) * np.cos(az_rad - aspect))
+    hs = np.clip(hs, 0.0, 1.0)
+    hs[~valid] = 0.0
+    return hs
 # -------------------- outputs: PNG doublet --------------------
 def save_final_doublet_png(
     dem: np.ndarray,
@@ -2491,7 +2525,9 @@ def save_final_doublet_png(
     gs = gridspec.GridSpec(1, 3, figure=fig, width_ratios=[1.0, 0.08, 1.0], wspace=0.15)
 
     ax1 = fig.add_subplot(gs[0, 0])
-    im1 = ax1.imshow(dem, cmap="terrain", origin="upper", interpolation="nearest", resample=False)
+    _hs1 = _hillshade_for_doublet(dem)
+    ax1.imshow(_hs1, cmap="gray", origin="upper", interpolation="nearest", resample=False, vmin=0.0, vmax=1.0)
+    im1 = ax1.imshow(dem, cmap="terrain", origin="upper", interpolation="nearest", resample=False, alpha=0.5)
     ax1.plot(base_contour[:, 1], base_contour[:, 0], "w-", linewidth=1)
     ax1.plot(base_p1[1], base_p1[0], "ro", markersize=8)
     ax1.plot(base_p2[1], base_p2[0], "yo", markersize=8)
@@ -2506,7 +2542,9 @@ def save_final_doublet_png(
     ax_sp.axis("off")
 
     ax2 = fig.add_subplot(gs[0, 2])
-    im2 = ax2.imshow(dem, cmap="terrain", origin="upper", interpolation="nearest", resample=False)
+    _hs2 = _hillshade_for_doublet(dem)
+    ax2.imshow(_hs2, cmap="gray", origin="upper", interpolation="nearest", resample=False, vmin=0.0, vmax=1.0)
+    im2 = ax2.imshow(dem, cmap="terrain", origin="upper", interpolation="nearest", resample=False, alpha=0.5)
     caldera_plot = np.vstack([caldera_contour, caldera_contour[0]])
     ax2.plot(caldera_plot[:, 1], caldera_plot[:, 0], "b-", linewidth=1)
     ax2.plot(cal_p1[1], cal_p1[0], "ro", markersize=8)
