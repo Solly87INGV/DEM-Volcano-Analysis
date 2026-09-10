@@ -1,9 +1,8 @@
 // VolumeSelection.js
 import React, { useEffect, useMemo, useState } from 'react';
-import { Box, Typography, Button, IconButton, CircularProgress, Divider } from '@mui/material';
+import { Box, Typography, Button, CircularProgress, Divider } from '@mui/material';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import AssessmentIcon from '@mui/icons-material/Assessment';
-import CardSelection from './CardSelection';
 import axios from 'axios';
 import './VolumeSelection.css';
 
@@ -19,8 +18,6 @@ const VolumeSelection = ({
   setStep,        // ✅ NEW (from App wrapper)
   setVolumeRun,   // ✅ NEW (from App)
 }) => {
-  // ✅ MorphoVolc 2.0: only scenario selection
-  const [baseScenario, setBaseScenario] = useState(''); // island | continental
   const [isLoading, setIsLoading] = useState(false);
 
   // output UI (kept for debug, but we won't render inline anymore)
@@ -84,17 +81,6 @@ const VolumeSelection = ({
     setServerPhasesCalc(null);
   };
 
-  const handleScenarioSelect = (scenario) => {
-    setBaseScenario(scenario);
-    resetOutputs();
-  };
-
-  // ✅ Reset selections on this screen
-  const handleReset = () => {
-    setBaseScenario('');
-    resetOutputs();
-  };
-
   async function fetchJsonOrNull(url) {
     try {
       const r = await fetch(url, { cache: 'no-store' });
@@ -114,9 +100,6 @@ const VolumeSelection = ({
     // Keep demFile upload for backward compatibility.
     // Server will prefer dem_working.tif in OUTPUTS_DIR/<processId>/ when present.
     if (demFile) formData.append('demFile', demFile);
-
-    // ✅ MorphoVolc 2.0: only baseProfile is required for unified model
-    formData.append('baseProfile', baseScenario);
 
     const originalFileName =
       (demFile && demFile.name) ||
@@ -176,7 +159,7 @@ const VolumeSelection = ({
       }
 
       // moduleKey fallback (unified)
-      const fallbackModuleKey = `unified_${baseScenario || 'unknown'}`;
+      const fallbackModuleKey = 'unified';
 
       // costruisci payload compatibile con VolumeResultsViewer
       const run = {
@@ -185,7 +168,7 @@ const VolumeSelection = ({
         moduleKey: response?.data?.moduleKey || vr?.moduleKey || fallbackModuleKey,
         result: vr?.result || response?.data?.result || null,
         images: vr?.images || response?.data?.images || [],
-        selection: { baseScenario }, // keep only what exists in 2.0 UI
+        selection: {},
       };
 
       if (setVolumeRun) setVolumeRun(run);
@@ -229,12 +212,9 @@ const VolumeSelection = ({
   // ✅ inline results OFF: questa schermata deve solo selezionare e lanciare il run
   const SHOW_INLINE_RESULTS = false;
 
-  const instructionText = useMemo(() => {
-    if (!baseScenario) return "Choose volcano scenario";
-    return "Ready to calculate volume";
-  }, [baseScenario]);
+  const instructionText = "Ready to calculate volume";
 
-  const canCalculate = Boolean(baseScenario && !isLoading);
+  const canCalculate = !isLoading;
 
   return (
     <Box className="volume-selection-container">
@@ -268,33 +248,6 @@ const VolumeSelection = ({
       <Typography variant="h6" className="instruction-message">
         {instructionText}
       </Typography>
-
-      {/* Optional: reset arrow (clears selections) */}
-      {baseScenario && (
-        <IconButton onClick={handleReset} className="back-arrow" aria-label="Reset selections">
-          <ArrowBackIcon />
-        </IconButton>
-      )}
-
-      {/* ===== SCENARIO (2 cards) ===== */}
-      <Box className="main-layout">
-        <Box className="card-container">
-          <CardSelection
-            title="Island volcano (simple base)"
-            description="Recommended when the edifice is isolated and the base contour is clear (e.g., island volcanoes)."
-            onClick={() => handleScenarioSelect('island')}
-            imageSrc="/images/IslandBase.png"
-            isSelected={baseScenario === 'island'}
-          />
-          <CardSelection
-            title="Continental volcano (complex base)"
-            description="Recommended when the edifice merges with surrounding topography and the base contour is ambiguous."
-            onClick={() => handleScenarioSelect('continental')}
-            imageSrc="/images/ContinentalBase.png"
-            isSelected={baseScenario === 'continental'}
-          />
-        </Box>
-      </Box>
 
       {/* ===== ACTIONS ===== */}
       <Box className="button-group" sx={{ mt: 2 }}>

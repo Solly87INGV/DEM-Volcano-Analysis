@@ -210,6 +210,8 @@ function resolveVnumForRun(vnum) {
     record: null,
     gvp_type: '',        // raw type string, e.g. "Shield"
     gvp_type_env: '',    // exact string to feed as GVP_TYPE (raw, not normalized)
+    gvp_lat: '',         // string for GVP_LAT env (empty if absent/invalid)
+    gvp_lon: '',         // string for GVP_LON env (empty if absent/invalid)
     resolution: 'none',
     preset_hint: null,   // { matched, base_preset, rim_preset, reason }
   };
@@ -223,6 +225,14 @@ function resolveVnumForRun(vnum) {
   out.record = rec;
   out.gvp_type = String(rec.primary_volcano_type || '');
   out.gvp_type_env = out.gvp_type;
+  // Approccio 3: expose GVP coordinates so they can be passed to Python as
+  // GVP_LAT/GVP_LON and used to anchor the caldera center (continental preset).
+  if (rec.latitude != null && Number.isFinite(Number(rec.latitude))) {
+    out.gvp_lat = String(Number(rec.latitude));
+  }
+  if (rec.longitude != null && Number.isFinite(Number(rec.longitude))) {
+    out.gvp_lon = String(Number(rec.longitude));
+  }
   out.preset_hint = gvpClient.resolvePresetsForType(out.gvp_type);
   out.resolution = out.preset_hint && out.preset_hint.matched
     ? 'resolved'
@@ -276,12 +286,29 @@ function patchVolumeResultsFile(procDir, moduleKey, baseProfile, rimSource = nul
   }
 }
 
-// metrics picker (unified: canonical names)
+// metrics picker (unified). I file ora si chiamano metrics_<stem>.json/csv
+// (naming col nome del vulcano, richiesta 2026-08-22). Si cerca prima il
+// nome canonico legacy (metrics.json/csv) per retrocompatibilita' con run
+// gia' presenti in cartella, poi il pattern metrics_*.<ext>. La cartella
+// contiene una sola run, quindi al piu' un file per estensione.
 function pickMetricsPath(procDir, ext /* 'csv'|'json' */) {
   try {
-    const wantedExt = String(ext || '').toLowerCase();
-    const p = path.join(procDir, wantedExt === 'csv' ? 'metrics.csv' : 'metrics.json');
-    return fs.existsSync(p) ? p : null;
+    const wantedExt = String(ext || '').toLowerCase() === 'csv' ? 'csv' : 'json';
+
+    // 1) nome legacy canonico
+    const legacy = path.join(procDir, `metrics.${wantedExt}`);
+    if (fs.existsSync(legacy)) return legacy;
+
+    // 2) nome col nome del vulcano: metrics_<stem>.<ext>
+    let entries = [];
+    try {
+      entries = fs.readdirSync(procDir);
+    } catch {
+      return null;
+    }
+    const re = new RegExp(`^metrics_.+\\.${wantedExt}$`, 'i');
+    const match = entries.find((f) => re.test(f));
+    return match ? path.join(procDir, match) : null;
   } catch {
     return null;
   }
@@ -467,6 +494,8 @@ app.post('/process', upload.single('demFile'), (req, res) => {
       // GVP_TYPE is currently only consumed by volume_unified.py in step 2;
       // exporting it here too is harmless and keeps the two steps symmetric.
       GVP_TYPE: gvpRes.gvp_type_env,
+      GVP_LAT: gvpRes.gvp_lat,
+      GVP_LON: gvpRes.gvp_lon,
     },
   });
 
@@ -518,17 +547,23 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
   const baseProfileRaw = req.body.baseProfile;
   const baseProfile = normalizeBaseProfile(baseProfileRaw);
 
+  // Unified GVP-driven workflow: baseProfile non è più una scelta manuale
+  // obbligatoria. Se arriva un valore island/continental valido (chiamante
+  // legacy) lo si onora; altrimenti si usa 'continental' come fallback
+  // conservativo. Questo default è deliberato e viene normalmente
+  // sovrascritto da GVP_TYPE dentro resolve_presets() quando il vnum
+  // risolve — vedi gvp_profile_mapping_v2.md.
+  const baseProfileEffective =
+    (baseProfile === 'island' || baseProfile === 'continental') ? baseProfile : 'continental';
+
   if (DEBUG_CALC) {
     console.log('[SERVER] /calculateVolume req:', {
       baseProfileRaw,
       baseProfile,
+      baseProfileEffective,
       processId: req.body.processId,
       hasFile: !!file,
     });
-  }
-
-  if (!baseProfile || (baseProfile !== 'island' && baseProfile !== 'continental')) {
-    return res.status(400).json({ error: 'Missing required field: baseProfile (island|continental).' });
   }
 
   const originalFileNameRaw =
@@ -565,7 +600,7 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
     });
   }
 
-  const moduleKey = deriveUnifiedModuleKey(baseProfile);
+  const moduleKey = deriveUnifiedModuleKey(baseProfileEffective);
 
   // Sett 3-4: resolve vnum. Body takes priority over meta.json (idempotency).
   const gvpRes = resolveVnumForRun(extractVnum(req, procDir));
@@ -581,7 +616,7 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
     original_file_stem: String(originalFileStem || ''),
     processId: String(processId || ''),
     moduleKey: String(moduleKey || ''),
-    baseProfile: String(baseProfile || ''),
+    baseProfile: String(baseProfileEffective || ''),
     volumeType: 'unified',
     approximationType: 'unified',
     dem_input_path: demInputPath ? String(demInputPath) : '',
@@ -613,7 +648,7 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
       OUTPUTS_DIR: outputsDir,
 
       MODULE_KEY: moduleKey,
-      BASE_PROFILE: baseProfile,
+      BASE_PROFILE: baseProfileEffective,
       VOLUME_TYPE: 'unified',
       APPROXIMATION_TYPE: 'unified',
       DEM_INPUT: demInputPath,
@@ -626,6 +661,8 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
       // Raw GVP type string; volume_unified.py normalizes it internally.
       // Empty string preserves the pre-patch retrocompatibility path.
       GVP_TYPE: gvpRes.gvp_type_env,
+      GVP_LAT: gvpRes.gvp_lat,
+      GVP_LON: gvpRes.gvp_lon,
     },
   });
 
@@ -654,7 +691,7 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
       return res.status(500).json({ error: 'Error calculating volume' });
     }
 
-    patchVolumeResultsFile(procDir, moduleKey, baseProfile, rimSource, rimFile);
+    patchVolumeResultsFile(procDir, moduleKey, baseProfileEffective, rimSource, rimFile);
 
     // Preferred: serve the on-disk truth
     try {
@@ -662,7 +699,7 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
       if (fs.existsSync(vrPath)) {
         const vr = JSON.parse(fs.readFileSync(vrPath, 'utf-8'));
         vr.moduleKey = moduleKey;
-        vr.baseProfile = baseProfile || '';
+        vr.baseProfile = baseProfileEffective || '';
         vr.rim_source = rimSource;
         vr.rim_file = rimFile;
         return res.json(vr);
@@ -675,7 +712,7 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
     try {
       const parsed = JSON.parse(resultData);
       parsed.moduleKey = moduleKey;
-      parsed.baseProfile = baseProfile || '';
+      parsed.baseProfile = baseProfileEffective || '';
       parsed.rim_source = rimSource;
       parsed.rim_file = rimFile;
       return res.json(parsed);
@@ -684,7 +721,7 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
         processId,
         status: 'completed',
         moduleKey,
-        baseProfile,
+        baseProfile: baseProfileEffective,
         rim_source: rimSource,
         rim_file: rimFile,
         result: resultData,

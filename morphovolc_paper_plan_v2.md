@@ -243,10 +243,109 @@ Banda Api: ambiguità di definizione tra caldera insulare storica e
 cratere sommitale attivo. Da discutere con Galetto prima che disegni la
 ground truth. Impatta anche Chaitén e casi analoghi (Miyakejima, Krakatau).
 
-Sett 3-4 — DA INIZIARE
-Deliverable target: modulo GVP client (fetch metadati da vnum, cache locale),
-estensione UploadForm con campo vnum, propagazione vnum → GVP_TYPE dal backend
-Node allo script Python. Run completo end-to-end senza docker exec manuale.
+Sett 3-4 — COMPLETATA (2026-07-11)
+Deliverable raggiunti: modulo GVP client (fetch metadati da vnum, cache
+locale, backend/gvp/client.js), estensione UploadForm.js con campo vnum
++ Verify, propagazione vnum → GVP_TYPE dal backend Node allo script Python
+(server.js, priorità body su meta.json). Deploy locale Docker completato
+(docker compose build && up -d, rebuild da zero — nessun container/immagine
+preesistente sulla macchina). Run end-to-end via endpoint HTTP reale
+(non docker exec manuale) sui 4 casi target:
+
+RunGVP_TYPEPreset risoltoEsitoPiton de la Fournaise (full pipeline
+/process → /calculateVolume, vnum ripreso da meta.json)Shieldbase=island,
+rim=shieldOK — base 162.38 km², caldera 1.77 km²Erta AleShieldbase=island,
+rim=shieldOK — numeri identici al test Sett 1-2 (caldera 32.66 km²,
+roi_px 974528)Banda ApiCalderabase=continental, rim=continentalOK —
+caldera 0.95 km², coerente con ambiguità morfologica notaChaiténCaldera
+base=continental, rim=continentalFAIL — ValueError: No rim component
+meets constraints. Mai prodotto metrics.json valido nemmeno in Sett 1-2.
+Aggiunto come quarto issue empirico parcheggiato (dettaglio in
+gvp_profile_mapping_v2.md §6bis e CLAUDE.md §5.3).
+
+Verdetto: meccanica GVP-informed preset selection via HTTP reale
+verificata su 3/4 casi target. Idempotenza vnum (body > meta.json)
+verificata su Piton (vnum non ripassato su /calculateVolume, ripreso
+correttamente da meta.json scritto da /process).
+
+Hotfix Sett 3-4 (eccezione mirata al §3.3, autorizzata 2026-07-11):
+`meta.preset_selection` non veniva mai scritto in metrics.json — il
+blocco di costruzione di `metrics["meta"]` in volume_unified.py
+(ex-righe 1668-1688) ricostruiva il dict `meta` da zero pescando solo
+un sottoinsieme di chiavi da quello originale, senza includere
+`preset_selection` prodotto da resolve_presets() a monte. Fix
+puramente additivo: una riga (`"preset_selection": meta.get(
+"preset_selection"),`) aggiunta al dict, nessuna riga rimossa/modificata.
+Diff mostrato e approvato dall'utente prima dell'applicazione. Rerun di
+verifica su Erta Ale: numeri identici bit-per-bit al run pre-fix
+(base_area_km2, caldera_area_km2, total_volume_km3, h_max_m,
+pixel_size_m tutti invariati); `preset_selection` ora presente e
+corretto in metrics.json.
+
+Sett 5-6 — IN CORSO
+
+Osservazione emersa (2026-08-03): il dataset GVP è stato aggiornato a
+12 vulcani di benchmark (snapshot_version 1.0.0-benchmark12,
+snapshot_date 2026-07-21, snapshot_source gvp_holocene_export +
+pleistocene_schede) — 4 record in più rispetto agli 8 documentati alla
+chiusura di Sett 3-4, inclusi Ambrym, Karthala, Lewotolok, Aniakchak,
+Puyehue-Cordon Caulle, Valles Caldera e Long Valley (quest'ultima,
+323822, caldera pleistocenica non presente nell'export Holocene).
+Nota anche: Okmok è Shield/Shield nel GVP reale, non Caldera come
+indicato nella vecchia tabella bootstrap.
+
+Hotfix Sett 5-6 (eccezione mirata al §3.3, autorizzata 2026-08-03):
+_normalize_gvp_type in volume_unified.py normalizzava solo il suffisso
+GVP thesaurus "(s)" (es. "Shield(s)" -> "shield"). Il nuovo record
+Ambrym ha primary_volcano_type = "Shield(pyroclastic)", non riconosciuto
+dalla normalizzazione esistente -> preset_hint.matched = false,
+reason = gvp_type_unknown, nonostante Ambrym sia morfologicamente uno
+shield. Fix: _normalize_gvp_type e il mirror normalizeGvpType in
+backend/gvp/client.js estesi per rimuovere qualsiasi contenuto tra
+parentesi tonde (non solo "(s)"), con collapse degli spazi multipli
+residui. Diff mostrato e approvato dall'utente prima dell'applicazione.
+Verifica di non-regressione: resolve_presets rieseguito sui 12 vulcani
+reali del benchmark (dentro il container, via docker cp + docker exec).
+11/12 preset invariati bit-per-bit; unico cambiamento Ambrym, da non
+mappato a base=island, rim=shield. Mirror JS verificato identico via
+resolvePresetsForType. Dettaglio completo in gvp_profile_mapping_v2.md
+§6bis. Nota: il fix è nel sorgente e copiato nel container in
+esecuzione per il test; va reso persistente con un
+docker compose build && up -d quando si vorrà bakerlo nell'immagine.
+
+Estensione Sett 5-6 (deroga a §3.3 di CLAUDE.md, apertura anticipata
+della finestra su `volume_unified.py`, autorizzata 2026-08-04):
+9 dei 12 casi di benchmark risultavano bloccati — 5 crash fatali in
+`find_caldera_contour_morphological` (Ambrym, Lewotolok, Aniakchak,
+Puyehue, Chaitén) e 2 volumi nulli silenziosi per base contour degenere
+in `select_base_contour` (Valles, Long Valley), diagnosticati in
+`MorphoVolc_diagnosi_detector.docx` (Marco, 4 agosto 2026). A differenza
+degli hotfix precedenti (una riga, un campo), questa è una deroga a
+scope più ampio ma a rischio dichiarato basso ("Livello 1 —
+Robustezza" del piano a 3 livelli del documento): i 4 raise fatali
+diventano esito gestito (partial + confidenza, o fallimento onesto),
+il fallback base continental viene validato contro geometria degenere,
+e `run_quality`/`run_issues` diventano campi additivi in metrics.json e
+volume_results.json. `status` resta invariato ("completed") per non
+rompere il gate `VolumeResultsViewer.js` su cui si appoggia la
+rifinitura manuale del rim (Valles/Long Valley, vedi §4
+dell'handoff). Livello 2 e 3 del documento di Marco (rim tratteggiato,
+analisi multi-criterio con curvatura) restano fuori scope, da discutere
+con Galetto. Il Monte Carlo di Sett 7-8 resta cantiere separato,
+invariato.
+Diff validato riga per riga con l'utente prima dell'applicazione,
+incluso conteggio diff sul file reale (148 righe aggiunte, 41 rimosse,
+20 hunk tutti confinati a select_base_contour,
+find_caldera_contour_morphological, run_unified, main()) e verifica
+sintattica (ast.parse) sul contenuto scritto su disco. Baseline "prima"
+catturato dai run esistenti (cartelle output Fernandina, okmok,
+Nyiragongo/77508125-...) prima di applicare la patch, per la
+non-regressione. Atteso per Nyiragongo: run_quality "degenerate" (già
+passa da continental_sweep_failed_fallback_longest, A_base=4253 m²,
+crop noto e parcheggiato — parked issue #2) con numeri identici a
+prima; non una regressione. Esito completo (non-regressione sui 3 casi
+buoni + rilancio dei 9 falliti) da aggiungere qui una volta applicato e
+testato.
 
 Parte D — Filosofia di lavoro (invariata)
 

@@ -60,13 +60,12 @@ const GVP_TYPE_TO_PRESETS = Object.freeze({
 
 /**
  * Mirror of Python _normalize_gvp_type():
- *   lower, strip, trim trailing "(s)".
+ *   lower, strip, remove any parenthesised qualifier (e.g. "(s)", "(pyroclastic)").
  */
 function normalizeGvpType(v) {
   let s = String(v == null ? '' : v).trim().toLowerCase();
-  if (s.endsWith('(s)')) {
-    s = s.slice(0, -3).trim();
-  }
+  s = s.replace(/\([^)]*\)/g, '');
+  s = s.replace(/\s+/g, ' ').trim();
   return s;
 }
 

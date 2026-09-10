@@ -141,7 +141,7 @@ resolve_presets).
 6bis. Osservazioni empiriche dai test di Sett 2
 Note operative dai primi run del benchmark, da tenere presenti quando arriveranno
 la ground truth (Sett 5-6) e l'ottimizzazione parametri (Sett 7-8).
-Erta Ale (Shield, run test_erta_ale_shield)
+Erta Ale (Shield, run test_erta_ale_shield) [ARCHIVIATO — riserva/caso limite, non caso attivo del benchmark a 12]
 
 Meccanica del preset shield: OK, attivato correttamente e senza fallback interni.
 Miglioramento vs baseline continental: presente ma marginale — rim leggermente
@@ -156,6 +156,12 @@ plausibili con un filtro più permissivo.
 Azione in Sett 7-8: per il preset shield valutare min_area_frac ∈ [0.0005, 0.002], oppure sostituire il vincolo relativo con un vincolo
 assoluto in pixel (indipendente dalla ROI). Da tunare su ground truth di
 almeno 4-5 shield.
+Status (confermato 2026-08-03): Erta Ale (221080) è tenuto
+deliberatamente fuori dal set principale del benchmark a 12 vulcani
+(riserva/caso limite by design, vedi CLAUDE.md §5 e §9) — non un record
+perso nel refresh dello snapshot. L'osservazione sopra resta valida e
+tornerà rilevante se Erta Ale verrà promosso nel set attivo, ma non è
+più un'issue bloccante per il lavoro Sett 5-8 sul benchmark a 12.
 
 Nyiragongo (Stratovolcano, run test_nyiragongo_stratovolcano)
 
@@ -175,7 +181,7 @@ Nota per il paper: questo caso è utile in Discussion come dimostrazione
 che il tipo GVP da solo non basta — serve anche una sanity check sul crop
 del DEM (per esempio: rapporto tra range di quota e vetta stimata).
 
-Banda Api (Caldera, run test_bandaapi_caldera)
+Banda Api (Caldera, run test_bandaapi_caldera) [ARCHIVIATO — riserva/caso limite, non caso attivo del benchmark a 12]
 
 Retrocompatibilità: OK, preset continental applicato invariato.
 Rim ragionevole ma frammentato (contour_len 287, 3 componenti candidate di
@@ -191,6 +197,60 @@ con lui quale delle due interpretazioni vogliamo che il rim rappresenti.
 La scelta impatta anche Chaitén e potenzialmente altri casi analoghi
 (Miyakejima, Krakatau...). Va documentata nel protocollo scritto del
 ground truth.
+Status (confermato 2026-08-03): Banda Api (268060) non è stato scelto
+come uno dei tre rappresentanti `island_complex` del benchmark a 12
+vulcani — quel ruolo è coperto da Ambrym, Karthala e Lewotolok (vedi
+CLAUDE.md §9). Scelta di selezione stratificata deliberata, non un
+record perso. L'ambiguità morfologica sopra resta un'osservazione
+valida e documentata, rilevante se Banda Api verrà reintegrato, ma non
+è più un'issue bloccante per l'annotazione ground truth di Sett 5-8 sul
+benchmark a 12. Resta comunque valida per Chaitén e i casi analoghi
+citati sopra, che sono nel set attivo.
+
+Chaitén (Caldera, run test_chaiten_caldera — osservazione Sett 3-4, 2026-07-11)
+
+Emerso durante il test end-to-end via endpoint HTTP reale (/calculateVolume,
+non docker exec) richiesto dal deliverable Sett 3-4, non durante Sett 1-2.
+Preset risolto correttamente: gvp_type=Caldera → base=continental,
+rim=continental (meccanica GVP-informed OK).
+Ma il preset continental fallisce sul DEM esistente:
+ValueError: No rim component meets constraints (find_caldera_contour_morphological).
+Non è una regressione Sett 3-4: la cartella test_chaiten_caldera esisteva già
+dal 7 luglio (Sett 1-2) con il solo dem_working.tif — non ha mai prodotto un
+metrics.json valido, nemmeno testata manualmente in Sett 1-2.
+Ipotesi da verificare in Sett 5-8, nessuna diagnosi approfondita fatta:
+crop del DEM insufficiente (analogo a Nyiragongo), mismatch tra tipo GVP
+assegnato e morfologia reale, o parametri del preset continental non adatti
+a questo edificio. type_verified: false nello snapshot — va confermato anche
+il tipo GVP stesso contro l'export reale prima di investigare i parametri.
+Non toccare volume_unified.py per questo caso fuori da Sett 5-8.
+
+Ambrym (Shield(pyroclastic), osservazione Sett 5-6, 2026-08-03)
+
+Emerso durante la verifica del nuovo snapshot dataset a 12 vulcani
+(1.0.0-benchmark12, 2026-07-21), che ha introdotto Ambrym con
+primary_volcano_type = "Shield(pyroclastic)".
+_normalize_gvp_type gestiva solo il suffisso GVP thesaurus "(s)"
+(es. "Shield(s)" -> "shield"); una qualificazione tra parentesi diversa
+come "(pyroclastic)" non veniva rimossa, quindi il tipo normalizzato
+restava "shield(pyroclastic)", assente da _GVP_TYPE_TO_PRESETS ->
+preset_hint.matched = false, reason = gvp_type_unknown. Ambrym
+risultava non mappato nonostante sia morfologicamente uno shield.
+Eccezione mirata al §3.3, autorizzata 2026-08-03 (stesso schema
+dell'hotfix Sett 3-4): _normalize_gvp_type in volume_unified.py e il
+mirror normalizeGvpType in backend/gvp/client.js estesi per rimuovere
+qualsiasi contenuto tra parentesi tonde (non solo "(s)"), con collapse
+degli spazi multipli residui. Diff mostrato e approvato dall'utente
+prima dell'applicazione.
+Verifica di non-regressione: resolve_presets rieseguito sui 12 vulcani
+reali del benchmark. 11/12 invariati bit-per-bit nel preset risolto
+(base_preset, rim_preset identici a prima). Unico cambiamento: Ambrym,
+da non mappato a base=island, rim=shield. Mirror JS verificato
+identico via resolvePresetsForType.
+Nota per §2: l'alias accettato ora copre anche qualificatori arbitrari
+tra parentesi (es. "Shield(pyroclastic)", "Stratovolcano(?)"), non solo
+"(s)" — aggiornare la formulazione degli alias se si documenta §2 in
+dettaglio in futuro.
 
 Verdetto complessivo Sett 1-2
 

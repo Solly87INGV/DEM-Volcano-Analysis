@@ -43,7 +43,30 @@ PREFERRED_IMAGE_ORDER = [
     # final always at end (handled separately)
 ]
 
-FINAL_DOUBLET_NAME = "final_doublet_base_vs_caldera.png"
+# Il doublet finale ora puo' avere il nome del vulcano in coda:
+# final_doublet_base_vs_caldera_<stem>.png (naming 2026-08-22). Manteniamo il
+# prefisso come chiave di riconoscimento e risolviamo il file reale su disco
+# per prefisso, cosi' il report continua a mettere il doublet in fondo come
+# prima, sia col nome legacy sia col nome col vulcano.
+FINAL_DOUBLET_PREFIX = "final_doublet_base_vs_caldera"
+FINAL_DOUBLET_NAME = "final_doublet_base_vs_caldera.png"  # legacy, ancora riconosciuto
+
+
+def _find_final_doublet_on_disk(proc_dir: Path):
+    """Return the final-doublet PNG in proc_dir, matching either the legacy
+    fixed name or the new final_doublet_base_vs_caldera_<stem>.png. Prefers an
+    exact legacy match, else the first prefixed match. None if absent."""
+    legacy = proc_dir / FINAL_DOUBLET_NAME
+    if legacy.exists():
+        return legacy
+    try:
+        for f in sorted(proc_dir.iterdir()):
+            n = f.name.lower()
+            if n.startswith(FINAL_DOUBLET_PREFIX) and n.endswith(".png"):
+                return f
+    except Exception:
+        pass
+    return None
 
 
 def _read_json(p: Path):
@@ -211,22 +234,34 @@ def _resolve_images(proc_dir: Path, vol: dict, analysis: dict):
             if (proc_dir / f).exists() or f in abs_map:
                 filenames.append(f)
 
-    # Separate final doublet and force inclusion at end if exists
+    # Separate final doublet and force inclusion at end if exists.
+    # Match per prefisso (nome legacy o final_doublet_..._<stem>.png).
     final_img = None
-    final_path = None
-    if (proc_dir / FINAL_DOUBLET_NAME).exists():
-        final_path = proc_dir / FINAL_DOUBLET_NAME
-    elif FINAL_DOUBLET_NAME in abs_map:
-        final_path = Path(abs_map[FINAL_DOUBLET_NAME])
+    final_path = _find_final_doublet_on_disk(proc_dir)
+    final_on_disk_name = final_path.name if final_path is not None else None
+    if final_path is None:
+        # fallback: prova la mappa abs_path da analysis_images.json
+        for _fn, _ap in abs_map.items():
+            ln = str(_fn).lower()
+            if ln.startswith(FINAL_DOUBLET_PREFIX) and ln.endswith(".png"):
+                cand = Path(_ap)
+                if cand.exists():
+                    final_path = cand
+                    final_on_disk_name = _fn
+                    break
 
     if final_path and final_path.exists():
-        final_img = (final_path, captions.get(FINAL_DOUBLET_NAME, "Base vs Caldera (final doublet)"))
+        cap_key = final_on_disk_name if final_on_disk_name in captions else FINAL_DOUBLET_NAME
+        final_img = (final_path, captions.get(cap_key, "Base vs Caldera (final doublet)"))
 
     # Filter out any missing files, resolve abs paths first then fallback to proc_dir
     resolved = []
     for fn in filenames:
-        if fn == FINAL_DOUBLET_NAME:
-            continue  # handled separately
+        # salta qualsiasi variante del doublet finale (legacy o col nome vulcano):
+        # e' gestita separatamente e va in fondo.
+        ln = str(fn).lower()
+        if ln.startswith(FINAL_DOUBLET_PREFIX) and ln.endswith(".png"):
+            continue
         p = Path(abs_map[fn]) if fn in abs_map else (proc_dir / fn)
         if p.exists():
             resolved.append((p, captions.get(fn, fn)))
