@@ -483,7 +483,7 @@ def write_dem_preview(
         raise RuntimeError("Cannot write DEM preview: no valid DEM pixels.")
 
     preview = _downsample_for_preview(arr, max_size=DEM_PREVIEW_MAX_SIZE)
-    valid_p = np.isfinite(preview)
+    valid_p = np.isfinite(preview) & (preview > -9000.0)
     vals = preview[valid_p]
 
     vmin = float(np.percentile(vals, 2))
@@ -2505,7 +2505,7 @@ def _hillshade_for_doublet(dem: np.ndarray, azimuth: float = 315.0, altitude: fl
     hs = (np.sin(alt_rad) * np.sin(slope) +
           np.cos(alt_rad) * np.cos(slope) * np.cos(az_rad - aspect))
     hs = np.clip(hs, 0.0, 1.0)
-    hs[~valid] = 0.0
+    hs[~valid] = np.nan
     return hs
 # -------------------- outputs: PNG doublet --------------------
 def save_final_doublet_png(
@@ -2520,14 +2520,20 @@ def save_final_doublet_png(
 ):
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Maschera nodata SOLO per il rendering: -9999 (DST_NODATA) e non-finiti
+    # diventano NaN → matplotlib li disegna trasparenti, niente fascia al bordo.
+    # NON tocca l'array usato dai calcoli (siamo in una funzione di sola figura).
+    _dem_bg = np.asarray(dem, dtype=float)
+    _dem_bg = np.where(np.isfinite(_dem_bg) & (_dem_bg > 1.0), _dem_bg, np.nan)
+
     FIG_W, FIG_H = 14.5, 5.5
     fig = plt.figure(figsize=(FIG_W, FIG_H))
     gs = gridspec.GridSpec(1, 3, figure=fig, width_ratios=[1.0, 0.08, 1.0], wspace=0.15)
 
     ax1 = fig.add_subplot(gs[0, 0])
-    _hs1 = _hillshade_for_doublet(dem)
+    _hs1 = _hillshade_for_doublet(_dem_bg)
     ax1.imshow(_hs1, cmap="gray", origin="upper", interpolation="nearest", resample=False, vmin=0.0, vmax=1.0)
-    im1 = ax1.imshow(dem, cmap="terrain", origin="upper", interpolation="nearest", resample=False, alpha=0.5)
+    im1 = ax1.imshow(_dem_bg, cmap="terrain", origin="upper", interpolation="nearest", resample=False, alpha=0.5)
     ax1.plot(base_contour[:, 1], base_contour[:, 0], "w-", linewidth=1)
     ax1.plot(base_p1[1], base_p1[0], "ro", markersize=8)
     ax1.plot(base_p2[1], base_p2[0], "yo", markersize=8)
@@ -2542,9 +2548,9 @@ def save_final_doublet_png(
     ax_sp.axis("off")
 
     ax2 = fig.add_subplot(gs[0, 2])
-    _hs2 = _hillshade_for_doublet(dem)
+    _hs2 = _hillshade_for_doublet(_dem_bg)
     ax2.imshow(_hs2, cmap="gray", origin="upper", interpolation="nearest", resample=False, vmin=0.0, vmax=1.0)
-    im2 = ax2.imshow(dem, cmap="terrain", origin="upper", interpolation="nearest", resample=False, alpha=0.5)
+    im2 = ax2.imshow(_dem_bg, cmap="terrain", origin="upper", interpolation="nearest", resample=False, alpha=0.5)
     caldera_plot = np.vstack([caldera_contour, caldera_contour[0]])
     ax2.plot(caldera_plot[:, 1], caldera_plot[:, 0], "b-", linewidth=1)
     ax2.plot(cal_p1[1], cal_p1[0], "ro", markersize=8)
