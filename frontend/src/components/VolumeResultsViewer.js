@@ -33,7 +33,7 @@ function buildResultRows(result) {
     { label: 'Total volume', value: fmt(result.total_volume_km3, 2), unit: 'km³' },
     { label: 'Caldera volume', value: fmt(result.caldera_volume_km3, 2), unit: 'km³' },
     { label: 'Effective volume', value: fmt(result.effective_volume_km3, 2), unit: 'km³' },
-    result.h_max_m != null ? { label: 'Max elevation (h_max)', value: fmt(result.h_max_m, 1), unit: 'm' } : null,
+    result.h_max_m != null ? { label: 'Edifice height (P99–P05)', value: fmt(result.h_max_m, 1), unit: 'm' } : null,
     result.pixel_size_m != null ? { label: 'Pixel size', value: fmt(result.pixel_size_m, 0), unit: 'm' } : null,
   ].filter(Boolean);
 }

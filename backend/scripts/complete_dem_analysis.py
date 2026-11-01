@@ -2,6 +2,7 @@
 
 import sys
 import os
+import shutil
 # HEADLESS flag (used later to skip PyQt GUI in Docker)
 HEADLESS = str(os.environ.get("HEADLESS", "")).strip().lower() in ("1", "true", "yes")
 
@@ -346,17 +347,21 @@ def standardize_dem_option2(dem_path: str, out_dir: str, target_res_m: float | N
             "input_shape": [int(src.height), int(src.width)],
         }
 
-        # Caso: già proiettato -> usalo direttamente
+        # Caso: già proiettato -> nessuna riproiezione, ma copia in dem_working.tif
+        # (2026-10-30, Zheltovsky): ogni run deve avere outputs/<pid>/dem_working.tif,
+        # altrimenti /calculateVolume senza file allegato (Recalculate dopo edit rim)
+        # risponde 400 "Missing DEM input". Copia byte-a-byte: dati invariati.
         if not src_crs.is_geographic:
+            shutil.copyfile(dem_path, working_path)
             meta.update({
-                "working_path": dem_path,
+                "working_path": working_path,
                 "working_crs": src_crs.to_string(),
                 "working_res": [float(src.res[0]), float(src.res[1])],
                 "reprojected": False,
                 "resampling": "none",
-                "note": "Input DEM already projected; used as-is (Option 2)."
+                "note": "Input DEM already projected; copied as-is to dem_working.tif (Option 2)."
             })
-            return dem_path, meta
+            return working_path, meta
 
         # Caso: geografico -> riproietta in UTM locale
         lon, lat = _dem_center_lonlat(src.bounds, src_crs)

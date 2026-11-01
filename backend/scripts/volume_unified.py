@@ -1666,7 +1666,31 @@ def find_caldera_contour_morphological(
         # (Tengger/Pagan: seed fuori + solidity bassa -> rifiutati) ne' le
         # caldere-depressione senza fondo chiuso (Valles/Long Valley/Fogo).
         _quota_degenere = bool(elev_dbg.get("selected_touches_border", False))
-        if _quota_degenere:
+        # 7a modifica (2026-11-01, Raung/Puyehue): il fallback scattava solo sul
+        # caso "tocca il bordo", non sul secondo caso dichiarato sopra (anello
+        # chiuso che NON racchiude una depressione). Raung: isolinea a 0.8*zmax
+        # sotto il fondo del cratere -> anello sui fianchi (15 km2), chiuso,
+        # profondita' canonica <= 0 -> volume collassato. Stesso test del
+        # fallback volume in run_unified (depth-integrated p90/p05: depth<=0 o
+        # V<=1e3 m3). Il criterio stretto del fill-sinks resta invariato.
+        # What-if sul benchmark (2026-11-01): cambia solo Puyehue (13.4 ->
+        # 3.08 km2, validato 3.06); tutti gli altri continental invariati.
+        _quota_senza_conca = False
+        if not _quota_degenere:
+            try:
+                _cd_chk = caldera_volume_depth_integrated(
+                    dem=dem, caldera_contour=caldera_contour, transform=transform,
+                    nodata=nodata, rim_percentile=90.0, floor_percentile=5.0,
+                    rim_ring_offset_px=1, rim_ring_width_px=3,
+                )
+                _quota_senza_conca = (
+                    float(_cd_chk.get("depth_ref_m", 0.0)) <= 0.0
+                    or float(_cd_chk.get("V_caldera_m3", 0.0)) <= 1.0e3
+                )
+            except Exception:
+                _quota_senza_conca = False
+        debug["quota_closed_ring_without_depression"] = bool(_quota_senza_conca)
+        if _quota_degenere or _quota_senza_conca:
             fs_c, fs_d = _find_caldera_by_fillsinks_continental(
                 dem=dem, transform=transform, nodata=nodata, dst_crs=dst_crs,
                 center_rc=center_gvp,
@@ -1676,7 +1700,8 @@ def find_caldera_contour_morphological(
                     "method": "fillsinks_continental_fallback",
                     "rim_method": "fillsinks_continental_fallback",
                     "quota_degenerate": {
-                        "selected_touches_border": True,
+                        "selected_touches_border": _quota_degenere,
+                        "closed_ring_without_depression": bool(_quota_senza_conca),
                         "elevation_detail": elev_dbg,
                     },
                     "fillsinks_detail": fs_d,

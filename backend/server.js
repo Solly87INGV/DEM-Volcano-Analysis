@@ -470,6 +470,7 @@ app.post('/process', upload.single('demFile'), (req, res) => {
   writeProcessMeta(procDir, {
     input_dem_name: inputDemName,
     original_file_stem: String(originalFileStem || ''),
+    original_file_name: String(originalFileNameRaw || ''),
     processId: String(processId || ''),
     step: 'complete_dem_analysis',
     updated_at: new Date().toISOString(),
@@ -566,12 +567,12 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
     });
   }
 
-  const originalFileNameRaw =
+  let originalFileNameRaw =
     (req.body.originalFileName && String(req.body.originalFileName).trim())
       ? String(req.body.originalFileName).trim()
       : (file ? file.originalname : '');
 
-  const originalFileStem = (originalFileNameRaw && path.parse(originalFileNameRaw).name)
+  let originalFileStem = (originalFileNameRaw && path.parse(originalFileNameRaw).name)
     ? path.parse(originalFileNameRaw).name
     : 'Unknown';
 
@@ -580,6 +581,26 @@ app.post('/calculateVolume', upload.single('demFile'), (req, res) => {
 
   const procDir = path.join(outputsDir, processId);
   fs.mkdirSync(procDir, { recursive: true });
+
+  // Recalculate (nessun file allegato): il nome del run e' quello registrato
+  // in meta.json allo step 1, non quello del body (il frontend manda
+  // 'recalculate' come segnaposto). Altrimenti metrics/doublet vengono scritti
+  // come *_recalculate accanto a quelli vecchi, e /api/metrics + report PDF
+  // continuano a servire i file del run precedente.
+  if (!file) {
+    try {
+      const metaPrev = JSON.parse(fs.readFileSync(path.join(procDir, 'meta.json'), 'utf-8'));
+      const stemPrev = metaPrev && metaPrev.original_file_stem ? String(metaPrev.original_file_stem).trim() : '';
+      if (stemPrev && stemPrev !== 'recalculate') {
+        originalFileStem = stemPrev;
+        originalFileNameRaw = (metaPrev.original_file_name && String(metaPrev.original_file_name).trim())
+          ? String(metaPrev.original_file_name).trim()
+          : `${stemPrev}.tif`;
+      }
+    } catch {
+      // meta.json assente/illeggibile: si tiene il nome dal body (comportamento precedente)
+    }
+  }
 
   const editedRimPath = getEditedRimPath(processId);
   const hasEditedRim = fs.existsSync(editedRimPath);
