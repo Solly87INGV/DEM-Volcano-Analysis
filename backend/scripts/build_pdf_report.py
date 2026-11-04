@@ -23,6 +23,12 @@ SUPPORTED_KEYS = {
     "circular_approx2",
     "elliptical_approx1",
     "elliptical_approx2",
+    # Modello unificato MorphoVolc 2.0 (2026-11-04): prima non riconosciuto ->
+    # ricadeva su circular_approx1 e il titolo diceva "Circular Base,
+    # Approximation Type 1" per ogni run.
+    "unified",
+    "unified_continental",
+    "unified_island",
 }
 
 MODULE_TITLE = {
@@ -178,7 +184,42 @@ def _pick_module_key(cli_module_key: str, meta: dict, vol: dict) -> str:
     return "circular_approx1"
 
 
-def _build_title(module_key: str, dem_name: str) -> str:
+def _read_metrics(proc_dir: Path):
+    """metrics_<stem>.json (o metrics.json legacy) della cartella del run."""
+    legacy = proc_dir / "metrics.json"
+    if legacy.exists():
+        return _read_json(legacy)
+    try:
+        for f in sorted(proc_dir.iterdir()):
+            if f.name.startswith("metrics_") and f.name.endswith(".json"):
+                return _read_json(f)
+    except Exception:
+        pass
+    return None
+
+
+def _build_title(module_key: str, dem_name: str, metrics: dict = None, rim_source: str = "") -> str:
+    if str(module_key).startswith("unified"):
+        # Titolo dai preset EFFETTIVI del run (preset_selection nel metrics),
+        # non dal moduleKey: il server lo fissa a 'continental' anche quando il
+        # GVP seleziona island/shield (es. Darwin).
+        ps = {}
+        try:
+            ps = (metrics or {}).get("meta", {}).get("preset_selection") or {}
+        except Exception:
+            ps = {}
+        base_p = ps.get("base_preset") or ""
+        rim_p = ps.get("rim_preset") or ""
+        gvp_t = ps.get("gvp_type_raw") or ""
+        parts = []
+        if base_p or rim_p:
+            parts.append(f"base preset: {base_p or '-'}, rim preset: {rim_p or '-'}")
+        if gvp_t:
+            parts.append(f"GVP type: {gvp_t}")
+        if str(rim_source).strip().lower() == "edited":
+            parts.append("rim: expert-edited")
+        detail = f" ({'; '.join(parts)})" if parts else ""
+        return f"Calculation Results - MorphoVolc 2.0 unified model{detail} Input DEM: {dem_name}"
     base_label, approx_label = MODULE_TITLE.get(module_key, ("Circular Base", "Approximation Type 1"))
     return f"Calculation Results - {base_label}, {approx_label} Input DEM: {dem_name}"
 
@@ -325,7 +366,22 @@ def main():
     dem_name = _pick_input_dem_name(meta, vol, process_id)
     dem_base = _safe_filename(Path(dem_name).stem)
 
-    title = _build_title(module_key, dem_name)
+    metrics = _read_metrics(proc_dir) or {}
+    rim_source = (vol.get("rim_source") if isinstance(vol, dict) else "") or meta.get("rim_source", "")
+    # (2026-11-04) Allo step 2 meta.input_dem_name diventa 'dem_working.tif'
+    # (file di lavoro): nel titolo e nel nome del PDF va il DEM originale.
+    if Path(dem_name).name.lower() == "dem_working.tif":
+        _orig = ""
+        try:
+            _orig = str((metrics.get("meta") or {}).get("original_file_name") or "").strip()
+        except Exception:
+            _orig = ""
+        if not _orig:
+            _orig = str(meta.get("original_file_name") or "").strip()
+        if _orig:
+            dem_name = _orig
+            dem_base = _safe_filename(Path(dem_name).stem)
+    title = _build_title(module_key, dem_name, metrics=metrics, rim_source=rim_source)
 
     pretty_pdf_name = f"report_{module_key}_{dem_base}.pdf"
     pretty_pdf_path = proc_dir / pretty_pdf_name

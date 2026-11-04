@@ -941,8 +941,23 @@ app.get('/api/report/:processId', (req, res) => {
 
   let pdfPath = pickLatestReportPdf();
   if (pdfPath && fs.existsSync(pdfPath)) {
-    res.setHeader('Content-Type', 'application/pdf');
-    return res.sendFile(pdfPath);
+    // (2026-11-04) Il PDF si generava solo la prima volta: dopo un Recalculate
+    // (es. rim editato) veniva servito il PDF vecchio. Se volume_results.json
+    // e' piu' recente del PDF, il PDF e' obsoleto -> si rigenera sotto.
+    let pdfStale = false;
+    try {
+      const vrPath = path.join(procDir, 'volume_results.json');
+      if (fs.existsSync(vrPath) && fs.statSync(vrPath).mtimeMs > fs.statSync(pdfPath).mtimeMs) {
+        pdfStale = true;
+      }
+    } catch {
+      pdfStale = false;
+    }
+    if (!pdfStale) {
+      res.setHeader('Content-Type', 'application/pdf');
+      return res.sendFile(pdfPath);
+    }
+    console.log(`[INFO][SERVER] report older than volume_results.json -> rebuilding (pid=${processId})`);
   }
 
   const reportScriptPath = path.join(__dirname, 'scripts', 'build_pdf_report.py');

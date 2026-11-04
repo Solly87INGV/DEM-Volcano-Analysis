@@ -2446,6 +2446,12 @@ def caldera_volume_depth_integrated(
         "floor_percentile": float(floor_percentile),
         "pixel_area_m2": float(Apx),
         "caldera_mask_area_m2": float(np.sum(caldera_mask & valid) * Apx),
+        # 8a modifica (2026-11-02), SOLO OUTPUT: profondita' massimo->minimo
+        # (punto piu' alto dell'anello del bordo -> punto piu' basso dentro la
+        # maschera), per il confronto con la letteratura. Non entra in V.
+        "z_rim_max_m": float(np.max(rim_vals)),
+        "z_floor_min_m": float(np.min(inside_vals)),
+        "depth_max_min_m": float(np.max(rim_vals) - np.min(inside_vals)),
     }
 
 
@@ -2617,10 +2623,39 @@ HUMAN_FIELDS = [
     ("Height model", "Height method", "height_model.method", ""),
     ("Height model", "Height (P99 - P05)", "height_model.h_max_m", "m"),
 
+    ("Caldera depth", "Volume source", "volume_model.inputs_used.caldera_depth.volume_source", ""),
+    ("Caldera depth", "Depth rim P90 - floor P05", "volume_model.inputs_used.caldera_depth.depth_ref_m", "m"),
+    ("Caldera depth", "Depth rim max - floor min", "volume_model.inputs_used.caldera_depth.depth_max_min_m", "m"),
+    ("Caldera depth", "Depth to spill point (fill-sinks)", "volume_model.inputs_used.caldera_depth.fill_sinks.depth_to_spill_m", "m"),
+
     ("Volumes", "Total edifice volume", "volumes.V_total_m3", "m³"),
     ("Volumes", "Caldera volume", "volumes.V_caldera_m3", "m³"),
     ("Volumes", "Effective edifice volume", "volumes.V_effective_m3", "m³"),
 ]
+
+def _depth_extra_fields(cd: dict) -> dict:
+    """8a modifica (2026-11-02), solo output. Campi aggiuntivi per il metrics:
+    - volume_source: 'fill_sinks' o 'depth_integrated'
+    - depth_max_min_m / z_rim_max_m / z_floor_min_m: profondita' massimo->minimo
+      (confronto con la letteratura), per entrambe le fonti
+    - fill_sinks: le grandezze del fill-sinks (sfioro, 3 definizioni), o None
+    Non modifica nessun valore esistente."""
+    is_fs = (cd.get("method") == "fill_sinks")
+    if is_fs:
+        zf = cd.get("z_floor_min_m")
+        dmax = cd.get("depth_to_rim_max_m")
+        zr = (float(zf) + float(dmax)) if (zf is not None and dmax is not None) else None
+        fs = {k: cd.get(k) for k in (
+            "caldera_model", "spill_point_m", "z_floor_min_m", "depth_to_spill_m",
+            "depth_to_rim_p90_m", "depth_to_rim_max_m", "V_to_spill_m3",
+            "V_to_rim_p90_m3", "V_to_rim_max_m3", "filled_area_km2", "max_fill_depth_m")}
+        return {"volume_source": "fill_sinks", "depth_max_min_m": dmax,
+                "z_rim_max_m": zr, "z_floor_min_m": zf, "fill_sinks": fs}
+    return {"volume_source": ("depth_integrated" if cd.get("V_caldera_m3") is not None else None),
+            "depth_max_min_m": cd.get("depth_max_min_m"),
+            "z_rim_max_m": cd.get("z_rim_max_m"), "z_floor_min_m": cd.get("z_floor_min_m"),
+            "fill_sinks": None}
+
 
 def _get_by_path(d: dict, path: str):
     cur = d
@@ -3081,6 +3116,10 @@ def main() -> int:
                     "mask_area_m2": out["caldera_depth"].get("caldera_mask_area_m2"),
                     "pixel_area_m2": out["caldera_depth"].get("pixel_area_m2"),
                     "fallback_used": bool(out.get("caldera_fallback_used", False)),
+                    # 8a modifica (2026-11-02), SOLO OUTPUT: fonte del volume,
+                    # profondita' max/min e grandezze fill-sinks (prima non
+                    # serializzate: depth_* restava null nei run fill-sinks).
+                    **_depth_extra_fields(out.get("caldera_depth") or {}),
                 }
             },
         },
