@@ -1498,8 +1498,9 @@ def main():
         _, smooth_curv_stats = gather_statistics(
             curvature_smoothed, "Amplified and Smoothed Curvature"
         )
-        write_statistics_to_json(total_statistics, filename="output_statistics.json")
-        print("[DEBUG] Statistics written to output_statistics.json")
+        _stats_path = os.path.join(out_dir, "output_statistics.json")
+        write_statistics_to_json(total_statistics, filename=_stats_path)
+        print(f"[DEBUG] Statistics written to {_stats_path}")
         log_memory("after_statistics_json")
 
     # Organizza le analisi in triplette (timed)
