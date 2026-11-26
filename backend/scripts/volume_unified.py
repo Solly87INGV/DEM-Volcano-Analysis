@@ -2651,10 +2651,19 @@ def _depth_extra_fields(cd: dict) -> dict:
             "V_to_rim_p90_m3", "V_to_rim_max_m3", "filled_area_km2", "max_fill_depth_m")}
         return {"volume_source": "fill_sinks", "depth_max_min_m": dmax,
                 "z_rim_max_m": zr, "z_floor_min_m": zf, "fill_sinks": fs}
+    # 9a modifica: se il volume ufficiale e' depth-integrated ma il rim viene
+    # dal ramo fill-sinks (Alcedo), le grandezze dello sfioro restano visibili.
+    _fx = cd.get("fill_sinks_extra")
+    fs_extra = None
+    if isinstance(_fx, dict) and _fx.get("method") == "fill_sinks":
+        fs_extra = {k: _fx.get(k) for k in (
+            "caldera_model", "spill_point_m", "z_floor_min_m", "depth_to_spill_m",
+            "depth_to_rim_p90_m", "depth_to_rim_max_m", "V_to_spill_m3",
+            "V_to_rim_p90_m3", "V_to_rim_max_m3", "filled_area_km2", "max_fill_depth_m")}
     return {"volume_source": ("depth_integrated" if cd.get("V_caldera_m3") is not None else None),
             "depth_max_min_m": cd.get("depth_max_min_m"),
             "z_rim_max_m": cd.get("z_rim_max_m"), "z_floor_min_m": cd.get("z_floor_min_m"),
-            "fill_sinks": None}
+            "fill_sinks": fs_extra}
 
 
 def _get_by_path(d: dict, path: str):
@@ -2776,36 +2785,37 @@ def run_unified(
         V_caldera_m3 = 0.0
         fallback_used = False
     elif _rim_method == "fillsinks_fallback":
-        # --- Opzione A: coerenza volumetrica con Puyehue ---
-        # Quando il rim proviene dal ramo fill-sinks (caldera-depressione, es.
-        # Alcedo), il volume UFFICIALE e' il volume fill-sinks fino allo sfioro
-        # (idrologico, conservativo, riproducibile) — la STESSA definizione usata
-        # per Puyehue. NON si usa il depth-integrated: sebbene qui darebbe un
-        # valore positivo (il rim e' corretto), userebbe rim-p90/floor-p05 e
-        # produrrebbe una definizione di volume DIVERSA da Puyehue, rompendo la
-        # coerenza tra casi comparabili. Il metrics riporta comunque le 3
-        # definizioni (sfioro / rim p90 / rim max) per trasparenza.
-        caldera_depth = caldera_volume_fill_sinks(
-            dem=dem,
-            caldera_contour=caldera_contour,
-            transform=transform,
-            nodata=nodata,
+        # --- 9a modifica (2026-11-26, decisione con Federico): convenzione
+        # volumetrica UNIFORME. Anche quando il rim proviene dal ramo fill-sinks
+        # (Alcedo) il volume ufficiale e' il depth-integrated rim-p90/floor-p05,
+        # come per tutti gli altri casi. Il volume fill-sinks fino allo sfioro
+        # resta nel metrics come grandezza aggiuntiva (blocco fill_sinks).
+        # (Prima: "Opzione A", volume ufficiale = sfioro.)
+        caldera_depth = caldera_volume_depth_integrated(
+            dem=dem, caldera_contour=caldera_contour, transform=transform,
+            nodata=nodata, rim_percentile=90.0, floor_percentile=5.0,
+            rim_ring_offset_px=1, rim_ring_width_px=3,
         )
+        depth_raw = float(caldera_depth.get("depth_ref_m", 0.0))
         V_caldera_m3 = float(caldera_depth.get("V_caldera_m3", 0.0))
-        depth_raw = float(caldera_depth.get("depth_to_spill_m", 0.0))
-        fallback_used = True
-        # se per qualche ragione il fill-sinks non trova depressione (non
-        # atteso: il ramo e' scattato proprio perche' ne ha trovata una),
-        # ripiega sul depth-integrated per non azzerare il volume.
-        if V_caldera_m3 <= 1.0e3:
-            caldera_depth = caldera_volume_depth_integrated(
-                dem=dem, caldera_contour=caldera_contour, transform=transform,
-                nodata=nodata, rim_percentile=90.0, floor_percentile=5.0,
-                rim_ring_offset_px=1, rim_ring_width_px=3,
+        fallback_used = False
+        try:
+            _cd_fs_extra = caldera_volume_fill_sinks(
+                dem=dem, caldera_contour=caldera_contour,
+                transform=transform, nodata=nodata,
             )
-            depth_raw = float(caldera_depth.get("depth_ref_m", 0.0))
-            V_caldera_m3 = float(caldera_depth.get("V_caldera_m3", 0.0))
-            fallback_used = False
+        except Exception:
+            _cd_fs_extra = None
+        if V_caldera_m3 <= 1.0e3 and _cd_fs_extra is not None and float(_cd_fs_extra.get("V_caldera_m3", 0.0)) > 1.0e3:
+            # salvaguardia (non attesa): se il depth-integrated collassa, il
+            # volume ufficiale torna allo sfioro come negli altri fallback.
+            caldera_depth = _cd_fs_extra
+            depth_raw = float(_cd_fs_extra.get("depth_to_spill_m", 0.0))
+            V_caldera_m3 = float(_cd_fs_extra.get("V_caldera_m3", 0.0))
+            fallback_used = True
+        elif _cd_fs_extra is not None and _cd_fs_extra.get("method") == "fill_sinks":
+            caldera_depth = dict(caldera_depth)
+            caldera_depth["fill_sinks_extra"] = _cd_fs_extra
     else:
         caldera_depth = caldera_volume_depth_integrated(
             dem=dem,
