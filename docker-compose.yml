@@ -2,6 +2,7 @@ services:
   morphovolc:
     build: .
     container_name: morphovolc
+    user: "${UID:-1000}:${GID:-1000}"
     ports:
       - "5000:5000"
     environment:
@@ -17,5 +18,5 @@ services:
     volumes:
       - ./backend/uploads:/app/backend/uploads
       - ./backend/outputs:/app/backend/outputs
-      - ./frontend/public/images:/app/frontend/public/images:ro   # <-- AGGIUNGI QUESTA
+      - ./frontend/public/images:/app/frontend/public/images:ro
     restart: unless-stopped
