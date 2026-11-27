@@ -16,12 +16,16 @@ const Description = () => {
       <p>
         Here we present a systematic workflow to extract quantitative morphometric parameters of volcanic edifices from DEMs.
         We developed a Python-based analysis core integrated into a JavaScript user interface to provide a flexible and user-friendly environment
-        for rapid and repeatable measurements.
+        for rapid and repeatable measurements. Detection parameters are selected deterministically from the volcano type in the
+        Smithsonian Global Volcanism Program (GVP) database.
       </p>
 
       <p>
-        <b>Input:</b> a georeferenced DEM (projected/metric CRS recommended). <br />
-        <b>Outputs:</b> key morphometrics (e.g., base/caldera geometry, heights, volumes), a PDF report with plots, and an exportable metrics package (JSON + CSV) for QA and machine-learning workflows.
+        <b>Input:</b> a georeferenced DEM (geographic DEMs are reprojected to UTM automatically; the method is validated at 20–30 m resolution,
+        e.g. Copernicus GLO-30) and the GVP volcano number (optional, but strongly recommended: it selects the parameter preset and anchors the caldera centre). <br />
+        <b>Outputs:</b> base and caldera geometry (area, diameter), caldera depth (p90/p05 and max/min), caldera and edifice volumes,
+        a PDF report with plots, and an exportable metrics package (JSON + CSV) for quality control and reproducible downstream analysis.
+        The caldera rim can be redrawn or imported (GeoJSON) and the volumes recalculated.
       </p>
     </div>
   );

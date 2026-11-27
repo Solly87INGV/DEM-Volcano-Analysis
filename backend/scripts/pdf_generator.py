@@ -167,9 +167,9 @@ def generate_pdf(file_path, results_list, title="Calculation Results",
         # Candidate paths for logo
         logo_candidates = []
         for d in candidates_dirs:
-            logo_candidates.append(os.path.join(d, 'logo-ingv.jpg'))
-            logo_candidates.append(os.path.join(d, 'logo-ingv.jpeg'))
-            logo_candidates.append(os.path.join(d, 'logo-ingv.png'))
+            logo_candidates.append(os.path.join(d, 'INGV_white.jpg'))
+            logo_candidates.append(os.path.join(d, 'INGV_white.jpeg'))
+            logo_candidates.append(os.path.join(d, 'INGV_white.png'))
 
         header_image_path = _find_first_existing(header_candidates)
         logo_image_path = _find_first_existing(logo_candidates)

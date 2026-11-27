@@ -5,7 +5,7 @@
 .footer {
   background-color: #333;
   color: white;
-  padding: 20px;
+  padding: 0 20px;
   font-size: 0.9rem;
 
   position: fixed;
@@ -48,4 +48,20 @@
   color: #ffffff;
   margin-right: 30px;
   padding-right: 10px;
+}
+
+/* Logo INGV centrato rispetto all’intero footer */
+.footer-logo {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  height: 42px;
+  width: auto;
+  max-width: 30%;
+  object-fit: contain;
+}
+
+.footer p {
+  margin: 0;
 }

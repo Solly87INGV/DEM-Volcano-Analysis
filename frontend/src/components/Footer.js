@@ -13,6 +13,13 @@ const Footer = () => {
           <a href="/contact">Contact</a>
         </div>
       </div>
+
+      <img
+        src={`${process.env.PUBLIC_URL}/images/INGV_footer_white.png`}
+        alt="Istituto Nazionale di Geofisica e Vulcanologia"
+        className="footer-logo"
+      />
+
       <div className="footer-info">
         <p>Site Manager: Marco Solinas</p>
       </div>

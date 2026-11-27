@@ -4,14 +4,14 @@ import './Header.css';
 
 const Header = () => {
   const headerStyle = {
-    backgroundImage: `url(${process.env.PUBLIC_URL + '/images/ingv_Etna.jpg'})`, // Usa process.env.PUBLIC_URL per referenziare la cartella public
+    backgroundImage: `url(${process.env.PUBLIC_URL + '/images/ingv_Etna.jpg'})`,
     backgroundSize: 'cover',
     backgroundPosition: 'center',
   };
 
   return (
     <header className="app-header" style={headerStyle}>
-      <img src={`${process.env.PUBLIC_URL}/images/logo-ingv.jpeg`} alt="Logo INGV" className="logo" />
+      <img src={`${process.env.PUBLIC_URL}/images/INGV_white.png`} alt="Logo INGV" className="logo" />
       <h1>MorphoVolc DEM interface</h1>
     </header>
   );

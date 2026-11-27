@@ -18,13 +18,13 @@
     left: -400px; /* Sposta verso destra */
   }
 
-  .logo {
+.logo {
     position: absolute;
-    left: 0px;
-    height: 160px;
+    left: 25px;
+    height: 115px;
     width: auto;
-    z-index: 1; /* Assicura che il logo sia visibile sopra l'immagine */
-  }
+    z-index: 1;
+}
   
   /* Overlay per migliorare il contrasto */
   .app-header::before {
