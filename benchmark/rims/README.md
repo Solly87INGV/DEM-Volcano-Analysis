@@ -23,3 +23,5 @@ Polygons in lon/lat (EPSG:4326, GeoJSON Feature Polygon, `properties.source = "e
 
 DEMs: Copernicus GLO-30 (via OpenTopography), reprojected to UTM by MorphoVolc step 1.
 Hand-drawn rims of the same cases were used only to quantify operator variability; they are not reference rims.
+
+`scripts/` contains one script per criterion that regenerates these rims from the DEMs (all within one DEM pixel of the archived files); see `scripts/README.md`.
